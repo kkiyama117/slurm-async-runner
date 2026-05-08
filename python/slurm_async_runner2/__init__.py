@@ -1,6 +1,6 @@
-from .slurm_async_runner2 import *
+from slurm_async_runner2 import _core
 
-
-__doc__ = slurm_async_runner2.__doc__
-if hasattr(slurm_async_runner2, "__all__"):
-    __all__ = slurm_async_runner2.__all__
+if hasattr(_core, "__doc__"):
+    __doc__ = _core.__doc__
+if hasattr(_core, "__all__"):
+    __all__ = _core.__all__

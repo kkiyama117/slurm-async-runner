@@ -43,7 +43,6 @@ pyo3 = { version = "0.28", features = [
   "abi3-py312",
   # Connection to other useful crates
   "anyhow",
-  "auto-initialize",
   "chrono",
   "experimental-inspect",
   # NOTE: "extension-module" is intentionally NOT enabled here. Enable it
@@ -51,6 +50,12 @@ pyo3 = { version = "0.28", features = [
   # each maturin-built package's pyproject.toml. Keeping it out of the default
   # workspace feature set allows the `stub_gen` binary in each package to link
   # against libpython.
+  # NOTE: "auto-initialize" is intentionally NOT enabled. It conflicts with
+  # the statically-linked Python that maturin's manylinux build images ship,
+  # producing the build-script error "auto-initialize feature is enabled, but
+  # your python installation only supports embedding the Python interpreter
+  # statically". stub_gen does not need it (abi3 dynamic linking via
+  # libpython3.so is sufficient at run time).
   "nightly",
   # "eyre",
   "serde",

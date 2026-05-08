@@ -1,36 +1,49 @@
 [project]
 name = "slurm_async_runner2"
+readme = "README.md"
 requires-python = ">=3.12"
+authors = [{ name = "kkiyama117", email = "k.kiyama117@gmail.com" }]
 classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+  "Programming Language :: Rust",
 ]
 dynamic = ["version"]
-readme = "README.md"
-authors = [{name="kkiyama117", email = "k.kiyama117@gmail.com"}]
 
 [project.optional-dependencies]
-tests = [
-    "pytest",
-    "ruff"
-]
+tests = ["pytest", "ruff"]
 
 [dependency-groups]
 dev = [
-    "pytest",
-    "ruff",
+  "pytest",
+  "ruff",
 ]
-
-[tool.maturin]
-features = ["pyo3/extension-module"]
-profile = "dev"
-python-packages = ["slurm_async_runner2"]
-python-source = "python"
 
 [build-system]
 requires = ["maturin>=1.13,<2.0"]
 build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "slurm_async_runner2._core"
+profile = "dev"
+python-packages = ["slurm_async_runner2"]
+python-source = "python"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# pyo3-stub-gen output uses forward references in default-value expressions
+# that ruff flags as F821. The file already opts out of F401/F403/F405/E501.
+"**/*.pyi" = ["F821"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["slurm-async-runner2"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
 
 [tool.uv]
 cache-keys = [
@@ -39,13 +52,3 @@ cache-keys = [
   { file = "Cargo.toml" },
   { file = "Cargo.lock" }
 ]
-
-[tool.ruff]
-target-version = "py312"
-
-[tool.ruff.lint.isort]
-known-first-party = ["slurm-async-runner2"]
-
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
