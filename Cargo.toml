@@ -1,0 +1,74 @@
+[package]
+name = "slurm_async_runner2"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# "cdylib" is necessary to produce a shared library for Python to import from.
+# "rlib" is required so stub_gen binary can link against this crate.
+# `name` omitted; cargo defaults to the package name. Python-facing module path
+# is controlled separately via `[tool.maturin] module-name` in `pyproject.toml`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "slurm_async_runner2"
+
+[[bin]]
+name = "stub_gen"
+required-features = ["stub_gen"]
+
+[dependencies]
+# Simplified error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging and tracing
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Asynchronous runtime and utilities
+futures = "0.3"
+tokio = { version = "1.0", features = ["macros", "process", "rt-multi-thread"] }
+
+chrono = { version = "0.4", features = ["serde"] }
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# UUID and datetime
+uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
+
+##### OPTIONAL DEPS #####
+# PYO3
+pyo3 = { version = "0.28", features = [
+  "abi3-py312",
+  # Connection to other useful crates
+  "anyhow",
+  "auto-initialize",
+  "chrono",
+  "experimental-inspect",
+  # NOTE: "extension-module" is intentionally NOT enabled here. Enable it
+  # per-package via `[tool.maturin] features = ["pyo3/extension-module"]` in
+  # each maturin-built package's pyproject.toml. Keeping it out of the default
+  # workspace feature set allows the `stub_gen` binary in each package to link
+  # against libpython.
+  "nightly",
+  # "eyre",
+  "serde",
+], optional = true }
+pyo3-async-runtimes = { version = "0.28", features = [
+  "attributes",
+  "tokio-runtime"
+], optional = true }
+pyo3-log = { version = "0.13", optional = true }
+pythonize = { version = "0.28", optional = true }
+
+# STUB_GEN
+pyo3-stub-gen = { git = "https://github.com/Jij-Inc/pyo3-stub-gen", branch = "main", default-features = false, features = [
+  "infer_signature"
+], optional = true }
+
+[features]
+default = ["pyo3", "stub_gen"]
+
+pyo3 = ["dep:pyo3", "pyo3-async-runtimes", "pyo3-log", "pythonize"]
+stub_gen = ["pyo3-stub-gen"]
