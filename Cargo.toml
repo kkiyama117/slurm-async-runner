@@ -37,6 +37,11 @@ serde = { version = "1.0", features = ["derive"] }
 # UUID and datetime
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
+# Shared Gaussian job entities (Job, JobSpec, SlurmJobConfig, ...).
+# Pinned to `branch = "main"` during migration; tighten to a `rev`/`tag` after
+# S7 lands `SlurmJobState` upstream so this package can re-export it (S8).
+gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", branch = "main" }
+
 ##### OPTIONAL DEPS #####
 # PYO3
 pyo3 = { version = "0.28", features = [
