@@ -3,6 +3,7 @@ pub mod py_export;
 #[cfg(feature = "pyo3")]
 pub use py_export::stub_info;
 
+pub mod manager;
 pub mod runner;
 
 // Re-export the SLURM lifecycle types so downstream Rust crates can write
@@ -14,6 +15,10 @@ pub use gaussian_job_shared::entities::slurm::status::{JobReason, JobState, JobS
 // Re-export the async batch-query so callers can write
 // `use slurm_async_runner::query_job_states_batch`.
 pub use runner::query_job_states_batch;
+
+// Re-export the manager + launcher so callers can write
+// `use slurm_async_runner::{SlurmCmd, SlurmManager}`.
+pub use manager::{SlurmCmd, SlurmManager};
 
 #[cfg(test)]
 mod tests {
