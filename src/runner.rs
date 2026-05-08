@@ -13,20 +13,30 @@
 //! forward-compat).
 
 use std::collections::{HashMap, HashSet};
-use std::process::Stdio;
 
-use anyhow::{Context, Result};
-use tokio::process::Command;
+use anyhow::Result;
 
+use crate::dispatcher::{JobDispatcher, TokioDispatcher};
 use crate::{JobReason, JobState, JobStatus};
 
 /// Bulk-query SLURM for the `(state, reason)` of every jobid in the input.
-///
-/// Empty input short-circuits to `Ok(HashMap::new())` with zero
-/// subprocesses spawned. Duplicate ids are de-duplicated for the actual
-/// SLURM calls but every input id (duplicates included) appears as a key
-/// in the returned map.
+/// Default-flavored wrapper around [`query_job_states_batch_with`] that
+/// uses [`TokioDispatcher`] for actual subprocess work.
 pub async fn query_job_states_batch(jobids: &[u64]) -> Result<HashMap<u64, JobStatus>> {
+    query_job_states_batch_with(&TokioDispatcher, jobids).await
+}
+
+/// Bulk-query SLURM via a custom [`JobDispatcher`].
+///
+/// Empty input short-circuits to `Ok(HashMap::new())` without dispatching.
+/// Duplicate ids are de-duplicated for the actual SLURM calls but every
+/// input id (duplicates included) appears as a key in the returned map.
+/// Ids absent from both backends map to `JobStatus::default()`
+/// (state=Unknown, reason=None).
+pub async fn query_job_states_batch_with<D: JobDispatcher>(
+    dispatcher: &D,
+    jobids: &[u64],
+) -> Result<HashMap<u64, JobStatus>> {
     if jobids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -34,8 +44,15 @@ pub async fn query_job_states_batch(jobids: &[u64]) -> Result<HashMap<u64, JobSt
     let unique = dedupe_preserving_order(jobids);
     let id_csv = csv_join(&unique);
 
-    let squeue_out =
-        capture_subprocess(&["squeue", "-h", "-j", &id_csv, "-o", "%i %T %r"]).await?;
+    let squeue_argv = vec![
+        "squeue".to_string(),
+        "-h".to_string(),
+        "-j".to_string(),
+        id_csv,
+        "-o".to_string(),
+        "%i %T %r".to_string(),
+    ];
+    let (_, squeue_out) = dispatcher.capture(&squeue_argv).await?;
     let active = parse_squeue(&squeue_out);
 
     let missing: Vec<u64> = unique
@@ -47,17 +64,16 @@ pub async fn query_job_states_batch(jobids: &[u64]) -> Result<HashMap<u64, JobSt
     let history = if missing.is_empty() {
         HashMap::new()
     } else {
-        let miss_csv = csv_join(&missing);
-        let sacct_out = capture_subprocess(&[
-            "sacct",
-            "-P",
-            "-n",
-            "-j",
-            &miss_csv,
-            "-o",
-            "JobID,State,Reason",
-        ])
-        .await?;
+        let sacct_argv = vec![
+            "sacct".to_string(),
+            "-P".to_string(),
+            "-n".to_string(),
+            "-j".to_string(),
+            csv_join(&missing),
+            "-o".to_string(),
+            "JobID,State,Reason".to_string(),
+        ];
+        let (_, sacct_out) = dispatcher.capture(&sacct_argv).await?;
         parse_sacct(&sacct_out)
     };
 
@@ -80,20 +96,6 @@ fn csv_join(ids: &[u64]) -> String {
         out.push_str(&id.to_string());
     }
     out
-}
-
-async fn capture_subprocess(argv: &[&str]) -> Result<String> {
-    let (program, args) = argv
-        .split_first()
-        .context("capture_subprocess called with empty argv")?;
-    let output = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `{program}`"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Parse `%i %T %r` rows from `squeue -h`.

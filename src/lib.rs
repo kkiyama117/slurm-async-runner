@@ -3,6 +3,7 @@ pub mod py_export;
 #[cfg(feature = "pyo3")]
 pub use py_export::stub_info;
 
+pub mod dispatcher;
 pub mod manager;
 pub mod runner;
 
@@ -14,11 +15,15 @@ pub use gaussian_job_shared::entities::slurm::status::{JobReason, JobState, JobS
 
 // Re-export the async batch-query so callers can write
 // `use slurm_async_runner::query_job_states_batch`.
-pub use runner::query_job_states_batch;
+pub use runner::{query_job_states_batch, query_job_states_batch_with};
 
 // Re-export the manager + launcher so callers can write
 // `use slurm_async_runner::{SlurmCmd, SlurmManager}`.
 pub use manager::{SlurmCmd, SlurmManager};
+
+// Re-export the dispatcher abstraction so callers can plug in custom
+// runtime implementations or use the shipped Tokio / dry-run flavors.
+pub use dispatcher::{DryRunDispatcher, JobDispatcher, TokioDispatcher};
 
 #[cfg(test)]
 mod tests {

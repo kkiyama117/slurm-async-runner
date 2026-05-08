@@ -75,23 +75,14 @@ impl PySlurmManager {
     }
 
     #[getter]
-    fn default_shell(&self) -> Option<String> {
-        self.0.default_shell.clone()
-    }
-
-    #[getter]
     fn slurm_cmd(&self) -> PySlurmCmd {
         PySlurmCmd(self.0.slurm_cmd.clone())
     }
 
-    fn build_shell_str(&self, cmd: Vec<String>) -> String {
-        let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        self.0.build_shell_str(&refs)
-    }
-
-    fn srun_command(&self, batch_file: PathBuf) -> PyResult<String> {
+    /// Build the argv that would dispatch `batch_file`.
+    fn build_argv(&self, batch_file: PathBuf) -> PyResult<Vec<String>> {
         self.0
-            .srun_command(&batch_file)
+            .build_argv(&batch_file)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -157,10 +148,7 @@ impl PySlurmManager {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "SlurmManager(default_shell={:?}, slurm_cmd={:?})",
-            self.0.default_shell, self.0.slurm_cmd.srun_cmd,
-        )
+        format!("SlurmManager(slurm_cmd={:?})", self.0.slurm_cmd.srun_cmd)
     }
 }
 
