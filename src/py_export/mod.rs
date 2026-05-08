@@ -2,6 +2,9 @@
 
 use pyo3::prelude::*;
 
+pub mod manager;
+pub mod runner;
+
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
 /// A Python module implemented in Rust.
@@ -15,6 +18,14 @@ mod slurm_async_runner {
     // ---- legacy demo function ----
     #[pymodule_export]
     use crate::py_export::sum_as_string;
+
+    // ---- async batch-query sub-module: slurm_async_runner._core.runner ----
+    #[pymodule_export]
+    use super::runner::inner_module as runner_module;
+
+    // ---- manager sub-module: slurm_async_runner._core.manager ----
+    #[pymodule_export]
+    use super::manager::inner_module as manager_module;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

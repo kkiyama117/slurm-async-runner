@@ -1,0 +1,94 @@
+name: Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (cargo fmt / clippy / test)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (nightly per rust-toolchain.toml)
+        # rust-toolchain.toml pins channel = "nightly" because Cargo.toml
+        # enables the pyo3 "nightly" feature. Install nightly with rustfmt +
+        # clippy so the override file doesn't strand cargo on a component-less
+        # toolchain.
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python 3.12 (required by pyo3 abi3-py312)
+        # pyo3's build script links against libpython at compile time. Without
+        # this, cargo clippy/test on ubuntu-22.04 picks up Python 3.10 and
+        # fails: "cannot set a minimum Python version 3.12 higher than the
+        # interpreter version 3.10".
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # `--all-targets` covers tests + bins; `-D warnings` makes any warning fail.
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --lib
+        # Lib-only: a real SLURM cluster is not available in CI. The unit suite
+        # covers all parsers, dispatchers, and the SlurmManager argv plumbing
+        # (TokioDispatcher uses the coreutils `true`/`false`/`echo` binaries).
+        run: cargo test --lib
+
+  python:
+    name: Python (maturin develop + pytest)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (nightly per rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: python-test
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Sync uv environment
+        run: uv sync --all-extras
+
+      - name: maturin develop (build & install extension)
+        run: uv run maturin develop
+
+      - name: pytest
+        run: uv run pytest python/tests -v
+
+      - name: ruff check
+        run: uv run ruff check python/
+
+      - name: ruff format --check
+        run: uv run ruff format --check python/
