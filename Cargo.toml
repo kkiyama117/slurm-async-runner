@@ -37,10 +37,16 @@ serde = { version = "1.0", features = ["derive"] }
 # UUID and datetime
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
-# Shared Gaussian job entities (Job, JobSpec, SlurmJobConfig, ...).
-# Pinned to `branch = "main"` during migration; tighten to a `rev`/`tag` after
-# S7 lands `SlurmJobState` upstream so this package can re-export it (S8).
-gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", branch = "main" }
+# Shared Gaussian job entities (Job, JobSpec, SlurmJobConfig, JobStatus,
+# JobState, JobReason). `default-features = false` is REQUIRED: upstream
+# defaults enable its `pyo3` feature, which compiles `py_export` and emits
+# `PyInit__core`. This crate also exports its own `_core` pymodule, so the
+# linker refuses with "duplicate symbol PyInit__core". Disabling defaults
+# here gives us the Rust types only; Python users import the Py* wrappers
+# directly from `gaussian_job_shared._core.entities.slurm.status`.
+# Pinned to `branch = "main"` during migration; tighten to a `rev`/`tag`
+# after S6 stabilizes the public API.
+gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", branch = "main", default-features = false }
 
 ##### OPTIONAL DEPS #####
 # PYO3
