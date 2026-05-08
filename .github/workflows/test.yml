@@ -21,8 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (nightly per rust-toolchain.toml)
+        # rust-toolchain.toml pins channel = "nightly" because Cargo.toml
+        # enables the pyo3 "nightly" feature. Install nightly with rustfmt +
+        # clippy so the override file doesn't strand cargo on a component-less
+        # toolchain.
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
 
@@ -50,8 +54,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (nightly per rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry / target
         uses: Swatinem/rust-cache@v2
