@@ -30,6 +30,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Set up Python 3.12 (required by pyo3 abi3-py312)
+        # pyo3's build script links against libpython at compile time. Without
+        # this, cargo clippy/test on ubuntu-22.04 picks up Python 3.10 and
+        # fails: "cannot set a minimum Python version 3.12 higher than the
+        # interpreter version 3.10".
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
       - name: Cache cargo registry / target
         uses: Swatinem/rust-cache@v2
         with:
