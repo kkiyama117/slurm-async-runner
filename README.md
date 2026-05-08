@@ -1,0 +1,121 @@
+# slurm-async-runner
+
+Async SLURM job dispatcher and lifecycle-status query backend, implemented in
+Rust and exposed to Python via [pyo3] + [pyo3-async-runtimes].
+
+This is the Rust port of the original pure-Python `slurm-async-runner`. The
+public Python API is intentionally compatible: callers continue to `await`
+coroutines that wrap the same set of operations.
+
+[pyo3]: https://pyo3.rs/
+[pyo3-async-runtimes]: https://github.com/PyO3/pyo3-async-runtimes
+
+## Public API
+
+### Rust
+
+```rust
+use slurm_async_runner::{
+    SlurmCmd, SlurmManager,
+    JobDispatcher, TokioDispatcher, DryRunDispatcher,
+    JobStatus, JobState, JobReason,
+    query_job_states_batch, query_job_states_batch_with,
+};
+use std::path::Path;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let manager = SlurmManager::default(); // launcher = "srun"
+
+    // Dispatch a batch script.
+    let exit_code = manager.run_job(Path::new("./job.sh"), false).await?;
+
+    // Query lifecycle status (squeue then sacct fallback).
+    let status: JobStatus = manager.query_job_state(12345).await?;
+    println!("state={:?} reason={:?}", status.state, status.reason);
+
+    // Bulk query.
+    let states = manager.query_job_states_batch(&[12345, 12346]).await?;
+
+    // Plug in a custom dispatcher (e.g. for tests or a remote backend).
+    let dry = DryRunDispatcher;
+    manager.run_job_with(&dry, Path::new("./job.sh")).await?;
+    Ok(())
+}
+```
+
+### Python
+
+```python
+import asyncio
+from slurm_async_runner._core.manager import SlurmCmd, SlurmManager
+from slurm_async_runner._core.runner import query_job_states_batch
+from gaussian_job_shared._core.entities.slurm.status import JobStatus
+
+async def main():
+    manager = SlurmManager()                      # launcher = "srun"
+    # Or override:
+    manager = SlurmManager(SlurmCmd(srun_cmd="srun"))
+
+    code: int = await manager.run_job("./job.sh", dry_run=False)
+    status: JobStatus = await manager.query_job_state(12345)
+    states: dict[int, JobStatus] = await manager.query_job_states_batch([12345, 12346])
+
+    # Module-level helper:
+    states = await query_job_states_batch([12345, 12346])
+
+asyncio.run(main())
+```
+
+`JobStatus` carries `(state, reason)` and is parsed from SLURM's `squeue`
+output (`-o "%i %T %r"`) with an `sacct` fallback for completed jobs. See
+[`gaussian_job_shared`](https://github.com/kkiyama117/gaussian_job_shared) for
+the full state/reason taxonomies (24 official states, ~80 reason codes, with
+`Unknown` / `Other(String)` forward-compat fallbacks).
+
+## Architecture
+
+The crate is split along two axes:
+
+| Layer | Type | Concern |
+|-------|------|---------|
+| Spec | `SlurmCmd`, `SlurmManager` | Pure data + argv builders. No I/O. |
+| Runtime | `JobDispatcher` trait, `TokioDispatcher`, `DryRunDispatcher` | Subprocess execution. Swappable. |
+| Query | `runner::query_job_states_batch_with` | `squeue` then `sacct` fallback parsing. |
+
+This separation lets tests substitute mock dispatchers without spawning real
+processes, and keeps the spec layer language-agnostic so the same argv builder
+feeds both the Rust runtime and a Python `asyncio.create_subprocess_exec`
+runtime.
+
+No shell wrapping (`$SHELL -c "..."`) is used — both Python's
+`asyncio.create_subprocess_exec` and Rust's `tokio::process::Command::args`
+accept argv directly.
+
+## Development
+
+```bash
+# Rust-side
+cargo test --lib                          # 35 unit tests, no SLURM required
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+
+# Python-side
+uv sync --all-extras
+uv run maturin develop                    # builds + installs the extension
+uv run pytest python/tests -v
+uv run ruff check python/
+
+# Regenerate .pyi stubs (for sync types only — async pyfunctions and submodule
+# pyclasses are hand-written under python/slurm_async_runner/_core/*.pyi).
+# Re-run ruff format afterwards because pyo3-stub-gen output isn't ruff-formatted.
+cargo run --bin stub_gen && uv run ruff format python/
+```
+
+The CI pipeline runs all of the above on every push and PR; see
+[`.github/workflows/test.yml`](.github/workflows/test.yml). Wheel building +
+PyPI publishing is in [`.github/workflows/CI.yml`](.github/workflows/CI.yml).
+
+## License
+
+See repository root.

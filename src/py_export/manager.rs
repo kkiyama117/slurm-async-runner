@@ -134,13 +134,15 @@ impl PySlurmManager {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Python::attach(|py| {
-                let cls = job_status_class(py)?;
-                let parse = cls.getattr("parse")?;
                 let dict = PyDict::new(py);
-                for (jid, status) in result {
-                    let py_status =
-                        parse.call1((status.state.as_token(), status.reason.as_str()))?;
-                    dict.set_item(jid, py_status)?;
+                if !result.is_empty() {
+                    let cls = job_status_class(py)?;
+                    let parse = cls.getattr("parse")?;
+                    for (jid, status) in result {
+                        let py_status =
+                            parse.call1((status.state.as_token(), status.reason.as_str()))?;
+                        dict.set_item(jid, py_status)?;
+                    }
                 }
                 Ok::<Py<PyAny>, PyErr>(dict.into_any().unbind())
             })

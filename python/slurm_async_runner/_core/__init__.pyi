@@ -2,6 +2,7 @@
 # ruff: noqa: E501, F401, F403, F405
 
 import builtins
+
 __all__ = [
     "sum_as_string",
 ]
@@ -10,4 +11,3 @@ def sum_as_string(a: builtins.int, b: builtins.int) -> builtins.str:
     r"""
     Formats the sum of two numbers as string.
     """
-

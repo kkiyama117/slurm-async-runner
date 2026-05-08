@@ -33,21 +33,24 @@ fn job_status_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 /// returned dict — ids absent from both backends map to a default
 /// `JobStatus` (state=`Unknown`, reason=`None`).
 #[pyfunction]
-fn query_job_states_batch<'py>(
-    py: Python<'py>,
-    jobids: Vec<u64>,
-) -> PyResult<Bound<'py, PyAny>> {
+fn query_job_states_batch<'py>(py: Python<'py>, jobids: Vec<u64>) -> PyResult<Bound<'py, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let result = rust_query(&jobids)
             .await
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Python::attach(|py| {
-            let cls = job_status_class(py)?;
-            let parse = cls.getattr("parse")?;
             let dict = PyDict::new(py);
-            for (jid, status) in result {
-                let py_status = parse.call1((status.state.as_token(), status.reason.as_str()))?;
-                dict.set_item(jid, py_status)?;
+            // Defer the cross-module import until we actually have a row to
+            // build — keeps `[] -> {}` working even when the upstream Python
+            // wheel isn't installed (e.g. on test/dev machines without it).
+            if !result.is_empty() {
+                let cls = job_status_class(py)?;
+                let parse = cls.getattr("parse")?;
+                for (jid, status) in result {
+                    let py_status =
+                        parse.call1((status.state.as_token(), status.reason.as_str()))?;
+                    dict.set_item(jid, py_status)?;
+                }
             }
             Ok::<Py<PyAny>, PyErr>(dict.into_any().unbind())
         })

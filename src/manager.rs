@@ -128,10 +128,7 @@ impl SlurmManager {
     /// Bulk-query SLURM for the `(state, reason)` of every input id.
     /// Uses [`TokioDispatcher`]; for a custom dispatcher use
     /// [`runner::query_job_states_batch_with`].
-    pub async fn query_job_states_batch(
-        &self,
-        jobids: &[u64],
-    ) -> Result<HashMap<u64, JobStatus>> {
+    pub async fn query_job_states_batch(&self, jobids: &[u64]) -> Result<HashMap<u64, JobStatus>> {
         runner::query_job_states_batch(jobids).await
     }
 }
@@ -158,7 +155,10 @@ mod tests {
     fn build_argv_uses_absolute_path() {
         let c = SlurmCmd::default();
         let argv = c.build_argv(Path::new("/tmp/example.sh")).unwrap();
-        assert_eq!(argv, vec!["srun".to_string(), "/tmp/example.sh".to_string()]);
+        assert_eq!(
+            argv,
+            vec!["srun".to_string(), "/tmp/example.sh".to_string()]
+        );
     }
 
     #[test]
@@ -233,10 +233,7 @@ mod tests {
             received: Mutex::new(vec![]),
         };
         let m = SlurmManager::default();
-        let code = m
-            .run_job_with(&mock, Path::new("/tmp/x.sh"))
-            .await
-            .unwrap();
+        let code = m.run_job_with(&mock, Path::new("/tmp/x.sh")).await.unwrap();
         assert_eq!(code, 42);
         assert_eq!(
             mock.received.lock().unwrap()[0],
