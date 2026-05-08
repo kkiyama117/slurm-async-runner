@@ -1,6 +1,6 @@
 """Smoke tests for the PyO3-exported Rust extension."""
 
-from slurm_async_runner2._core import sum_as_string
+from slurm_async_runner._core import sum_as_string
 
 
 def test_sum_as_string():

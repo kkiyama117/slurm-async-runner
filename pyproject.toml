@@ -1,5 +1,5 @@
 [project]
-name = "slurm_async_runner2"
+name = "slurm_async_runner"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "kkiyama117", email = "k.kiyama117@gmail.com" }]
@@ -25,9 +25,9 @@ build-backend = "maturin"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "slurm_async_runner2._core"
+module-name = "slurm_async_runner._core"
 profile = "dev"
-python-packages = ["slurm_async_runner2"]
+python-packages = ["slurm_async_runner"]
 python-source = "python"
 
 [tool.ruff]
@@ -39,7 +39,7 @@ target-version = "py312"
 "**/*.pyi" = ["F821"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["slurm-async-runner2"]
+known-first-party = ["slurm-async-runner"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -1,5 +1,5 @@
 [package]
-name = "slurm_async_runner2"
+name = "slurm_async_runner"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,7 +10,7 @@ edition = "2024"
 # is controlled separately via `[tool.maturin] module-name` in `pyproject.toml`.
 [lib]
 crate-type = ["cdylib", "rlib"]
-name = "slurm_async_runner2"
+name = "slurm_async_runner"
 
 [[bin]]
 name = "stub_gen"
