@@ -92,6 +92,39 @@ No shell wrapping (`$SHELL -c "..."`) is used — both Python's
 `asyncio.create_subprocess_exec` and Rust's `tokio::process::Command::args`
 accept argv directly.
 
+## tssrun (background mode + env inspection)
+
+For the Kyoto-U ECCS interactive batch frontend `tssrun`, the
+`slurm_async_runner.tssrun` submodule offers a non-blocking spawn API
+and snapshot-based environment inspection.
+
+```python
+import asyncio
+from slurm_async_runner._core.tssrun import (
+    Resource, TssrunCmd, TssrunManager, file_log_sink,
+)
+
+async def main():
+    cmd = TssrunCmd(
+        program="/work/job.sh",
+        queue="gr19999b", time_limit="1:00:00",
+        rsc=Resource(processes=4, memory="2G"),
+    )
+    sink = await file_log_sink("/tmp/job.out", "/tmp/job.err")
+    manager = TssrunManager(cmd, state_dir="/var/lib/slurm-runner", log_sink=sink)
+
+    handle = await manager.spawn()
+    print("pid", await handle.pid, "jobid", await handle.jobid)
+    code = await handle.wait()
+    print("exit", code)
+
+asyncio.run(main())
+```
+
+A separate process can later call `await manager.attach_pid(pid)`
+(or `attach_jobid` / `attach_file`) to inspect the persisted snapshot
+read-only.
+
 ## Development
 
 ```bash
