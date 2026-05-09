@@ -9,6 +9,7 @@ use std::sync::Arc;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
+use uuid::Uuid;
 
 use tokio::sync::watch;
 
@@ -16,6 +17,7 @@ use crate::tssrun::cmd::{Resource, TssrunCmd};
 use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
+use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
 
 // ---------- Resource ----------
 
@@ -163,6 +165,49 @@ fn file_log_sink<'py>(
     })
 }
 
+// ---------- JobStateStore ----------
+
+/// Opaque Python handle to an [`Arc<dyn JobStateStore>`]. Construct via
+/// the `in_memory_state_store` / `file_system_state_store` factories and
+/// pass the result to ``TssrunManager(cmd, store=...)``.
+///
+/// The trait is intentionally not subclassable from Python — Rust
+/// requires the backend to implement [`async_trait`] methods that pyo3
+/// cannot dispatch back into Python without a dedicated bridge. New
+/// backends should be added in Rust and re-exported here.
+#[pyclass(
+    name = "JobStateStore",
+    module = "slurm_async_runner._core.tssrun",
+    from_py_object,
+    frozen
+)]
+#[derive(Clone)]
+pub struct PyJobStateStore(pub Arc<dyn JobStateStore>);
+
+/// Build an in-process, in-memory state store.
+///
+/// This is the default backend used when ``TssrunManager`` is
+/// constructed without a ``store=`` argument; the factory exists so
+/// callers can wire the *same* store into multiple managers within a
+/// single process (each ``Arc`` clone shares the underlying map).
+#[pyfunction]
+#[pyo3(name = "in_memory_state_store")]
+fn in_memory_state_store() -> PyJobStateStore {
+    PyJobStateStore(Arc::new(InMemoryStateStore::new()))
+}
+
+/// Build an on-disk state store rooted at ``dir``.
+///
+/// Snapshots are written as ``{dir}/{uuid}.json`` via atomic rename.
+/// The directory is created lazily on first save, so it is fine to pass
+/// a path that does not yet exist — but the parent must be writable when
+/// the first save fires.
+#[pyfunction]
+#[pyo3(name = "file_system_state_store")]
+fn file_system_state_store(dir: PathBuf) -> PyJobStateStore {
+    PyJobStateStore(Arc::new(FileSystemStateStore::new(dir)))
+}
+
 // ---------- JobHandle ----------
 
 /// Python view onto a [`JobHandle`].
@@ -204,6 +249,16 @@ impl PyTssrunJobHandle {
     fn jobid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let jobid = self.rx.borrow().jobid;
         future_into_py(py, async move { Ok(jobid) })
+    }
+
+    /// UUID v7 primary key for this job. Returned as the canonical
+    /// hyphenated string (e.g. ``"0190cc1c-7a48-7c0e-a0a0-1234567890ab"``)
+    /// so it can be passed straight back to ``attach_uuid`` or used as a
+    /// dict key without needing to depend on Python's ``uuid`` module.
+    #[getter]
+    fn uuid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let uuid = self.rx.borrow().uuid.to_string();
+        future_into_py(py, async move { Ok(uuid) })
     }
 
     #[getter]
@@ -257,6 +312,27 @@ impl PyTssrunJobHandle {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
     }
+
+    /// Re-read this handle's snapshot from the configured store and
+    /// broadcast it to all snapshot subscribers (so subsequent ``pid``
+    /// / ``jobid`` / ``node`` getters reflect the persisted state).
+    ///
+    /// Useful for an attached handle whose owner is in another process
+    /// — the local watch channel only sees mutations the local tee /
+    /// wait tasks make, so a cross-process update is not visible until
+    /// ``refresh()`` pulls it in. Raises ``RuntimeError`` when no store
+    /// is wired or when the store has no record for this handle's uuid.
+    fn refresh<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .refresh()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
 }
 
 // ---------- TssrunManager ----------
@@ -271,12 +347,26 @@ pub struct PyTssrunManager(pub Arc<TssrunManager>);
 
 #[pymethods]
 impl PyTssrunManager {
+    /// Construct a manager.
+    ///
+    /// Parameters
+    /// ----------
+    /// cmd
+    ///     The ``TssrunCmd`` spec to spawn.
+    /// store
+    ///     A ``JobStateStore`` for snapshot persistence. When ``None``
+    ///     (the default), an in-memory store is used — sufficient for
+    ///     single-process workflows on read-only filesystems. To
+    ///     persist across processes, pass
+    ///     ``store=file_system_state_store(path)``.
+    /// log_sink
+    ///     Optional ``LogSink``. Defaults to the standard-stream sink.
     #[new]
-    #[pyo3(signature = (cmd, state_dir = None, log_sink = None))]
-    fn new(cmd: PyTssrunCmd, state_dir: Option<PathBuf>, log_sink: Option<PyLogSink>) -> Self {
+    #[pyo3(signature = (cmd, store = None, log_sink = None))]
+    fn new(cmd: PyTssrunCmd, store: Option<PyJobStateStore>, log_sink: Option<PyLogSink>) -> Self {
         let mut m = TssrunManager::new(cmd.0);
-        if let Some(d) = state_dir {
-            m = m.with_state_dir(d);
+        if let Some(s) = store {
+            m = m.with_state_store(s.0);
         }
         if let Some(s) = log_sink {
             m = m.with_log_sink(s.0);
@@ -292,6 +382,22 @@ impl PyTssrunManager {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(PyTssrunJobHandle::from_handle(handle))
+        })
+    }
+
+    /// Attach to a previously persisted handle by its UUID v7 primary key.
+    /// Accepts the canonical hyphenated string returned by the ``uuid``
+    /// getter — invalid input raises ``RuntimeError``.
+    fn attach_uuid<'py>(&self, py: Python<'py>, uuid: &str) -> PyResult<Bound<'py, PyAny>> {
+        let parsed = Uuid::parse_str(uuid)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid uuid {uuid:?}: {e}")))?;
+        let m = self.0.clone();
+        future_into_py(py, async move {
+            let h = m
+                .attach(AttachKey::Uuid(parsed))
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(PyTssrunJobHandle::from_handle(h))
         })
     }
 
@@ -339,6 +445,8 @@ pub mod inner_module {
     const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.tssrun";
 
     #[pymodule_export]
+    use super::PyJobStateStore;
+    #[pymodule_export]
     use super::PyLogSink;
     #[pymodule_export]
     use super::PyResource;
@@ -350,6 +458,10 @@ pub mod inner_module {
     use super::PyTssrunManager;
     #[pymodule_export]
     use super::file_log_sink;
+    #[pymodule_export]
+    use super::file_system_state_store;
+    #[pymodule_export]
+    use super::in_memory_state_store;
     #[pymodule_export]
     use super::null_log_sink;
     #[pymodule_export]

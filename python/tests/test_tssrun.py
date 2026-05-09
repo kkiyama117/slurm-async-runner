@@ -12,6 +12,8 @@ from slurm_async_runner._core.tssrun import (
     TssrunCmd,
     TssrunManager,
     file_log_sink,
+    file_system_state_store,
+    in_memory_state_store,
     null_log_sink,
     std_log_sink,
 )
@@ -141,14 +143,158 @@ def test_h1_snapshot_getters_do_not_block_on_inflight_wait() -> None:
 def test_manager_attach_file_round_trip() -> None:
     async def run() -> None:
         with tempfile.TemporaryDirectory() as td:
-            manager = TssrunManager(_bash_cmd(Path(td)), state_dir=td)
+            manager = TssrunManager(
+                _bash_cmd(Path(td)), store=file_system_state_store(td)
+            )
             h = await manager.spawn()
             pid = await h.pid
+            uuid = await h.uuid
             await h.wait()
-            path = Path(td) / f"{pid}.json"
+            # State directory layout: {state_dir}/{uuid}.json — pid is no
+            # longer the filename key after the UUID v7 migration.
+            path = Path(td) / f"{uuid}.json"
             assert path.exists()
             attached = await manager.attach_file(str(path))
             assert (await attached.pid) == pid
+            assert (await attached.uuid) == uuid
             assert (await attached.jobid) == 555
+
+    asyncio.run(run())
+
+
+def test_manager_attach_uuid_round_trip() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            manager = TssrunManager(
+                _bash_cmd(Path(td)), store=file_system_state_store(td)
+            )
+            h = await manager.spawn()
+            pid = await h.pid
+            uuid = await h.uuid
+            await h.wait()
+            # uuid is the canonical hyphenated string, e.g.
+            # "0190cc1c-7a48-7c0e-a0a0-1234567890ab" — 36 chars.
+            assert len(uuid) == 36 and uuid.count("-") == 4
+            attached = await manager.attach_uuid(uuid)
+            assert (await attached.uuid) == uuid
+            assert (await attached.pid) == pid
+            assert (await attached.jobid) == 555
+
+    asyncio.run(run())
+
+
+def test_manager_attach_uuid_rejects_invalid_string() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            manager = TssrunManager(
+                _bash_cmd(Path(td)), store=file_system_state_store(td)
+            )
+            try:
+                await manager.attach_uuid("not-a-uuid")
+            except RuntimeError as e:
+                assert "invalid uuid" in str(e).lower()
+            else:
+                raise AssertionError("attach_uuid must reject malformed input")
+
+    asyncio.run(run())
+
+
+def test_manager_default_store_is_in_memory_and_supports_attach_uuid() -> None:
+    """The default ``TssrunManager(cmd)`` uses an in-memory store, so the
+    spawn → attach_uuid round-trip works without any writable directory.
+
+    This is the headline use case for the read-only-filesystem scenarios
+    that motivated splitting the store out of the manager.
+    """
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            # Note: no store= argument — we are exercising the default.
+            manager = TssrunManager(_bash_cmd(Path(td)))
+            h = await manager.spawn()
+            uuid = await h.uuid
+            await h.wait()
+            attached = await manager.attach_uuid(uuid)
+            assert (await attached.uuid) == uuid
+            assert (await attached.jobid) == 555
+
+    asyncio.run(run())
+
+
+def test_manager_explicit_in_memory_store_is_shared_across_managers() -> None:
+    """Two managers wired to the *same* in-memory store can attach to
+    each other's spawned handles in-process."""
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = in_memory_state_store()
+            spawner = TssrunManager(_bash_cmd(Path(td)), store=store)
+            attacher = TssrunManager(_bash_cmd(Path(td)), store=store)
+
+            h = await spawner.spawn()
+            uuid = await h.uuid
+            await h.wait()
+
+            attached = await attacher.attach_uuid(uuid)
+            assert (await attached.uuid) == uuid
+            assert (await attached.jobid) == 555
+
+    asyncio.run(run())
+
+
+def test_manager_attach_jobid_returns_friendly_error_when_dir_missing() -> None:
+    """Regression: pre-store, ``attach_jobid`` surfaced ``ENOENT`` when
+    the file system state directory had not been created. With the
+    ``FileSystemStateStore``, the missing directory is treated as "no
+    entries" and the manager returns the same friendly
+    ``no persisted handle matched jobid …`` message it would for an
+    empty directory."""
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "never-created"
+            assert not missing.exists()
+            manager = TssrunManager(
+                _bash_cmd(Path(td)), store=file_system_state_store(missing)
+            )
+            try:
+                await manager.attach_jobid(999)
+            except RuntimeError as e:
+                assert "no persisted handle matched jobid" in str(e)
+            else:
+                raise AssertionError(
+                    "attach_jobid must fail with a friendly error when the "
+                    "state dir does not exist"
+                )
+
+    asyncio.run(run())
+
+
+def test_handle_refresh_picks_up_cross_manager_mutations() -> None:
+    """``refresh()`` must re-load the snapshot from the shared store so a
+    handle obtained from one manager observes mutations recorded by
+    another manager spawning under the same uuid space."""
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = in_memory_state_store()
+            spawner = TssrunManager(_bash_cmd(Path(td)), store=store)
+            attacher = TssrunManager(_bash_cmd(Path(td)), store=store)
+
+            h_spawn = await spawner.spawn()
+            uuid = await h_spawn.uuid
+            # Attach BEFORE waiting — the attached handle's local snapshot
+            # captures the pre-exit state (no ``finished`` yet).
+            h_attach = await attacher.attach_uuid(uuid)
+            assert await h_attach.is_running() is True
+
+            # Drive the spawner to completion; this updates the store.
+            await h_spawn.wait()
+
+            # The attached handle's local snapshot is still stale until we
+            # explicitly refresh from the store.
+            await h_attach.refresh()
+            assert await h_attach.is_running() is False
+            assert (await h_attach.exit_code()) == 0
 
     asyncio.run(run())
