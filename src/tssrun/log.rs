@@ -5,9 +5,11 @@
 //! on the multi-threaded tokio runtime.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Result;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogStream {
@@ -72,6 +74,55 @@ impl JobLogSink for StdLogSink {
     }
 }
 
+/// Append-only file sink. Each `append` writes one line followed by `\n`.
+pub struct FileLogSink {
+    stdout: tokio::sync::Mutex<tokio::fs::File>,
+    stderr: tokio::sync::Mutex<tokio::fs::File>,
+    paths: (PathBuf, PathBuf),
+}
+
+impl FileLogSink {
+    pub async fn create(stdout: PathBuf, stderr: PathBuf) -> Result<Self> {
+        let stdout_f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout)
+            .await?;
+        let stderr_f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr)
+            .await?;
+        Ok(Self {
+            stdout: tokio::sync::Mutex::new(stdout_f),
+            stderr: tokio::sync::Mutex::new(stderr_f),
+            paths: (stdout, stderr),
+        })
+    }
+
+    pub fn paths(&self) -> &(PathBuf, PathBuf) {
+        &self.paths
+    }
+}
+
+impl JobLogSink for FileLogSink {
+    async fn append(&self, stream: LogStream, line: &str) -> Result<()> {
+        let mut f = match stream {
+            LogStream::Stdout => self.stdout.lock().await,
+            LogStream::Stderr => self.stderr.lock().await,
+        };
+        f.write_all(line.as_bytes()).await?;
+        f.write_all(b"\n").await?;
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.stdout.lock().await.flush().await?;
+        self.stderr.lock().await.flush().await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +160,24 @@ mod tests {
         s.append(LogStream::Stdout, "alpha").await.unwrap();
         s.append(LogStream::Stderr, "beta").await.unwrap();
         s.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_sink_writes_lines_to_correct_streams() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout_path: PathBuf = tmp.path().join("o.log");
+        let stderr_path: PathBuf = tmp.path().join("e.log");
+        let s = FileLogSink::create(stdout_path.clone(), stderr_path.clone())
+            .await
+            .unwrap();
+        s.append(LogStream::Stdout, "hello").await.unwrap();
+        s.append(LogStream::Stderr, "world").await.unwrap();
+        s.flush().await.unwrap();
+
+        let o = std::fs::read_to_string(&stdout_path).unwrap();
+        let e = std::fs::read_to_string(&stderr_path).unwrap();
+        assert_eq!(o, "hello\n");
+        assert_eq!(e, "world\n");
     }
 }
