@@ -9,7 +9,7 @@ use crate::entities::slurm as inner;
 #[gen_stub_pyclass_enum]
 #[pyclass(
     name = "DependencyType",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options",
     from_py_object,
     eq,
     eq_int,
@@ -71,7 +71,7 @@ impl From<PyDependencyType> for inner::DependencyType {
 #[gen_stub_pyclass_enum]
 #[pyclass(
     name = "DependencyJoin",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options",
     from_py_object,
     eq,
     eq_int,
@@ -123,7 +123,7 @@ impl From<PyDependencyJoin> for inner::DependencyJoin {
 #[gen_stub_pyclass]
 #[pyclass(
     name = "DependencyJobRef",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options",
     from_py_object,
     eq,
     hash,
@@ -182,7 +182,7 @@ impl From<PyDependencyJobRef> for inner::DependencyJobRef {
 #[gen_stub_pyclass]
 #[pyclass(
     name = "DependencyClause",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options",
     from_py_object,
     eq
 )]
@@ -251,7 +251,7 @@ impl From<PyDependencyClause> for inner::DependencyClause {
 #[gen_stub_pyclass]
 #[pyclass(
     name = "SlurmDependency",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options",
     from_py_object,
     eq
 )]

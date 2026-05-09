@@ -18,7 +18,7 @@ use crate::entities::slurm::status as inner;
 #[gen_stub_pyclass_enum]
 #[pyclass(
     name = "JobState",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.status",
     from_py_object,
     eq,
     eq_int,
@@ -157,7 +157,7 @@ impl From<PyJobState> for inner::JobState {
 #[gen_stub_pyclass]
 #[pyclass(
     name = "JobReason",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.status",
     from_py_object,
     eq,
     hash,
@@ -292,7 +292,7 @@ impl From<PyJobReason> for inner::JobReason {
 #[gen_stub_pyclass]
 #[pyclass(
     name = "JobStatus",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.status",
     from_py_object,
     eq,
     hash,

@@ -11,7 +11,7 @@ use crate::entities::slurm as inner;
 #[gen_stub_pyclass]
 #[pyclass(
     name = "JobTimeLimit",
-    module = "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options",
+    module = "slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options",
     from_py_object,
     eq,
     hash,
