@@ -26,6 +26,18 @@ pub use manager::{SlurmCmd, SlurmManager};
 // runtime implementations or use the shipped Tokio / dry-run flavors.
 pub use dispatcher::{DryRunDispatcher, JobDispatcher, TokioDispatcher};
 
+// Re-export background dispatcher types.
+pub use dispatcher::{BackgroundDispatcher, SpawnedChild, TokioBackgroundDispatcher};
+
+// Re-export tssrun public API.
+pub use tssrun::cmd::{Resource, TssrunCmd};
+pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};
+pub use tssrun::log::{
+    FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,
+};
+pub use tssrun::manager::{AttachKey, TssrunManager};
+pub use tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
+
 #[cfg(test)]
 mod tests {
     use super::*;
