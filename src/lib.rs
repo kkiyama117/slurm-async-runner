@@ -30,7 +30,15 @@ pub use dispatcher::{DryRunDispatcher, JobDispatcher, TokioDispatcher};
 pub use dispatcher::{BackgroundDispatcher, SpawnedChild, TokioBackgroundDispatcher};
 
 // Re-export tssrun public API.
-pub use tssrun::cmd::{Resource, TssrunCmd};
+pub use tssrun::cmd::TssrunCmd;
+// Re-export shared2's ResourceSpec / JobTimeLimit so downstream Rust
+// callers can write `use slurm_async_runner::ResourceSpec;` without a
+// direct dependency on `gaussian_job_shared`. The `Resource` struct
+// previously lived in `tssrun::cmd`; consult the migration notes for
+// the field shape change (CPU/GPU enum, NonZeroU32 counts, Memory).
+pub use gaussian_job_shared::entities::slurm::{
+    JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
+};
 pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};
 pub use tssrun::log::{
     FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,

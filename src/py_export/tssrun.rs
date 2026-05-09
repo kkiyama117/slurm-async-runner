@@ -13,63 +13,14 @@ use uuid::Uuid;
 
 use tokio::sync::watch;
 
-use crate::tssrun::cmd::{Resource, TssrunCmd};
+use crate::tssrun::cmd::TssrunCmd;
+use gaussian_job_shared::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
+use gaussian_job_shared::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
+
 use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
 use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
-
-// ---------- Resource ----------
-
-#[pyclass(
-    name = "Resource",
-    module = "slurm_async_runner._core.tssrun",
-    from_py_object,
-    frozen
-)]
-#[derive(Clone)]
-pub struct PyResource(pub Resource);
-
-#[pymethods]
-impl PyResource {
-    #[new]
-    #[pyo3(signature = (processes = None, threads = None, cores = None, memory = None, gpus = None))]
-    fn new(
-        processes: Option<u32>,
-        threads: Option<u32>,
-        cores: Option<u32>,
-        memory: Option<String>,
-        gpus: Option<u32>,
-    ) -> Self {
-        Self(Resource {
-            processes,
-            threads,
-            cores,
-            memory,
-            gpus,
-        })
-    }
-    #[getter]
-    fn processes(&self) -> Option<u32> {
-        self.0.processes
-    }
-    #[getter]
-    fn threads(&self) -> Option<u32> {
-        self.0.threads
-    }
-    #[getter]
-    fn cores(&self) -> Option<u32> {
-        self.0.cores
-    }
-    #[getter]
-    fn memory(&self) -> Option<String> {
-        self.0.memory.clone()
-    }
-    #[getter]
-    fn gpus(&self) -> Option<u32> {
-        self.0.gpus
-    }
-}
 
 // ---------- TssrunCmd ----------
 
@@ -88,7 +39,7 @@ impl PyTssrunCmd {
     #[pyo3(signature = (
         program,
         args = Vec::new(),
-        queue = None,
+        partition = None,
         time_limit = None,
         rsc = None,
         x11 = false,
@@ -99,9 +50,9 @@ impl PyTssrunCmd {
     fn new(
         program: PathBuf,
         args: Vec<String>,
-        queue: Option<String>,
-        time_limit: Option<String>,
-        rsc: Option<PyResource>,
+        partition: Option<String>,
+        time_limit: Option<PyJobTimeLimit>,
+        rsc: Option<PyResourceSpec>,
         x11: bool,
         env: HashMap<String, String>,
         cwd: Option<PathBuf>,
@@ -109,8 +60,8 @@ impl PyTssrunCmd {
     ) -> Self {
         Self(TssrunCmd {
             tssrun_bin,
-            queue,
-            time_limit,
+            partition,
+            time_limit: time_limit.map(|t| t.0),
             rsc: rsc.map(|r| r.0),
             x11,
             program,
@@ -448,8 +399,11 @@ pub mod inner_module {
     use super::PyJobStateStore;
     #[pymodule_export]
     use super::PyLogSink;
-    #[pymodule_export]
-    use super::PyResource;
+    // Re-export shared2's ResourceSpec / JobTimeLimit pyclass wrappers
+    // so Python callers can construct them via the same import path
+    // as TssrunCmd. Both classes' canonical home remains
+    // gaussian_job_shared._gaussian_job_shared_core, but exposing them
+    // here saves an extra import for the common tssrun use case.
     #[pymodule_export]
     use super::PyTssrunCmd;
     #[pymodule_export]
@@ -466,6 +420,10 @@ pub mod inner_module {
     use super::null_log_sink;
     #[pymodule_export]
     use super::std_log_sink;
+    #[pymodule_export]
+    use gaussian_job_shared::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
+    #[pymodule_export]
+    use gaussian_job_shared::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
