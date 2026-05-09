@@ -134,6 +134,133 @@ Phase B5 のテスト (`tests/tssrun_integration.rs`) は SAR の cdylib 単体�
 
 ## 6. 参考リンク
 
-- pyo3 Issue tracker: cdylib type identity (関連 issue を探す)
-- pyo3 0.28 ドキュメント: `from_py_object` derive と cross-crate 利用の制限
+- pyo3 Issue #1444 (sharing pyclasses between multiple Rust packages): <https://github.com/PyO3/pyo3/issues/1444> — **2021 年に open、2026 年現在も未解決 / 未実装**。`pyclass_export!` / `pyclass_import!` 案も merge されていない。
+- pyo3-polars `FromPyObject` 実装 (業界標準の duck-typing 抽出): <https://github.com/pola-rs/pyo3-polars/blob/main/pyo3-polars/src/types.rs>
+- pyo3-arrow: PyCapsule Interface による cross-cdylib データ受け渡し: <https://docs.rs/pyo3-arrow/>
 - KUDPC `--rsc` manual: <https://web.kudpc.kyoto-u.ac.jp/manual/ja/run/resource#rscoption>
+
+## 7. 業界標準調査 (2026-05-09)
+
+主要 pyo3 ライブラリ群を調査した結果、**「複数 cdylib 間で `#[pyclass]` の型同一性を共有する」ことを正面から解決した実装は存在しない**。pyo3 issue #1444 は 5 年以上 open のまま放置されており、これは pyo3 の cdylib モデル由来の **根源的な制約** として受け止めるのが現実的。
+
+代わりに業界標準として確立しているパターンは **Duck-typing + Protocol-based extraction in `FromPyObject`**。
+
+### 7.1 pyo3-polars の前例 (`pyo3-polars/src/types.rs`)
+
+`PySeries::extract_bound` は **pyclass downcast に依存しない**:
+
+```rust
+impl<'a> FromPyObject<'a> for PySeries {
+    fn extract_bound(ob: &Bound<'a, PyAny>) -> PyResult<Self> {
+        let ob = ob.call_method0("rechunk")?;             // duck-typing
+        let name = ob.getattr("name")?;                   // duck-typing
+        let py_name = name.str()?;
+        let name = py_name.to_cow()?;
+        let kwargs = PyDict::new(ob.py());
+        if let Ok(compat_level) = ob.call_method0("_newest_compat_level") {
+            let compat_level = compat_level.extract().unwrap();
+            let compat_level = CompatLevel::with_level(compat_level)
+                .unwrap_or(CompatLevel::newest());
+            kwargs.set_item("compat_level", compat_level.get_level())?;
+        }
+        let arr = ob.call_method("to_arrow", (), Some(&kwargs))?;  // Arrow C interface
+        let arr = ffi::to_rust::array_to_rust(&arr)?;
+        let name = name.as_ref();
+        Ok(PySeries(
+            Series::try_from((PlSmallStr::from(name), arr)).map_err(PyPolarsErr::from)?,
+        ))
+    }
+}
+```
+
+ポイント:
+- 入力 `ob: &Bound<'a, PyAny>` は **どの cdylib 由来でもよい**
+- `call_method0("rechunk")` / `getattr("name")` / `call_method("to_arrow", ...)` は Python レベルの protocol → cdylib 境界を超える
+- Arrow C interface で zero-copy に Rust 側 `Series` を再構築
+- `PyDataFrame` も同様 (`get_columns` + `width` を duck-typing 抽出)
+- `PyLazyFrame` は `__getstate__()` の bytes を deserialize (binary protocol)
+
+これにより、pyo3-polars を使った plugin cdylib は **本家 polars wheel の `Series` インスタンスをそのまま受け取れる**。pyclass identity に一切依存していない。
+
+### 7.2 pyo3-arrow / Arrow PyCapsule Interface
+
+Arrow ecosystem は `__arrow_c_schema__` / `__arrow_c_array__` / `__arrow_c_stream__` の **3 つの dunder** を protocol として標準化。`FromPyObject` はこれらを `getattr` → `call0` し、PyCapsule からポインタを取り出す。`#[pyclass]` 派生型に一切依存しない。
+
+### 7.3 結論
+
+「pyclass を共有する」のではなく「**Python オブジェクトを protocol として扱う**」のが pyo3 ecosystem 5 年の蓄積による answer。我々の `error.md §4` 候補は **A の発展形** が最有力 — ただし polars 前例に倣えば `Bound<PyAny>` 引数として露出させる必要はなく、**普通に `PyTssrunCmd::__new__(rsc: Option<RscBridge>)` と書いて pyo3 に自動で `FromPyObject` を呼ばせれば良い**。
+
+## 8. 採用推奨候補: F. Duck-typing `FromPyObject` Bridge (Polars-style)
+
+### 概要
+
+shared2 の pyclass impls を **SAR cdylib に一切コンパイルしない** (= `pyo3-types` feature を外して `default-features = false` に戻す)。代わりに SAR 側に **bridge 型** (`RscBridge`, `JobTimeLimitBridge`, `MemoryBridge`) を定義し、独自の `FromPyObject` を **getattr ベースの duck-typing** で実装する。
+
+### コード骨子 (SAR `src/py_export/bridge.rs`)
+
+```rust
+// shared2 の Rust 型 (pyclass ではない素の enum/struct) を内包
+pub(crate) struct RscBridge(pub gaussian_job_shared::ResourceSpec);
+
+impl<'py> FromPyObject<'py> for RscBridge {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let py = ob.py();
+        // Duck-typing: shared2 PyResourceSpec が公開している getter と同じ名前
+        let processes: Option<u32> = ob.getattr(intern!(py, "processes"))?.extract()?;
+        let threads:   Option<u32> = ob.getattr(intern!(py, "threads"))?.extract()?;
+        let cores:     Option<u32> = ob.getattr(intern!(py, "cores"))?.extract()?;
+        let gpus:      Option<u32> = ob.getattr(intern!(py, "gpus"))?.extract()?;
+        let memory_any = ob.getattr(intern!(py, "memory"))?;
+        let memory = if memory_any.is_none() {
+            None
+        } else {
+            Some(MemoryBridge::extract_bound(&memory_any)?.0)
+        };
+        // Rust 型として再構築 (shared2 の pub fn from_parts(...) を使う)
+        let spec = ResourceSpec::from_parts(processes, threads, cores, memory, gpus)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self(spec))
+    }
+}
+```
+
+`PyTssrunCmd::__new__` は普通の named 引数で受ける:
+
+```rust
+#[new]
+fn new(
+    cmd: String,
+    partition: Option<String>,
+    time_limit: Option<JobTimeLimitBridge>,
+    rsc: Option<RscBridge>,
+) -> PyResult<Self> { ... }
+```
+
+ユーザ視点では `PyTssrunCmd(rsc=shared2.ResourceSpec(processes=4))` と書ける。**shared2 の `ResourceSpec` インスタンスがそのまま渡せる**。
+
+### shared2 側の追加要件
+
+- `ResourceSpec::from_parts(processes, threads, cores, memory, gpus) -> Result<ResourceSpec>` を **Rust 公開 API** として export (現状 `PyResourceSpec::new` の中にしか同等ロジックがない)。これ自体は §A3 の改修と一貫しており、Rust 側の API 整合性も向上する。
+- `pyo3-types` feature は維持 (shared2 自身の wheel build のため) だが、SAR は使わなくなる。
+
+### 候補 A〜E 比較表
+
+| 候補 | 規模 | API 一貫性 | ユーザ ergonomics | shared2 への変更 | cdylib サイズ |
+|------|------|-----------|-------------------|----------------|---------------|
+| A (Bound<PyAny>) | 中 | △ (型なし露出) | △ | 中 | 小 |
+| B (Python facade) | 小 | △ | ○ | なし | 大のまま |
+| C (露出諦め) | 最小 | × (path 二系統) | △ | なし | 大のまま |
+| D (cdylib 統合) | 最大 | ○ | ○ | 構造変更 | 大 |
+| E (動的 import) | 中〜大 | ○ | ○ | feature 細分化 | 小 |
+| **F (本案)** | **中** | **○** | **◎** | **小 (`from_parts` 公開のみ)** | **小** |
+
+候補 F が **規模・ergonomics・cdylib サイズの全項目でベスト**。前例 (polars) の実証が 5 年あり、リスクも低い。
+
+### 適用後の予想構成
+
+- `gaussian_job_shared/Cargo.toml`: 変更なし (現状の feature split は維持)
+- `slurm_async_runner/Cargo.toml`: `gaussian_job_shared = { ..., default-features = false }` に戻す (`features = ["pyo3-types"]` 削除)
+- `slurm_async_runner/src/py_export/bridge.rs`: 新規。bridge 型 + `FromPyObject` 実装
+- `slurm_async_runner/src/py_export/tssrun.rs`: `#[pymodule_export] use gaussian_job_shared::...` を削除し、bridge 引数で受ける
+- `slurm_async_runner/src/py_export/mod.rs`: shared2 由来の pyclass を再 export しない
+- `gaussian-job-shared2/src/entities/.../resource_spec.rs`: `pub fn ResourceSpec::from_parts(...)` を追加
