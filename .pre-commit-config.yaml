@@ -1,0 +1,73 @@
+# Pre-commit hooks: format & lint with auto-fix before each commit.
+#
+# One-time setup per clone:
+#   uv tool install pre-commit       # or: pipx install pre-commit
+#   pre-commit install                # registers the git hook
+#
+# Manual run:
+#   pre-commit run --all-files
+#   pre-commit run cargo-clippy-fix   # single hook
+#
+# When a hook modifies a file (autofix), the commit aborts so you can review
+# and re-stage:  git add -u && git commit
+#
+# Hooks mirror .github/workflows/test.yml (ruff check, ruff format --check,
+# cargo fmt --check, cargo clippy -D warnings) but run with --fix locally.
+
+minimum_pre_commit_version: "3.6.0"
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  # Python: ruff lint --fix + ruff format. Configured via [tool.ruff] in
+  # pyproject.toml (target-version py312, double-quoted, space indent).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Keep this in lockstep with the ruff version uv resolves for the dev
+    # group; otherwise the hook can disagree with `uv run ruff format --check`.
+    # Bump with `pre-commit autoupdate --repo https://github.com/astral-sh/ruff-pre-commit`.
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        name: ruff check (autofix)
+        args: [--fix, --exit-non-zero-on-fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        types_or: [python, pyi]
+
+  # Rust: local hooks pick up the nightly toolchain pinned by
+  # rust-toolchain.toml. clippy --fix runs first so its rewrites are then
+  # re-formatted by cargo fmt.
+  - repo: local
+    hooks:
+      - id: cargo-clippy-fix
+        name: cargo clippy --fix
+        description: >-
+          Lint Rust code and apply suggested fixes. --allow-dirty/--allow-staged
+          are required because pre-commit always runs against a non-clean tree.
+          -D warnings matches CI strictness.
+        entry: cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        require_serial: true
+
+      - id: rustfmt
+        name: rustfmt (staged files)
+        description: >-
+          Format only the staged .rs files with rustfmt directly. Edition is
+          read from rustfmt.toml; --edition is also passed explicitly so the
+          hook still works if rustfmt.toml is removed.
+        entry: rustfmt --edition 2024 --
+        language: system
+        types: [rust]
+        require_serial: true

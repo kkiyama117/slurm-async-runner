@@ -1,0 +1,4 @@
+# Match Cargo.toml `edition = "2024"`. Without this, rustfmt invoked outside
+# `cargo fmt` (e.g. by editors or by .pre-commit-config.yaml) defaults to
+# edition 2015 and rewrites code accordingly.
+edition = "2024"
