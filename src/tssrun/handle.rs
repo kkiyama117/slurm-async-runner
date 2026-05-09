@@ -54,6 +54,8 @@ pub struct JobHandle {
     snapshot_rx: watch::Receiver<JobHandleSnapshot>,
     snapshot_tx: watch::Sender<JobHandleSnapshot>,
     wait_handle: Option<JoinHandle<Result<i32>>>,
+    tee_stdout_handle: Option<JoinHandle<()>>,
+    tee_stderr_handle: Option<JoinHandle<()>>,
     persist_path: Option<PathBuf>,
 }
 
@@ -85,13 +87,13 @@ impl JobHandle {
             .take()
             .context("BackgroundDispatcher returned a child without piped stderr")?;
 
-        tokio::spawn(tee_stdout(
+        let tee_stdout_handle = tokio::spawn(tee_stdout(
             stdout,
             log_sink.clone(),
             tx.clone(),
             persist_path.clone(),
         ));
-        tokio::spawn(tee_stderr(
+        let tee_stderr_handle = tokio::spawn(tee_stderr(
             stderr,
             log_sink.clone(),
             tx.clone(),
@@ -127,6 +129,8 @@ impl JobHandle {
             snapshot_rx: rx,
             snapshot_tx: tx,
             wait_handle: Some(wait_handle),
+            tee_stdout_handle: Some(tee_stdout_handle),
+            tee_stderr_handle: Some(tee_stderr_handle),
             persist_path,
         })
     }
@@ -138,6 +142,8 @@ impl JobHandle {
             snapshot_rx: rx,
             snapshot_tx: tx,
             wait_handle: None,
+            tee_stdout_handle: None,
+            tee_stderr_handle: None,
             persist_path,
         }
     }
@@ -176,6 +182,15 @@ impl JobHandle {
             .wait_handle
             .take()
             .ok_or_else(|| anyhow!("not owner of the child / already waited"))?;
+        // Drain stdout/stderr completely before returning, so any salloc:
+        // lines emitted before the child exited are guaranteed to be
+        // parsed into the snapshot.
+        if let Some(t) = self.tee_stdout_handle.take() {
+            let _ = t.await;
+        }
+        if let Some(t) = self.tee_stderr_handle.take() {
+            let _ = t.await;
+        }
         h.await?
     }
 
