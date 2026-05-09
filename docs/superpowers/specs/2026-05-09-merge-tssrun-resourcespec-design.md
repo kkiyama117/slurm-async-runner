@@ -189,13 +189,16 @@ value.
 ### 3.4 Python wrapper API (shared2)
 
 ```python
-# kwargs (or positional) — individual Optional fields
-ResourceSpec(processes=4, threads=8, cores=8, memory="2G")    # full CPU
-ResourceSpec(60, 1, 1)                                         # partial CPU (no m)
-ResourceSpec(memory="8G")                                      # m only
-ResourceSpec()                                                 # CPU all-None (renders to "")
-ResourceSpec(gpus=1)                                           # GPU
-ResourceSpec(processes=4, gpus=1)                              # ValueError: mixed
+# kwargs (or positional) — individual Optional fields.
+# `memory` MUST be a Memory instance — no implicit string/tuple/dict
+# conversion. Construct it explicitly with Memory("2G") or
+# Memory.from_value(2, MemoryUnit.Giga).
+ResourceSpec(processes=4, threads=8, cores=8, memory=Memory("2G"))    # full CPU
+ResourceSpec(60, 1, 1)                                                 # partial CPU (no m)
+ResourceSpec(memory=Memory("8G"))                                      # m only
+ResourceSpec()                                                         # CPU all-None (renders to "")
+ResourceSpec(gpus=1)                                                   # GPU
+ResourceSpec(processes=4, gpus=1)                                      # ValueError: mixed
 
 # string parsing (KUDPC canonical surface form)
 ResourceSpec.from_str("p=60:t=1:c=1")
@@ -211,9 +214,67 @@ str(ResourceSpec(gpus=1))                  # "g=1"
 str(ResourceSpec())                        # ""  (use this if you want --rsc skipped)
 ```
 
-The Rust wrapper performs `NonZeroU32::new(...)` for each integer
-keyword and parses memory via `Memory::from_str`. All errors surface as
-`ValueError`.
+Implementation sketch:
+
+```rust
+// gaussian-job-shared2/src/py_export/entities/slurm/sbatch_options/resource_spec.rs
+
+#[pymethods]
+impl PyResourceSpec {
+    #[new]
+    #[pyo3(signature = (
+        processes = None, threads = None, cores = None,
+        memory = None, gpus = None,
+    ))]
+    fn new(
+        processes: Option<u32>,
+        threads: Option<u32>,
+        cores: Option<u32>,
+        memory: Option<PyMemory>,    // ← strict: only PyMemory accepted
+        gpus: Option<u32>,
+    ) -> PyResult<Self> {
+        let to_nz = |v: u32, key: &'static str| {
+            NonZeroU32::new(v).ok_or_else(||
+                PyValueError::new_err(format!("ResourceSpec/{key} must be > 0")))
+        };
+        let p = processes.map(|v| to_nz(v, "p")).transpose()?;
+        let t = threads.map(|v| to_nz(v, "t")).transpose()?;
+        let c = cores.map(|v| to_nz(v, "c")).transpose()?;
+        let m = memory.map(|pm| pm.0);
+        let g = gpus.map(|v| to_nz(v, "g")).transpose()?;
+
+        match (p.is_some() || t.is_some() || c.is_some() || m.is_some(), g) {
+            (true, Some(_)) => Err(PyValueError::new_err(
+                "CPU keys (processes/threads/cores/memory) and gpus are mutually exclusive"
+            )),
+            (false, None) => Ok(Self(inner::ResourceSpec::CPU(
+                inner::ResourceSpecCPU::default()
+            ))),
+            (false, Some(g)) => Ok(Self(inner::ResourceSpec::GPU(
+                inner::ResourceSpecGPU { g }
+            ))),
+            (true, None) => Ok(Self(inner::ResourceSpec::CPU(
+                inner::ResourceSpecCPU { p, t, c, m }
+            ))),
+        }
+    }
+
+    #[staticmethod]
+    fn from_str(s: &str) -> PyResult<Self> {
+        s.parse::<inner::ResourceSpec>()
+            .map(Self)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+}
+```
+
+`PyMemory` (and `PyMemoryUnit`, `PyResourceSpecCPU`, `PyResourceSpecGPU`)
+are unchanged: `Memory("2G")` and `Memory.from_value(value, unit)` remain
+the canonical Python constructors. The `memory` parameter on
+`PyResourceSpec.__new__` does **not** auto-convert strings, tuples, or
+dicts — callers wrap their value with `Memory(...)` first. The same
+applies to `PyResourceSpecCPU.__new__(p, t, c, m)` (which already takes
+`m: PyMemory`). All errors surface as `ValueError`.
 
 ### 3.5 Feature graph (shared2)
 
@@ -373,8 +434,9 @@ the two semantics agree: `Some(NonZeroU32(n))` means "user specified
 
 `Memory` is constructed via `<Memory as FromStr>::from_str("2G")`, which
 returns `Result<Memory, SchemaParseError>`. The struct literal therefore
-takes `Some(literal.parse()?)`. Python's `memory: Option<&str>` is
-parsed inside `__new__` and wrapped in `Some(_)` on success.
+takes `Some(literal.parse()?)`. Python's `memory` parameter is typed
+`Option<PyMemory>`; callers must wrap the value with `Memory(...)` or
+`Memory.from_value(...)` before passing it.
 
 **Why not a dedicated `Count` newtype?**
 
@@ -414,6 +476,8 @@ results in `--rsc` being omitted from the argv.
 | add | `default_constructor_yields_all_none_cpu` (Python: `ResourceSpec()` → CPU all-None, `str()` is `""`) |
 | add | `kwargs_constructor_rejects_mixed` (Python: `ResourceSpec(processes=4, gpus=1)` → ValueError) |
 | add | `kwargs_constructor_zero_rejected` (Python: `ResourceSpec(gpus=0)` → ValueError) |
+| add | `kwargs_memory_must_be_pymemory` (Python: `ResourceSpec(memory="2G")` → TypeError; `ResourceSpec(memory=Memory("2G"))` → ok) |
+| add | `kwargs_constructor_full_cpu_with_memory` (Python: `ResourceSpec(4, 8, 8, Memory("2G"))` → CPU spec, `str()` = `"p=4:t=8:c=8:m=2G"`) |
 | add | `from_str_classmethod_works` (Python: `ResourceSpec.from_str("p=4:t=8:c=8:m=8G")`) |
 
 ### 5.2 slurm-async-runner2 tests
@@ -493,11 +557,12 @@ cmd = TssrunCmd(
 from slurm_async_runner._slurm_async_runner_core.tssrun import TssrunCmd
 from gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options.resource_spec import ResourceSpec
 from gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options.time_limit import JobTimeLimit
+from gaussian_job_shared._gaussian_job_shared_core.entities.slurm.sbatch_options import Memory
 
 cmd = TssrunCmd(
     program="/work/job.sh", partition="gr19999b",
     time_limit=JobTimeLimit("1:00:00"),
-    rsc=ResourceSpec(4, 8, 8, "2G"),
+    rsc=ResourceSpec(4, 8, 8, Memory("2G")),
 )
 ```
 
