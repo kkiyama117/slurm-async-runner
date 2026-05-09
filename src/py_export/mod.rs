@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 pub mod manager;
 pub mod runner;
+pub mod tssrun;
 
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
@@ -26,6 +27,10 @@ mod slurm_async_runner {
     // ---- manager sub-module: slurm_async_runner._core.manager ----
     #[pymodule_export]
     use super::manager::inner_module as manager_module;
+
+    // ---- tssrun sub-module: slurm_async_runner._core.tssrun ----
+    #[pymodule_export]
+    use super::tssrun::inner_module as tssrun_module;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
