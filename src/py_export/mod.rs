@@ -2,6 +2,8 @@
 
 use pyo3::prelude::*;
 
+pub mod entities;
+pub mod error;
 pub mod manager;
 pub mod runner;
 pub mod tssrun;
@@ -19,6 +21,10 @@ mod slurm_async_runner {
     // ---- legacy demo function ----
     #[pymodule_export]
     use crate::py_export::sum_as_string;
+
+    // ---- entities sub-module: slurm_async_runner._slurm_async_runner_core.entities ----
+    #[pymodule_export]
+    use crate::py_export::entities::inner_module as entities_module;
 
     // ---- async batch-query sub-module: slurm_async_runner._slurm_async_runner_core.runner ----
     #[pymodule_export]
