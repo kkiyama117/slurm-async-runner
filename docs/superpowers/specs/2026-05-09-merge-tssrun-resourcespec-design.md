@@ -318,6 +318,74 @@ cmd = TssrunCmd(
 `TssrunCmd.__new__`'s `rsc=` parameter accepts `PyResourceSpec`,
 `time_limit=` accepts `PyJobTimeLimit`, and `partition=` accepts `str`.
 
+### 3.9 Construction conventions (`Option<NonZeroU32>` / `Option<Memory>`)
+
+The relaxed `ResourceSpecCPU` keeps shared2's existing positive-integer
+invariant by wrapping `NonZeroU32` (and `Memory`) in `Option<>` rather
+than relaxing to plain `u32`. Two construction surfaces exist, and they
+treat the value `0` differently — by design:
+
+**Rust direct struct literal (terse, internal use)**
+
+```rust
+use std::num::NonZeroU32;
+
+ResourceSpecCPU {
+    p: NonZeroU32::new(4),         // Option<NonZeroU32>::Some(4)
+    t: NonZeroU32::new(8),
+    c: NonZeroU32::new(8),
+    m: Some("2G".parse()?),
+}
+```
+
+`NonZeroU32::new(n)` returns `Option<NonZeroU32>`, so the field type
+matches with no extra wrapping. **Passing `0` here silently maps to
+`None`** ("absent" / "use default"). This is intentional: the KUDPC
+manual treats `0` for any of `p, t, c, g` as semantically meaningless
+(minimum is 1, default is 1), so conflating "zero" and "absent" loses
+no expressible meaning.
+
+**External input (FromStr, Python kwargs) — `0` is rejected**
+
+External callers normally do *intend* a particular value when they pass
+`0`, so the type-level conflation is unsafe. Both parsing paths reject
+`0` explicitly:
+
+```rust
+// FromStr — parse_count returns Result<NonZeroU32, SchemaParseError>
+fn parse_count(...) -> Result<NonZeroU32, SchemaParseError> {
+    let n: u32 = raw.parse().map_err(|_| err())?;
+    NonZeroU32::new(n).ok_or_else(err)        // 0 → Err
+}
+
+// Python kwargs — PyResourceSpec::__new__
+let p = processes
+    .map(|v| NonZeroU32::new(v).ok_or_else(||
+        PyValueError::new_err("processes must be > 0")))
+    .transpose()?;       // Some(0) → Err, Some(n) → Some(NonZeroU32), None → None
+```
+
+After validation, the Rust-side struct holds `Option<NonZeroU32>` and
+the two semantics agree: `Some(NonZeroU32(n))` means "user specified
+`n`", `None` means "absent / use system default".
+
+**Memory follows the same pattern**
+
+`Memory` is constructed via `<Memory as FromStr>::from_str("2G")`, which
+returns `Result<Memory, SchemaParseError>`. The struct literal therefore
+takes `Some(literal.parse()?)`. Python's `memory: Option<&str>` is
+parsed inside `__new__` and wrapped in `Some(_)` on success.
+
+**Why not a dedicated `Count` newtype?**
+
+`NonZeroU32` already encodes the invariant; wrapping it in another
+newtype would only re-export `Option<NonZeroU32>` semantics under a
+different name. The Python wrapper and `parse_count` are the two narrow
+spots where 0-rejection matters, and they handle it explicitly. A
+future ergonomic builder (`ResourceSpecCPU::builder().processes(4)?...`)
+is left as out-of-scope; the current code rarely constructs partial CPU
+specs in Rust.
+
 ## 4. Error model
 
 | condition | error type | source |
