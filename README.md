@@ -121,9 +121,55 @@ async def main():
 asyncio.run(main())
 ```
 
-A separate process can later call `await manager.attach_pid(pid)`
-(or `attach_jobid` / `attach_file`) to inspect the persisted snapshot
-read-only.
+### Handle API contract
+
+`TssrunJobHandle` returns awaitables for all reads, but the **snapshot
+getters are lock-free against an in-flight `wait()`** — you can poll
+liveness while the wait is pending without blocking it:
+
+```python
+handle = await manager.spawn()
+wait_fut = asyncio.ensure_future(handle.wait())
+
+while not wait_fut.done():
+    if await handle.is_running():
+        print("jobid", await handle.jobid, "node", await handle.node)
+    await asyncio.sleep(1)
+
+code = await wait_fut
+```
+
+The full snapshot surface:
+
+| Reader (lock-free) | Returns | Notes |
+|---|---|---|
+| `await handle.pid` | `int` | The OS pid of the spawned `tssrun` process |
+| `await handle.jobid` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
+| `await handle.node` | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
+| `await handle.sent_env` | `dict[str, str]` | Env explicitly passed via `TssrunCmd.env` |
+| `await handle.live_env()` | `dict[str, str] \| None` | Reads `/proc/<pid>/environ` on Linux; `None` off-Linux or after exit |
+| `await handle.is_running()` | `bool` | `True` until the wait task records `finished` |
+| `await handle.exit_code()` | `int \| None` | Available after exit; `None` for signal kill |
+
+| Owner-only | Returns | Notes |
+|---|---|---|
+| `await handle.wait()` | `int \| None` | `int` = exit code; `None` = killed by signal (SLURM time-limit kill, OOM, etc.). Raises `RuntimeError` on attached / already-waited handles. |
+
+### Cross-process attach
+
+`TssrunManager` persists a JSON snapshot to `{state_dir}/{pid}.json`
+(atomic rename) every time `salloc:` parsing or wait completion updates
+the state. A separate process can re-attach with read-only semantics:
+
+```python
+attached = await manager.attach_pid(12345)         # by pid
+attached = await manager.attach_jobid(102362)      # by parsed jobid (scans state_dir)
+attached = await manager.attach_file("/path/to/12345.json")
+```
+
+Attached handles support every snapshot getter (they reflect the JSON's
+last-known state) but `wait()` raises — only the original spawner owns
+the child.
 
 ### Live smoke test on kudpc / ECCS
 

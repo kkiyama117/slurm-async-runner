@@ -2,7 +2,18 @@
 //!
 //! Sinks are invoked once per `\n`-delimited line (no trailing newline).
 //! Implementations must be `Send + Sync` so the tee task can be spawned
-//! on the multi-threaded tokio runtime.
+//! on the multi-threaded tokio runtime, and [`JobLogSink`] is
+//! dyn-compatible (returns boxed futures rather than RPIT) so callers can
+//! hold `Arc<dyn JobLogSink>`.
+//!
+//! Built-in implementations:
+//!
+//! | Sink | Use case |
+//! |---|---|
+//! | [`NullLogSink`] | Discard every line. Snapshot parsing still runs. |
+//! | [`StdLogSink`] | Forward to the parent's stdout / stderr. |
+//! | [`InMemoryLogSink`] | Capture to a `Vec` for tests / diagnostics. |
+//! | [`FileLogSink`] | Append to two on-disk files (one per stream). |
 
 use std::path::PathBuf;
 use std::pin::Pin;

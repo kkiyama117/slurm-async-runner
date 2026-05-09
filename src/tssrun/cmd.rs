@@ -1,4 +1,15 @@
-//! Spec types: [`Resource`] and `TssrunCmd` with argv builder. No I/O.
+//! Pure-data spec types for one `tssrun` invocation:
+//!
+//! - [`Resource`] — `--rsc p=:t=:c=:m=:g=` builder; only fields set to
+//!   `Some(_)` are emitted, in a fixed order, joined by `:`.
+//! - [`TssrunCmd`] — full argv spec including binary path, optional
+//!   queue / time-limit / x11 / explicit env / cwd, plus
+//!   [`TssrunCmd::build_argv`] which produces the argv that
+//!   [`crate::dispatcher::TokioBackgroundDispatcher`] will hand to
+//!   `tokio::process::Command`.
+//!
+//! No I/O happens in this module — all subprocess work is in the
+//! dispatcher / handle / manager.
 
 /// Resource spec passed to `tssrun --rsc p=:t=:c=:m=:g=`.
 ///

@@ -1,4 +1,33 @@
-//! `TssrunManager` orchestrates spawn / attach / query_state.
+//! [`TssrunManager`] orchestrates `spawn` / `attach` / `query_state` for a
+//! single [`TssrunCmd`].
+//!
+//! ## Responsibilities
+//!
+//! - Holds the [`TssrunCmd`] spec, an optional `state_dir` for
+//!   JSON-snapshot persistence, and a shared [`JobLogSink`] for tee'd
+//!   stdout/stderr.
+//! - [`TssrunManager::spawn`] launches the child via
+//!   [`TokioBackgroundDispatcher`] and returns a [`JobHandle`] whose
+//!   snapshot is updated as `salloc:` lines arrive and as the wait task
+//!   records exit info. When `state_dir` is set, every snapshot mutation
+//!   persists `{state_dir}/{pid}.json` via atomic rename.
+//! - [`TssrunManager::attach`] reconstructs a read-only [`JobHandle`]
+//!   from a previously persisted snapshot, identified by [`AttachKey`].
+//! - [`TssrunManager::query_state`] looks up SLURM lifecycle state via
+//!   `sacct` for handles that already parsed a jobid.
+//!
+//! ## Builder pattern
+//!
+//! ```ignore
+//! let manager = TssrunManager::new(cmd)
+//!     .with_state_dir(PathBuf::from("/var/lib/slurm-runner"))
+//!     .with_log_sink(Arc::new(StdLogSink));
+//! ```
+//!
+//! Fields are crate-private on purpose — mutating them after a `spawn()`
+//! would not retroactively redirect already-running handles' persistence
+//! or log routing, so the builders are the only sanctioned construction
+//! path.
 
 use std::path::PathBuf;
 use std::sync::Arc;

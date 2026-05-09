@@ -14,7 +14,7 @@ pub fn parse_salloc_jobid(line: &str) -> Option<u64> {
 }
 
 /// Returns `Some(node_spec)` when `line` is the SLURM
-/// "Nodes <spec> are ready for job" message. The node spec is preserved
+/// `"Nodes <spec> are ready for job"` message. The node spec is preserved
 /// verbatim (e.g. `"cnode3"` or `"cnode[3-4]"`).
 pub fn parse_salloc_node(line: &str) -> Option<String> {
     let rest = line.strip_prefix("salloc: Nodes ")?;

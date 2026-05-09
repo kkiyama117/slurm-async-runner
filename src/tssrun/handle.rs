@@ -1,4 +1,29 @@
-//! `JobHandleSnapshot` (Serde) and `JobHandle` (in-process state).
+//! [`JobHandleSnapshot`] (Serde) and [`JobHandle`] (in-process state) plus
+//! the free function [`read_live_env_for_pid`] for callers that only have
+//! a pid but need to inspect the child's `/proc/<pid>/environ`.
+//!
+//! ## Snapshot vs. owner split
+//!
+//! [`JobHandle`] keeps two pieces of state:
+//!
+//! - A [`tokio::sync::watch`] channel whose value is the current
+//!   [`JobHandleSnapshot`]. Cloned via [`JobHandle::watch`] for any reader
+//!   that wants lock-free polling — including the pyo3 binding.
+//! - Three `Option<JoinHandle<…>>` fields (wait + tee_stdout + tee_stderr)
+//!   that are `.take()`-d exactly once during [`JobHandle::wait`]. After
+//!   wait completes, the handle is "drained" and can no longer wait again.
+//!
+//! Attached handles ([`JobHandle::attach_snapshot`]) skip the join handles
+//! and only carry the receiver — `wait()` on them returns
+//! `Err("not owner of the child / already waited")`.
+//!
+//! ## Persistence
+//!
+//! When `persist_path = Some(p)`, every mutation that changes `jobid`,
+//! `node`, or `finished` triggers an atomic-rename write of `p` using
+//! `tempfile::NamedTempFile::persist`. Cross-process attach reads the
+//! same file back via
+//! [`crate::tssrun::manager::TssrunManager::attach`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
