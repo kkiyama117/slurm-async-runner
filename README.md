@@ -92,6 +92,114 @@ No shell wrapping (`$SHELL -c "..."`) is used — both Python's
 `asyncio.create_subprocess_exec` and Rust's `tokio::process::Command::args`
 accept argv directly.
 
+## tssrun (background mode + env inspection)
+
+For the Kyoto-U ECCS interactive batch frontend `tssrun`, the
+`slurm_async_runner.tssrun` submodule offers a non-blocking spawn API
+and snapshot-based environment inspection.
+
+```python
+import asyncio
+from slurm_async_runner._core.tssrun import (
+    Resource, TssrunCmd, TssrunManager, file_log_sink,
+)
+
+async def main():
+    cmd = TssrunCmd(
+        program="/work/job.sh",
+        queue="gr19999b", time_limit="1:00:00",
+        rsc=Resource(processes=4, memory="2G"),
+    )
+    sink = await file_log_sink("/tmp/job.out", "/tmp/job.err")
+    manager = TssrunManager(cmd, state_dir="/var/lib/slurm-runner", log_sink=sink)
+
+    handle = await manager.spawn()
+    print("pid", await handle.pid, "jobid", await handle.jobid)
+    code = await handle.wait()  # int on normal exit, None on signal kill
+    print("exit", code)
+
+asyncio.run(main())
+```
+
+### Handle API contract
+
+`TssrunJobHandle` returns awaitables for all reads, but the **snapshot
+getters are lock-free against an in-flight `wait()`** — you can poll
+liveness while the wait is pending without blocking it:
+
+```python
+handle = await manager.spawn()
+wait_fut = asyncio.ensure_future(handle.wait())
+
+while not wait_fut.done():
+    if await handle.is_running():
+        print("jobid", await handle.jobid, "node", await handle.node)
+    await asyncio.sleep(1)
+
+code = await wait_fut
+```
+
+The full snapshot surface:
+
+| Reader (lock-free) | Returns | Notes |
+|---|---|---|
+| `await handle.pid` | `int` | The OS pid of the spawned `tssrun` process |
+| `await handle.jobid` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
+| `await handle.node` | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
+| `await handle.sent_env` | `dict[str, str]` | Env explicitly passed via `TssrunCmd.env` |
+| `await handle.live_env()` | `dict[str, str] \| None` | Reads `/proc/<pid>/environ` on Linux; `None` off-Linux or after exit |
+| `await handle.is_running()` | `bool` | `True` until the wait task records `finished` |
+| `await handle.exit_code()` | `int \| None` | Available after exit; `None` for signal kill |
+
+| Owner-only | Returns | Notes |
+|---|---|---|
+| `await handle.wait()` | `int \| None` | `int` = exit code; `None` = killed by signal (SLURM time-limit kill, OOM, etc.). Raises `RuntimeError` on attached / already-waited handles. |
+
+### Cross-process attach
+
+`TssrunManager` persists a JSON snapshot to `{state_dir}/{pid}.json`
+(atomic rename) every time `salloc:` parsing or wait completion updates
+the state. A separate process can re-attach with read-only semantics:
+
+```python
+attached = await manager.attach_pid(12345)         # by pid
+attached = await manager.attach_jobid(102362)      # by parsed jobid (scans state_dir)
+attached = await manager.attach_file("/path/to/12345.json")
+```
+
+Attached handles support every snapshot getter (they reflect the JSON's
+last-known state) but `wait()` raises — only the original spawner owns
+the child.
+
+### Live smoke test on kudpc / ECCS
+
+The unit and integration tests stub `tssrun` with `bash` so they run on any
+dev machine. To validate the wrapper against a real SLURM allocation, run
+the live smoke script on a host where `tssrun` is actually installed:
+
+```bash
+# Standalone — exits 0 on PASS, 0+SKIP message off-cluster, 1 on FAIL.
+uv run python scripts/test_tssrun_live.py
+
+# Or via pytest (opt-in, skipped unless RUN_LIVE_TSSRUN=1):
+RUN_LIVE_TSSRUN=1 uv run pytest python/tests/test_tssrun_live.py -v -s
+```
+
+Configurable via environment variables (all optional):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TSSRUN_LIVE_BIN` | `tssrun` | Path to the tssrun binary |
+| `TSSRUN_LIVE_QUEUE` | unset (site default) | Queue / partition (`-p`) |
+| `TSSRUN_LIVE_TIME_LIMIT` | `0:01:00` | Wall-clock limit (`-t`) |
+| `TSSRUN_LIVE_RSC` | unset | Raw `--rsc` value, e.g. `p=1:c=1:m=512M` |
+| `TSSRUN_LIVE_TIMEOUT` | `180` | Hard timeout (s) before the runner gives up |
+
+The script spawns a tiny child, awaits completion, and asserts that
+`pid` / `jobid` / `node` / persisted snapshot / `attach_file` round-trip /
+captured stdout log all line up — i.e. the same end-to-end shape as the
+integration test, but driven through the real tssrun → salloc → srun path.
+
 ## Development
 
 ```bash

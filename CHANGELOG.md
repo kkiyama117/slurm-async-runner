@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`slurm_async_runner::tssrun` Rust module and `slurm_async_runner._core.tssrun`
+  Python submodule.** Provides `TssrunCmd` (typed `tssrun` argv builder),
+  `TssrunManager` (background spawn / attach / state query), `JobHandle`
+  with watch-based snapshot, and a pluggable `JobLogSink` trait
+  (`Null/Std/InMemory/FileLogSink`).
+- **`BackgroundDispatcher` trait + `TokioBackgroundDispatcher`** for
+  non-blocking child spawn alongside the existing synchronous
+  `JobDispatcher`.
 - **Rust port of `slurm-async-runner`.** Initial Rust + pyo3 implementation
   replacing the pure-Python prototype, with a Python-compatible async API
   exposed through `pyo3-async-runtimes` (tokio runtime).
@@ -37,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`JobHandle::wait()` returns `Result<Option<i32>>`.** Was `Result<i32>`
+  with `unwrap_or(0)` masking signal kills. Now `Ok(None)` distinguishes
+  signal-killed children (e.g. SLURM time-limit kill, OOM) from clean
+  exits. The `.pyi` stub and Python wrapper surface the same `int | None`.
+- **`PyTssrunJobHandle` snapshot getters are lock-free.** Snapshot getters
+  (`pid`, `jobid`, `node`, `sent_env`, `is_running`, `exit_code`,
+  `live_env`) read from a cloned `watch::Receiver` and never lock the
+  `JobHandle` mutex. `wait()` is the only method that takes the mutex,
+  so concurrent polls during an in-flight `wait()` no longer block.
+- **`TssrunManager` fields are now `pub(crate)`.** Use the
+  `with_state_dir` / `with_log_sink` builders instead of mutating fields
+  directly — mid-flight mutation isn't retroactive on running handles.
 - **No shell wrapping.** The previous Python prototype wrapped `srun` in
   `$SHELL -c "..."`; this port spawns argv directly via
   `tokio::process::Command::args`. Both Python's

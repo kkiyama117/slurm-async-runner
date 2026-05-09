@@ -6,6 +6,7 @@ pub use py_export::stub_info;
 pub mod dispatcher;
 pub mod manager;
 pub mod runner;
+pub mod tssrun;
 
 // Re-export the SLURM lifecycle types so downstream Rust crates can write
 // `use slurm_async_runner::{JobStatus, JobState, JobReason}` without taking
@@ -24,6 +25,18 @@ pub use manager::{SlurmCmd, SlurmManager};
 // Re-export the dispatcher abstraction so callers can plug in custom
 // runtime implementations or use the shipped Tokio / dry-run flavors.
 pub use dispatcher::{DryRunDispatcher, JobDispatcher, TokioDispatcher};
+
+// Re-export background dispatcher types.
+pub use dispatcher::{BackgroundDispatcher, SpawnedChild, TokioBackgroundDispatcher};
+
+// Re-export tssrun public API.
+pub use tssrun::cmd::{Resource, TssrunCmd};
+pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};
+pub use tssrun::log::{
+    FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,
+};
+pub use tssrun::manager::{AttachKey, TssrunManager};
+pub use tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
 
 #[cfg(test)]
 mod tests {
