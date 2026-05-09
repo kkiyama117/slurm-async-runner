@@ -1,3 +1,6 @@
+pub mod entities;
+pub mod error;
+
 #[cfg(feature = "pyo3")]
 pub mod py_export;
 #[cfg(feature = "pyo3")]
