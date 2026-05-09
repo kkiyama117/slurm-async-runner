@@ -200,6 +200,12 @@ The script spawns a tiny child, awaits completion, and asserts that
 captured stdout log all line up — i.e. the same end-to-end shape as the
 integration test, but driven through the real tssrun → salloc → srun path.
 
+> **Cluster-side setup matters.** On kudpc / ECCS you need to point
+> `TMPDIR` at a shared filesystem (compute nodes can't see the login
+> node's `/tmp`) and pick a `TSSRUN_LIVE_QUEUE` your group is permitted
+> to use. See [`docs/setup_test.md`](docs/setup_test.md) for the full
+> operator checklist, including failure-mode triage.
+
 ## Development
 
 ```bash
