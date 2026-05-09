@@ -230,6 +230,29 @@ The CI pipeline runs all of the above on every push and PR; see
 [`.github/workflows/test.yml`](.github/workflows/test.yml). Wheel building +
 PyPI publishing is in [`.github/workflows/CI.yml`](.github/workflows/CI.yml).
 
+### Pre-commit hooks (local autofix)
+
+[`.pre-commit-config.yaml`](.pre-commit-config.yaml) wires `ruff check --fix`,
+`ruff format`, `cargo clippy --fix`, and `rustfmt` (edition 2024, see
+[`rustfmt.toml`](rustfmt.toml)) to run before each commit, mirroring CI but
+with autofix. One-time setup per clone:
+
+```bash
+uv tool install pre-commit          # or: pipx install pre-commit
+pre-commit install                  # registers .git/hooks/pre-commit
+```
+
+Manual sweep across the repo:
+
+```bash
+pre-commit run --all-files
+```
+
+When a hook rewrites files, the commit aborts so you can review the diff and
+re-stage (`git add -u && git commit`). The first commit on a fresh clone is
+slow because `cargo clippy` compiles the workspace; subsequent runs hit the
+cargo cache. To bypass hooks in an emergency, use `git commit --no-verify`.
+
 ## License
 
 See repository root.
