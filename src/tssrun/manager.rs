@@ -152,10 +152,7 @@ impl TssrunManager {
                 find_in_state_dir(dir, |s| s.pid == pid)
                     .await?
                     .ok_or_else(|| {
-                        anyhow!(
-                            "no persisted handle in {} matched pid {pid}",
-                            dir.display()
-                        )
+                        anyhow!("no persisted handle in {} matched pid {pid}", dir.display())
                     })?
             }
             AttachKey::JobId(jobid) => {
