@@ -6,6 +6,7 @@ pub use py_export::stub_info;
 pub mod dispatcher;
 pub mod manager;
 pub mod runner;
+pub mod tssrun;
 
 // Re-export the SLURM lifecycle types so downstream Rust crates can write
 // `use slurm_async_runner::{JobStatus, JobState, JobReason}` without taking
