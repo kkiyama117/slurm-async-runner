@@ -53,15 +53,15 @@ tempfile = "3.10"
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
 # Shared Gaussian job entities (Job, JobSpec, SlurmJobConfig, JobStatus,
-# JobState, JobReason). `default-features = false` is REQUIRED: upstream
-# defaults enable its `pyo3` feature, which compiles `py_export` and emits
-# `PyInit__core`. This crate also exports its own `_core` pymodule, so the
-# linker refuses with "duplicate symbol PyInit__core". Disabling defaults
-# here gives us the Rust types only; Python users import the Py* wrappers
-# directly from `gaussian_job_shared._core.entities.slurm.status`.
-# Pinned to `branch = "main"` during migration; tighten to a `rev`/`tag`
-# after S6 stabilizes the public API.
-gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", branch = "main", default-features = false }
+# JobState, JobReason, ResourceSpec, JobTimeLimit). We enable
+# `pyo3-types` so the pyclass wrappers (PyResourceSpec, PyJobTimeLimit,
+# etc.) are linked into our extension, but NOT the upstream
+# `pymodule-entry` feature — that would emit a
+# `PyInit__gaussian_job_shared_core` symbol that we don't want in our
+# `.so`. The shared2 wheel still ships its own
+# `_gaussian_job_shared_core` extension separately for direct Python
+# users.
+gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", rev = "299d3e80d73b1533e4dd7c5f4fdde000c7be1aae", default-features = false, features = ["pyo3-types"] }
 
 ##### OPTIONAL DEPS #####
 # PYO3

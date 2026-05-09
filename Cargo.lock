@@ -243,13 +243,18 @@ dependencies = [
 [[package]]
 name = "gaussian_job_shared"
 version = "0.1.0"
-source = "git+https://github.com/kkiyama117/gaussian_job_shared?branch=main#e40205da46326dbf7aeb247a801458ef0180b056"
+source = "git+https://github.com/kkiyama117/gaussian_job_shared?rev=299d3e80d73b1533e4dd7c5f4fdde000c7be1aae#299d3e80d73b1533e4dd7c5f4fdde000c7be1aae"
 dependencies = [
  "anyhow",
  "chrono",
  "futures",
  "itertools 0.14.0",
  "log",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-log",
+ "pyo3-stub-gen",
+ "pythonize",
  "serde",
  "thiserror",
  "tokio",
