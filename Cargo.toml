@@ -21,6 +21,11 @@ required-features = ["stub_gen"]
 anyhow = "1.0"
 thiserror = "2.0"
 
+# `async fn` in object-safe traits (`dyn JobStateStore`). Edition 2024
+# supports AFIT for static dispatch, but `dyn Trait` for an async-fn
+# trait still requires this macro-based desugaring.
+async-trait = "0.1"
+
 # Logging and tracing
 log = "0.4"
 tracing = "0.1"

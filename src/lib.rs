@@ -37,6 +37,7 @@ pub use tssrun::log::{
 };
 pub use tssrun::manager::{AttachKey, TssrunManager};
 pub use tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
+pub use tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
 
 #[cfg(test)]
 mod tests {

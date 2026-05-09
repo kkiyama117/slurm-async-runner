@@ -19,14 +19,22 @@
 //!
 //! ## Persistence
 //!
-//! When `persist_path = Some(p)`, every mutation that changes `jobid`,
-//! `node`, or `finished` triggers an atomic-rename write of `p` using
-//! `tempfile::NamedTempFile::persist`. Cross-process attach reads the
-//! same file back via
+//! When `store = Some(s)`, every mutation that changes `jobid`, `node`,
+//! or `finished` triggers `s.save(&snapshot).await`. The shipped
+//! [`FileSystemStateStore`] writes `{dir}/{uuid}.json` via atomic
+//! rename; the [`InMemoryStateStore`] just inserts into a HashMap.
+//! Save errors are logged via `tracing::warn!` rather than propagated,
+//! because losing one mid-flight persistence write must not crash an
+//! otherwise-healthy job.
+//!
+//! Cross-process attach reads the same store back via
 //! [`crate::tssrun::manager::TssrunManager::attach`].
+//!
+//! [`FileSystemStateStore`]: crate::tssrun::store::FileSystemStateStore
+//! [`InMemoryStateStore`]: crate::tssrun::store::InMemoryStateStore
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,6 +49,7 @@ use uuid::Uuid;
 use crate::dispatcher::SpawnedChild;
 use crate::tssrun::log::{JobLogSink, LogStream};
 use crate::tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
+use crate::tssrun::store::JobStateStore;
 
 /// Where the tee task is writing the child's logs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,24 +99,31 @@ pub struct JobHandle {
     wait_handle: Option<JoinHandle<Result<Option<i32>>>>,
     tee_stdout_handle: Option<JoinHandle<()>>,
     tee_stderr_handle: Option<JoinHandle<()>>,
-    persist_path: Option<PathBuf>,
+    store: Option<Arc<dyn JobStateStore>>,
 }
 
 impl JobHandle {
     /// Build a handle from a freshly spawned child. Spawns the tee tasks
     /// for stdout/stderr and the wait task for `child.wait()`.
+    ///
+    /// When `store` is `Some`, every mutation that changes `jobid`,
+    /// `node`, or `finished` is also written through. Save failures are
+    /// downgraded to `tracing::warn!` so a transient backend hiccup does
+    /// not abort an otherwise-healthy job.
     pub async fn from_spawn(
         mut spawned: SpawnedChild,
         init: JobHandleSnapshot,
         log_sink: Arc<dyn JobLogSink>,
-        persist_path: Option<PathBuf>,
+        store: Option<Arc<dyn JobStateStore>>,
     ) -> Result<Self> {
         let (tx, rx) = watch::channel(init);
 
-        if let Some(p) = &persist_path
-            && let Err(e) = write_atomic_json(p, &tx.borrow())
-        {
-            tracing::warn!(error = %e, path = %p.display(), "initial persist failed");
+        if let Some(s) = &store {
+            // Clone before awaiting: `tx.borrow()` returns a non-Send guard,
+            // which would make the surrounding future non-Send and break the
+            // pyo3-async-runtimes `future_into_py` Send bound downstream.
+            let snap = tx.borrow().clone();
+            persist_warn(s.as_ref(), &snap, "initial").await;
         }
 
         let stdout = spawned
@@ -125,20 +141,20 @@ impl JobHandle {
             stdout,
             log_sink.clone(),
             tx.clone(),
-            persist_path.clone(),
+            store.clone(),
         ));
         let tee_stderr_handle = tokio::spawn(tee_stderr(
             stderr,
             log_sink.clone(),
             tx.clone(),
-            persist_path.clone(),
+            store.clone(),
         ));
 
         let child_arc = Arc::new(Mutex::new(spawned.child));
         let wait_handle = {
             let child = child_arc.clone();
             let tx = tx.clone();
-            let persist_path = persist_path.clone();
+            let store = store.clone();
             let log_sink = log_sink.clone();
             tokio::spawn(async move {
                 let status = child.lock().await.wait().await?;
@@ -148,16 +164,17 @@ impl JobHandle {
                 // previous behaviour of returning Ok(0) silently masked
                 // failures and was the source of issue H2.
                 let code = status.code();
-                tx.send_modify(|s| {
-                    s.finished = Some(FinishedInfo {
-                        exit_code: code,
-                        finished_at_unix: now_unix(),
+                let snap_to_persist = {
+                    tx.send_modify(|s| {
+                        s.finished = Some(FinishedInfo {
+                            exit_code: code,
+                            finished_at_unix: now_unix(),
+                        });
                     });
-                });
-                if let Some(p) = &persist_path
-                    && let Err(e) = write_atomic_json(p, &tx.borrow())
-                {
-                    tracing::warn!(error = %e, path = %p.display(), "post-exit persist failed");
+                    tx.borrow().clone()
+                };
+                if let Some(s) = &store {
+                    persist_warn(s.as_ref(), &snap_to_persist, "post-exit").await;
                 }
                 let _ = log_sink.flush().await;
                 Ok(code)
@@ -170,12 +187,12 @@ impl JobHandle {
             wait_handle: Some(wait_handle),
             tee_stdout_handle: Some(tee_stdout_handle),
             tee_stderr_handle: Some(tee_stderr_handle),
-            persist_path,
+            store,
         })
     }
 
     /// Build a read-only handle from a previously persisted snapshot.
-    pub fn attach_snapshot(snap: JobHandleSnapshot, persist_path: Option<PathBuf>) -> Self {
+    pub fn attach_snapshot(snap: JobHandleSnapshot, store: Option<Arc<dyn JobStateStore>>) -> Self {
         let (tx, rx) = watch::channel(snap);
         Self {
             snapshot_rx: rx,
@@ -183,7 +200,7 @@ impl JobHandle {
             wait_handle: None,
             tee_stdout_handle: None,
             tee_stderr_handle: None,
-            persist_path,
+            store,
         }
     }
 
@@ -250,14 +267,17 @@ impl JobHandle {
         h.await?
     }
 
-    /// Re-read the persisted snapshot from disk and broadcast it.
-    pub async fn refresh_from_disk(&self) -> Result<()> {
-        let p = self
-            .persist_path
+    /// Re-read the persisted snapshot from the store and broadcast it.
+    pub async fn refresh(&self) -> Result<()> {
+        let store = self
+            .store
             .as_ref()
-            .ok_or_else(|| anyhow!("no persist_path on this handle"))?;
-        let bytes = tokio::fs::read(p).await?;
-        let snap: JobHandleSnapshot = serde_json::from_slice(&bytes)?;
+            .ok_or_else(|| anyhow!("no store on this handle"))?;
+        let uuid = self.snapshot_rx.borrow().uuid;
+        let snap = store
+            .load(uuid)
+            .await?
+            .ok_or_else(|| anyhow!("uuid {uuid} not found in store"))?;
         let _ = self.snapshot_tx.send(snap);
         Ok(())
     }
@@ -337,18 +357,18 @@ async fn tee_stdout(
     stdout: ChildStdout,
     sink: Arc<dyn JobLogSink>,
     tx: watch::Sender<JobHandleSnapshot>,
-    persist_path: Option<PathBuf>,
+    store: Option<Arc<dyn JobStateStore>>,
 ) {
-    tee_lines(stdout, LogStream::Stdout, sink, tx, persist_path).await;
+    tee_lines(stdout, LogStream::Stdout, sink, tx, store).await;
 }
 
 async fn tee_stderr(
     stderr: ChildStderr,
     sink: Arc<dyn JobLogSink>,
     tx: watch::Sender<JobHandleSnapshot>,
-    persist_path: Option<PathBuf>,
+    store: Option<Arc<dyn JobStateStore>>,
 ) {
-    tee_lines(stderr, LogStream::Stderr, sink, tx, persist_path).await;
+    tee_lines(stderr, LogStream::Stderr, sink, tx, store).await;
 }
 
 async fn tee_lines<R>(
@@ -356,7 +376,7 @@ async fn tee_lines<R>(
     stream_kind: LogStream,
     sink: Arc<dyn JobLogSink>,
     tx: watch::Sender<JobHandleSnapshot>,
-    persist_path: Option<PathBuf>,
+    store: Option<Arc<dyn JobStateStore>>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -384,11 +404,12 @@ async fn tee_lines<R>(
                         }
                     });
                 }
-                if updated
-                    && let Some(p) = &persist_path
-                    && let Err(e) = write_atomic_json(p, &tx.borrow())
-                {
-                    tracing::warn!(error = %e, "persist after parse failed");
+                if updated && let Some(s) = &store {
+                    // Clone the snapshot under the lock window of `borrow()`
+                    // and release before awaiting the store — avoids holding
+                    // the watch borrow across an `.await` point.
+                    let snap = tx.borrow().clone();
+                    persist_warn(s.as_ref(), &snap, "after parse").await;
                 }
             }
             Ok(None) => break,
@@ -407,17 +428,14 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-fn write_atomic_json(path: &Path, snap: &JobHandleSnapshot) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("persist_path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to mkdir -p {}", parent.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut tmp, snap)?;
-    tmp.persist(path)
-        .map_err(|e| anyhow!("persist rename failed: {e}"))?;
-    Ok(())
+/// Save `snap` through `store`, downgrading any error to a warning.
+/// The wait/tee tasks call this as the child progresses; a transient
+/// store outage must not crash the job, just leave the persisted view
+/// slightly stale until the next mutation.
+async fn persist_warn(store: &dyn JobStateStore, snap: &JobHandleSnapshot, when: &str) {
+    if let Err(e) = store.save(snap).await {
+        tracing::warn!(error = %e, when, uuid = %snap.uuid, "store.save failed");
+    }
 }
 
 #[cfg(test)]
