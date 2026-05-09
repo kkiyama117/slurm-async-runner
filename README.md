@@ -125,6 +125,35 @@ A separate process can later call `await manager.attach_pid(pid)`
 (or `attach_jobid` / `attach_file`) to inspect the persisted snapshot
 read-only.
 
+### Live smoke test on kudpc / ECCS
+
+The unit and integration tests stub `tssrun` with `bash` so they run on any
+dev machine. To validate the wrapper against a real SLURM allocation, run
+the live smoke script on a host where `tssrun` is actually installed:
+
+```bash
+# Standalone — exits 0 on PASS, 0+SKIP message off-cluster, 1 on FAIL.
+uv run python scripts/test_tssrun_live.py
+
+# Or via pytest (opt-in, skipped unless RUN_LIVE_TSSRUN=1):
+RUN_LIVE_TSSRUN=1 uv run pytest python/tests/test_tssrun_live.py -v -s
+```
+
+Configurable via environment variables (all optional):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TSSRUN_LIVE_BIN` | `tssrun` | Path to the tssrun binary |
+| `TSSRUN_LIVE_QUEUE` | unset (site default) | Queue / partition (`-p`) |
+| `TSSRUN_LIVE_TIME_LIMIT` | `0:01:00` | Wall-clock limit (`-t`) |
+| `TSSRUN_LIVE_RSC` | unset | Raw `--rsc` value, e.g. `p=1:c=1:m=512M` |
+| `TSSRUN_LIVE_TIMEOUT` | `180` | Hard timeout (s) before the runner gives up |
+
+The script spawns a tiny child, awaits completion, and asserts that
+`pid` / `jobid` / `node` / persisted snapshot / `attach_file` round-trip /
+captured stdout log all line up — i.e. the same end-to-end shape as the
+integration test, but driven through the real tssrun → salloc → srun path.
+
 ## Development
 
 ```bash
