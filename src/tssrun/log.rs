@@ -55,6 +55,23 @@ impl JobLogSink for InMemoryLogSink {
     }
 }
 
+/// Forwards stdout lines to the parent's stdout, stderr lines to stderr.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdLogSink;
+
+impl JobLogSink for StdLogSink {
+    async fn append(&self, stream: LogStream, line: &str) -> Result<()> {
+        match stream {
+            LogStream::Stdout => println!("{line}"),
+            LogStream::Stderr => eprintln!("{line}"),
+        }
+        Ok(())
+    }
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +99,15 @@ mod tests {
                 (LogStream::Stdout, "c".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn std_sink_does_not_panic() {
+        // Validates the type and trait wiring; the actual stdout/stderr
+        // bytes go to the test harness output and are not assertable here.
+        let s = StdLogSink;
+        s.append(LogStream::Stdout, "alpha").await.unwrap();
+        s.append(LogStream::Stderr, "beta").await.unwrap();
+        s.flush().await.unwrap();
     }
 }
