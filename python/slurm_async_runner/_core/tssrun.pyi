@@ -13,11 +13,14 @@ __all__ = [
     "Resource",
     "TssrunCmd",
     "LogSink",
+    "JobStateStore",
     "TssrunJobHandle",
     "TssrunManager",
     "null_log_sink",
     "std_log_sink",
     "file_log_sink",
+    "in_memory_state_store",
+    "file_system_state_store",
 ]
 
 @final
@@ -65,6 +68,30 @@ def std_log_sink() -> LogSink: ...
 def file_log_sink(stdout: builtins.str, stderr: builtins.str) -> Awaitable[LogSink]: ...
 
 @final
+class JobStateStore:
+    """Opaque handle to a Rust ``JobStateStore`` backend.
+
+    Construct via :func:`in_memory_state_store` or
+    :func:`file_system_state_store`. The trait is intentionally not
+    subclassable from Python — add new backends in Rust and re-export
+    them through the wrapper.
+    """
+
+def in_memory_state_store() -> JobStateStore:
+    """Process-local in-memory snapshot store. Default for ``TssrunManager``."""
+    ...
+
+def file_system_state_store(
+    dir: builtins.str | os.PathLike[builtins.str],
+) -> JobStateStore:
+    """On-disk store rooted at ``dir`` — writes ``{dir}/{uuid}.json`` via atomic rename.
+
+    The directory is created lazily on first save, so a not-yet-existing
+    path is fine as long as its parent is writable when persistence fires.
+    """
+    ...
+
+@final
 class TssrunJobHandle:
     """In-process or attached handle to a ``tssrun`` child."""
     @property
@@ -88,6 +115,9 @@ class TssrunJobHandle:
     # ``wait`` returns ``None`` when the child was killed by a signal
     # (e.g. SLURM time-limit kill, OOM). An ``int`` is the literal exit code.
     def wait(self) -> Awaitable[builtins.int | None]: ...
+    # Re-load the snapshot from the configured store and broadcast it to
+    # local subscribers. Raises ``RuntimeError`` if no store is wired.
+    def refresh(self) -> Awaitable[None]: ...
 
 @final
 class TssrunManager:
@@ -95,12 +125,12 @@ class TssrunManager:
     def __init__(
         self,
         cmd: TssrunCmd,
-        state_dir: builtins.str | os.PathLike[builtins.str] | None = ...,
+        store: JobStateStore | None = ...,
         log_sink: LogSink | None = ...,
     ) -> None: ...
     def spawn(self) -> Awaitable[TssrunJobHandle]: ...
-    # Attach by canonical hyphenated UUID v7 string. Resolves directly to
-    # ``{state_dir}/{uuid}.json``.
+    # Attach by canonical hyphenated UUID v7 string. Resolves directly
+    # through the configured store with an O(1) primary-key lookup.
     def attach_uuid(self, uuid: builtins.str) -> Awaitable[TssrunJobHandle]: ...
     def attach_pid(self, pid: builtins.int) -> Awaitable[TssrunJobHandle]: ...
     def attach_jobid(self, jobid: builtins.int) -> Awaitable[TssrunJobHandle]: ...

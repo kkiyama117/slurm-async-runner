@@ -47,3 +47,4 @@ pub mod handle;
 pub mod log;
 pub mod manager;
 pub mod parse;
+pub mod store;
