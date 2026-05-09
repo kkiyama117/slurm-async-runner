@@ -53,7 +53,7 @@ pub struct JobHandleSnapshot {
 pub struct JobHandle {
     snapshot_rx: watch::Receiver<JobHandleSnapshot>,
     snapshot_tx: watch::Sender<JobHandleSnapshot>,
-    wait_handle: Option<JoinHandle<Result<i32>>>,
+    wait_handle: Option<JoinHandle<Result<Option<i32>>>>,
     tee_stdout_handle: Option<JoinHandle<()>>,
     tee_stderr_handle: Option<JoinHandle<()>>,
     persist_path: Option<PathBuf>,
@@ -108,6 +108,11 @@ impl JobHandle {
             let log_sink = log_sink.clone();
             tokio::spawn(async move {
                 let status = child.lock().await.wait().await?;
+                // status.code() is None when the child was killed by a signal
+                // (SIGTERM on SLURM time-limit kill, SIGKILL on OOM, …). We
+                // surface that as Ok(None) so callers can branch on it; the
+                // previous behaviour of returning Ok(0) silently masked
+                // failures and was the source of issue H2.
                 let code = status.code();
                 tx.send_modify(|s| {
                     s.finished = Some(FinishedInfo {
@@ -121,7 +126,7 @@ impl JobHandle {
                     tracing::warn!(error = %e, path = %p.display(), "post-exit persist failed");
                 }
                 let _ = log_sink.flush().await;
-                Ok(code.unwrap_or(0))
+                Ok(code)
             })
         };
 
@@ -146,6 +151,14 @@ impl JobHandle {
             tee_stderr_handle: None,
             persist_path,
         }
+    }
+
+    /// Clone the underlying `watch::Receiver` so callers can read snapshots
+    /// without taking exclusive ownership of the handle. This is what the
+    /// pyo3 wrapper uses to keep `pid` / `jobid` / `is_running` polls cheap
+    /// and lock-free against an in-flight `wait()` (issue H1).
+    pub fn watch(&self) -> watch::Receiver<JobHandleSnapshot> {
+        self.snapshot_rx.clone()
     }
 
     pub fn snapshot(&self) -> JobHandleSnapshot {
@@ -174,10 +187,16 @@ impl JobHandle {
             .and_then(|f| f.exit_code)
     }
 
-    /// Wait for the child to exit and return its exit code. Errors when
-    /// invoked on an attached handle (no owned child) or after a previous
-    /// `wait()` already consumed the join handle.
-    pub async fn wait(&mut self) -> Result<i32> {
+    /// Wait for the child to exit and return its exit status code.
+    ///
+    /// - `Ok(Some(n))` — the child exited normally with code `n` (0 on
+    ///   clean success, non-zero on application error).
+    /// - `Ok(None)` — the child was terminated by a signal (e.g. SIGTERM
+    ///   from SLURM time-limit kill, SIGKILL from OOM). Inspect
+    ///   `snapshot().finished` for the recorded `exit_code: None`.
+    /// - `Err(_)` — `wait()` itself failed, or the handle was attached /
+    ///   already consumed.
+    pub async fn wait(&mut self) -> Result<Option<i32>> {
         let h = self
             .wait_handle
             .take()
@@ -209,30 +228,52 @@ impl JobHandle {
     /// Read `/proc/<pid>/environ` (Linux only). Returns `Ok(None)` on
     /// other platforms or when the directory is gone.
     pub async fn live_env(&self) -> Result<Option<HashMap<String, String>>> {
-        if !cfg!(target_os = "linux") {
-            return Ok(None);
-        }
-        let pid = self.pid();
-        let path = format!("/proc/{pid}/environ");
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(Some(parse_environ(&bytes))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        read_live_env_for_pid(self.pid()).await
+    }
+}
+
+/// Read `/proc/<pid>/environ` for an arbitrary pid without holding a
+/// `JobHandle`. Used by the pyo3 wrapper to bypass the handle mutex.
+///
+/// - On non-Linux platforms returns `Ok(None)` immediately.
+/// - On Linux, returns `Ok(None)` when the proc entry is gone (child has
+///   exited) and propagates other I/O errors.
+pub async fn read_live_env_for_pid(pid: u32) -> Result<Option<HashMap<String, String>>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let path = format!("/proc/{pid}/environ");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok(Some(parse_environ(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
 fn parse_environ(bytes: &[u8]) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    let mut dropped_non_utf8: usize = 0;
+    let mut dropped_no_eq: usize = 0;
     for raw in bytes.split(|&b| b == 0) {
         if raw.is_empty() {
             continue;
         }
-        if let Ok(s) = std::str::from_utf8(raw)
-            && let Some((k, v)) = s.split_once('=')
-        {
-            out.insert(k.to_string(), v.to_string());
+        match std::str::from_utf8(raw) {
+            Ok(s) => match s.split_once('=') {
+                Some((k, v)) => {
+                    out.insert(k.to_string(), v.to_string());
+                }
+                None => dropped_no_eq += 1,
+            },
+            Err(_) => dropped_non_utf8 += 1,
         }
+    }
+    if dropped_non_utf8 > 0 || dropped_no_eq > 0 {
+        tracing::warn!(
+            non_utf8 = dropped_non_utf8,
+            no_eq = dropped_no_eq,
+            "parse_environ dropped entries"
+        );
     }
     out
 }
@@ -409,7 +450,7 @@ echo done"#
             .unwrap();
 
         let code = handle.wait().await.unwrap();
-        assert_eq!(code, 0);
+        assert_eq!(code, Some(0));
 
         let snap = handle.snapshot();
         assert_eq!(snap.jobid, Some(999));
@@ -426,6 +467,46 @@ echo done"#
         let mut h = JobHandle::attach_snapshot(snap, None);
         let err = h.wait().await.unwrap_err().to_string();
         assert!(err.contains("not owner"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn wait_returns_none_when_child_is_signal_killed() {
+        // Regression test for H2 — wait() must distinguish a signal kill
+        // (Ok(None)) from a clean exit (Ok(Some(0))). bash's `kill -9 $$`
+        // makes the child SIGKILL itself synchronously, so `Child::wait`
+        // resolves with `ExitStatus::code() == None`.
+        let argv = vec!["bash".to_string(), "-c".to_string(), "kill -9 $$".into()];
+        let env = std::collections::HashMap::new();
+        let spawned = TokioBackgroundDispatcher
+            .spawn(&argv, &env, None)
+            .await
+            .unwrap();
+
+        let init = JobHandleSnapshot {
+            pid: spawned.pid,
+            argv,
+            sent_env: env,
+            cwd: None,
+            started_at_unix: 0,
+            log_locations: LogLocations::None,
+            jobid: None,
+            node: None,
+            finished: None,
+        };
+        let sink: Arc<dyn crate::tssrun::log::JobLogSink> =
+            Arc::new(crate::tssrun::log::NullLogSink);
+        let mut handle = JobHandle::from_spawn(spawned, init, sink, None)
+            .await
+            .unwrap();
+        let code = handle.wait().await.unwrap();
+        assert_eq!(code, None, "signal-killed child should return Ok(None)");
+        let snap = handle.snapshot();
+        assert!(snap.finished.is_some(), "finished must be recorded");
+        assert_eq!(
+            snap.finished.unwrap().exit_code,
+            None,
+            "snapshot must record None exit_code for signal kill"
+        );
     }
 
     #[tokio::test]
@@ -456,6 +537,14 @@ echo done"#
         let mut h = JobHandle::from_spawn(spawned, init, sink, None)
             .await
             .unwrap();
+
+        // Tokio's `Command::spawn` returns immediately after fork(). On a
+        // busy test runner there is a brief window before the child has
+        // finished its execve(), during which `/proc/<pid>/environ` still
+        // reflects the *parent's* environment — without our `MY_TEST_VAR`
+        // override. Wait briefly so the assertion observes the post-exec
+        // state deterministically.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let live = h.live_env().await.unwrap();
         let live = live.expect("live env should be readable on linux for live child");

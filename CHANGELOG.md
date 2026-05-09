@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`JobHandle::wait()` returns `Result<Option<i32>>`.** Was `Result<i32>`
+  with `unwrap_or(0)` masking signal kills. Now `Ok(None)` distinguishes
+  signal-killed children (e.g. SLURM time-limit kill, OOM) from clean
+  exits. The `.pyi` stub and Python wrapper surface the same `int | None`.
+- **`PyTssrunJobHandle` snapshot getters are lock-free.** Snapshot getters
+  (`pid`, `jobid`, `node`, `sent_env`, `is_running`, `exit_code`,
+  `live_env`) read from a cloned `watch::Receiver` and never lock the
+  `JobHandle` mutex. `wait()` is the only method that takes the mutex,
+  so concurrent polls during an in-flight `wait()` no longer block.
+- **`TssrunManager` fields are now `pub(crate)`.** Use the
+  `with_state_dir` / `with_log_sink` builders instead of mutating fields
+  directly — mid-flight mutation isn't retroactive on running handles.
 - **No shell wrapping.** The previous Python prototype wrapped `srun` in
   `$SHELL -c "..."`; this port spawns argv directly via
   `tokio::process::Command::args`. Both Python's

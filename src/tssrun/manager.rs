@@ -23,10 +23,16 @@ pub enum AttachKey {
 
 /// Orchestrates one or more tssrun invocations sharing a common log sink
 /// and (optional) state directory.
+///
+/// Fields are crate-private on purpose: mutating them after a `spawn()`
+/// would NOT retroactively redirect already-running handles' state-dir
+/// persistence or log sinks. Use the [`TssrunManager::new`] constructor
+/// plus the [`TssrunManager::with_state_dir`] / [`TssrunManager::with_log_sink`]
+/// builders for new managers.
 pub struct TssrunManager {
-    pub cmd: TssrunCmd,
-    pub state_dir: Option<PathBuf>,
-    pub log_sink: Arc<dyn JobLogSink>,
+    pub(crate) cmd: TssrunCmd,
+    pub(crate) state_dir: Option<PathBuf>,
+    pub(crate) log_sink: Arc<dyn JobLogSink>,
 }
 
 impl TssrunManager {
@@ -176,7 +182,7 @@ echo done
 
         let mut handle = manager.spawn_with(&dispatcher).await.unwrap();
         let code = handle.wait().await.unwrap();
-        assert_eq!(code, 0);
+        assert_eq!(code, Some(0));
         assert_eq!(handle.snapshot().jobid, Some(999));
         assert_eq!(handle.snapshot().node.as_deref(), Some("node-x"));
     }

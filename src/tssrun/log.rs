@@ -45,6 +45,11 @@ impl JobLogSink for NullLogSink {
 }
 
 /// Captures every appended line in memory. Test/diagnostics oriented.
+///
+/// Uses `std::sync::Mutex` (not `tokio::sync::Mutex`) on purpose: the
+/// `append` impl never holds the lock across an `.await`, so the sync
+/// mutex is both faster and works under any runtime — including code paths
+/// that the tokio runtime hasn't entered yet.
 #[derive(Debug, Default)]
 pub struct InMemoryLogSink {
     buf: Mutex<Vec<(LogStream, String)>>,

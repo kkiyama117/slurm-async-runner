@@ -115,7 +115,7 @@ async def main():
 
     handle = await manager.spawn()
     print("pid", await handle.pid, "jobid", await handle.jobid)
-    code = await handle.wait()
+    code = await handle.wait()  # int on normal exit, None on signal kill
     print("exit", code)
 
 asyncio.run(main())

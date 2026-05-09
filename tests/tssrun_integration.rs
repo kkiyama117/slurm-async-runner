@@ -41,7 +41,7 @@ async fn spawn_then_wait_then_snapshot_then_attach() {
     let mut handle = manager.spawn().await.unwrap();
     let pid = handle.pid();
     let code = handle.wait().await.unwrap();
-    assert_eq!(code, 0);
+    assert_eq!(code, Some(0));
 
     let snap = handle.snapshot();
     assert_eq!(snap.jobid, Some(12345));

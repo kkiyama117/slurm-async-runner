@@ -81,7 +81,11 @@ impl TssrunCmd {
 
     /// Build the argv: `[bin, -p QUEUE?, -t TIME?, --rsc SPEC?, --x11?, program_abs, args…]`.
     pub fn build_argv(&self) -> Result<Vec<String>> {
-        let mut argv: Vec<String> = Vec::with_capacity(8 + self.args.len());
+        // Maximum prelude slots: bin + (-p QUEUE) + (-t TIME) + (--rsc SPEC)
+        // + --x11 + program = 8. All flags except the bin and program are
+        // optional, so the actual length will usually be smaller.
+        const MAX_PRELUDE_SLOTS: usize = 8;
+        let mut argv: Vec<String> = Vec::with_capacity(MAX_PRELUDE_SLOTS + self.args.len());
         argv.push(self.tssrun_bin.clone());
 
         if let Some(q) = &self.queue {

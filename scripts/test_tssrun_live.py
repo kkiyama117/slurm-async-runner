@@ -156,14 +156,18 @@ async def _run() -> int:
         # — but the type should still be a real dict.
         assert isinstance(sent_env, dict), type(sent_env)
 
-        # live_env can be None on systems without /proc (mac/windows) or
-        # transiently if the child has already exited.
+        # live_env returns None for two distinct reasons:
+        #   1. We are not on Linux (no /proc filesystem at all).
+        #   2. We are on Linux but the child has already exited (proc gone).
+        # Tell them apart so the log is honest.
         live_env = await handle.live_env()
         if live_env is not None:
             assert isinstance(live_env, dict)
             print(f"[live] /proc/{pid}/environ has {len(live_env)} entries")
+        elif sys.platform != "linux":
+            print(f"[live] /proc not available on platform={sys.platform!r}")
         else:
-            print(f"[live] /proc/{pid}/environ unreadable (likely exited)")
+            print(f"[live] /proc/{pid}/environ unreadable (child already exited)")
 
         try:
             code = await asyncio.wait_for(handle.wait(), timeout=overall_timeout)
@@ -175,6 +179,13 @@ async def _run() -> int:
             return 2
 
         print(f"[live] child exit code = {code}")
+        if code is None:
+            stderr_text = stderr_log.read_text() if stderr_log.exists() else "<none>"
+            _eprint(
+                "FAIL: tssrun child was terminated by a signal (no exit code). "
+                f"stderr log =\n{stderr_text}"
+            )
+            return 1
         if code != 0:
             stderr_text = stderr_log.read_text() if stderr_log.exists() else "<none>"
             _eprint(

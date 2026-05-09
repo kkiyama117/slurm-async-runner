@@ -10,8 +10,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
+use tokio::sync::watch;
+
 use crate::tssrun::cmd::{Resource, TssrunCmd};
-use crate::tssrun::handle::JobHandle;
+use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
 
@@ -163,59 +165,87 @@ fn file_log_sink<'py>(
 
 // ---------- JobHandle ----------
 
+/// Python view onto a [`JobHandle`].
+///
+/// Holds two pieces of state with **deliberately different sharing**:
+///
+/// - `rx`: a cloned `watch::Receiver` over the snapshot. Snapshot getters
+///   (`pid`, `jobid`, `node`, `sent_env`, `is_running`, `exit_code`) read
+///   from this receiver synchronously — no JobHandle mutex, so they are
+///   not blocked by an in-flight `wait()` (issue H1 in the original
+///   review).
+/// - `inner`: a `Mutex<JobHandle>` that exists solely so `wait()` can
+///   `.take()` the join handle once. Snapshot getters never touch it.
 #[pyclass(name = "TssrunJobHandle", module = "slurm_async_runner._core.tssrun")]
 pub struct PyTssrunJobHandle {
+    rx: watch::Receiver<JobHandleSnapshot>,
     inner: Arc<tokio::sync::Mutex<JobHandle>>,
+}
+
+impl PyTssrunJobHandle {
+    fn from_handle(handle: JobHandle) -> Self {
+        let rx = handle.watch();
+        Self {
+            rx,
+            inner: Arc::new(tokio::sync::Mutex::new(handle)),
+        }
+    }
 }
 
 #[pymethods]
 impl PyTssrunJobHandle {
     #[getter]
     fn pid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move { Ok(inner.lock().await.pid()) })
+        let pid = self.rx.borrow().pid;
+        future_into_py(py, async move { Ok(pid) })
     }
 
     #[getter]
     fn jobid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move { Ok(inner.lock().await.jobid()) })
+        let jobid = self.rx.borrow().jobid;
+        future_into_py(py, async move { Ok(jobid) })
     }
 
     #[getter]
     fn node<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move { Ok(inner.lock().await.node()) })
+        let node = self.rx.borrow().node.clone();
+        future_into_py(py, async move { Ok(node) })
     }
 
     #[getter]
     fn sent_env<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move { Ok(inner.lock().await.sent_env()) })
+        let env = self.rx.borrow().sent_env.clone();
+        future_into_py(py, async move { Ok(env) })
     }
 
     fn live_env<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let pid = self.rx.borrow().pid;
         future_into_py(py, async move {
-            inner
-                .lock()
-                .await
-                .live_env()
+            read_live_env_for_pid(pid)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
     }
 
     fn is_running<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move { Ok(inner.lock().await.is_running()) })
+        let running = self.rx.borrow().finished.is_none();
+        future_into_py(py, async move { Ok(running) })
     }
 
     fn exit_code<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move { Ok(inner.lock().await.exit_code()) })
+        let code = self.rx.borrow().finished.as_ref().and_then(|f| f.exit_code);
+        future_into_py(py, async move { Ok(code) })
     }
 
+    /// Wait for the child to exit. Returns:
+    ///
+    /// - `int` — the exit code (0 = clean success).
+    /// - `None` — the child was terminated by a signal (e.g. SLURM time-
+    ///   limit kill, OOM). The persisted snapshot also records this with
+    ///   `finished.exit_code = None`.
+    ///
+    /// Raises ``RuntimeError`` if invoked on an attached handle or after a
+    /// previous successful wait.
     fn wait<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -261,9 +291,7 @@ impl PyTssrunManager {
                 .spawn()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(PyTssrunJobHandle {
-                inner: Arc::new(tokio::sync::Mutex::new(handle)),
-            })
+            Ok(PyTssrunJobHandle::from_handle(handle))
         })
     }
 
@@ -274,9 +302,7 @@ impl PyTssrunManager {
                 .attach(AttachKey::Pid(pid))
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(PyTssrunJobHandle {
-                inner: Arc::new(tokio::sync::Mutex::new(h)),
-            })
+            Ok(PyTssrunJobHandle::from_handle(h))
         })
     }
 
@@ -287,9 +313,7 @@ impl PyTssrunManager {
                 .attach(AttachKey::JobId(jobid))
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(PyTssrunJobHandle {
-                inner: Arc::new(tokio::sync::Mutex::new(h)),
-            })
+            Ok(PyTssrunJobHandle::from_handle(h))
         })
     }
 
@@ -300,9 +324,7 @@ impl PyTssrunManager {
                 .attach(AttachKey::File(path))
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(PyTssrunJobHandle {
-                inner: Arc::new(tokio::sync::Mutex::new(h)),
-            })
+            Ok(PyTssrunJobHandle::from_handle(h))
         })
     }
 }
