@@ -1,4 +1,4 @@
-//! pyo3 wrappers for the `slurm_async_runner._core.tssrun` submodule.
+//! pyo3 wrappers for the `slurm_async_runner._slurm_async_runner_core.tssrun` submodule.
 
 #![cfg(feature = "pyo3")]
 
@@ -26,7 +26,7 @@ use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateSto
 
 #[pyclass(
     name = "TssrunCmd",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object
 )]
 #[derive(Clone)]
@@ -82,7 +82,7 @@ impl PyTssrunCmd {
 
 #[pyclass(
     name = "LogSink",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object,
     frozen
 )]
@@ -128,7 +128,7 @@ fn file_log_sink<'py>(
 /// backends should be added in Rust and re-exported here.
 #[pyclass(
     name = "JobStateStore",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object,
     frozen
 )]
@@ -172,7 +172,10 @@ fn file_system_state_store(dir: PathBuf) -> PyJobStateStore {
 ///   review).
 /// - `inner`: a `Mutex<JobHandle>` that exists solely so `wait()` can
 ///   `.take()` the join handle once. Snapshot getters never touch it.
-#[pyclass(name = "TssrunJobHandle", module = "slurm_async_runner._core.tssrun")]
+#[pyclass(
+    name = "TssrunJobHandle",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun"
+)]
 pub struct PyTssrunJobHandle {
     rx: watch::Receiver<JobHandleSnapshot>,
     inner: Arc<tokio::sync::Mutex<JobHandle>>,
@@ -290,7 +293,7 @@ impl PyTssrunJobHandle {
 
 #[pyclass(
     name = "TssrunManager",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object
 )]
 #[derive(Clone)]
@@ -393,7 +396,7 @@ impl PyTssrunManager {
 pub mod inner_module {
     use pyo3::prelude::*;
 
-    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.tssrun";
+    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.tssrun";
 
     #[pymodule_export]
     use super::PyJobStateStore;

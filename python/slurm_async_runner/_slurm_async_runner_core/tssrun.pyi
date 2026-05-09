@@ -1,4 +1,4 @@
-# Hand-written stubs for slurm_async_runner._core.tssrun.
+# Hand-written stubs for slurm_async_runner._slurm_async_runner_core.tssrun.
 # pyo3-stub-gen does not derive stubs for pyclasses inside #[pymodule]
 # sub-modules wired via #[pymodule_export], so this file is maintained
 # by hand. Keep it in sync with src/py_export/tssrun.rs.

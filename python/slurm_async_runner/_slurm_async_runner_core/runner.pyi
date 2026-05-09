@@ -1,4 +1,4 @@
-# Hand-written stubs for slurm_async_runner._core.runner.
+# Hand-written stubs for slurm_async_runner._slurm_async_runner_core.runner.
 #
 # pyo3-stub-gen does not derive stubs for async pyfunctions returned via
 # pyo3_async_runtimes::tokio::future_into_py, so this file is maintained by

@@ -1,4 +1,4 @@
-# Hand-written stubs for slurm_async_runner._core.manager.
+# Hand-written stubs for slurm_async_runner._slurm_async_runner_core.manager.
 #
 # pyo3-stub-gen does not derive stubs for:
 #   - pyclasses inside #[pymodule] sub-modules wired via #[pymodule_export]

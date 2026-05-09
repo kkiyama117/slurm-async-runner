@@ -61,7 +61,7 @@ fn query_job_states_batch<'py>(py: Python<'py>, jobids: Vec<u64>) -> PyResult<Bo
 pub(crate) mod inner_module {
     use super::*;
 
-    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.runner";
+    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.runner";
 
     #[pymodule_export]
     use super::query_job_states_batch;

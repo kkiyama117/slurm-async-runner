@@ -1,4 +1,4 @@
-from slurm_async_runner import _core
+from slurm_async_runner import _slurm_async_runner_core as _core
 
 if hasattr(_core, "__doc__"):
     __doc__ = _core.__doc__

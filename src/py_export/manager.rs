@@ -1,6 +1,6 @@
 //! pyo3 wrappers for [`crate::manager::{SlurmCmd, SlurmManager}`].
 //!
-//! Exposed at `slurm_async_runner._core.manager`:
+//! Exposed at `slurm_async_runner._slurm_async_runner_core.manager`:
 //!
 //! - `SlurmCmd(srun_cmd="srun")` — frozen wrapper around the launcher
 //!   binary name.
@@ -29,7 +29,7 @@ use crate::manager::{SlurmCmd, SlurmManager};
 
 #[pyclass(
     name = "SlurmCmd",
-    module = "slurm_async_runner._core.manager",
+    module = "slurm_async_runner._slurm_async_runner_core.manager",
     from_py_object,
     frozen,
     eq,
@@ -60,7 +60,7 @@ impl PySlurmCmd {
 
 #[pyclass(
     name = "SlurmManager",
-    module = "slurm_async_runner._core.manager",
+    module = "slurm_async_runner._slurm_async_runner_core.manager",
     skip_from_py_object
 )]
 #[derive(Clone)]
@@ -174,7 +174,7 @@ fn job_status_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 pub(crate) mod inner_module {
     use super::*;
 
-    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.manager";
+    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.manager";
 
     #[pymodule_export]
     use super::{PySlurmCmd, PySlurmManager};

@@ -7,7 +7,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-from slurm_async_runner._core.tssrun import (
+from slurm_async_runner._slurm_async_runner_core.tssrun import (
     Resource,
     TssrunCmd,
     TssrunManager,
