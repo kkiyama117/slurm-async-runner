@@ -264,3 +264,4 @@ fn new(
 - `slurm_async_runner/src/py_export/tssrun.rs`: `#[pymodule_export] use gaussian_job_shared::...` を削除し、bridge 引数で受ける
 - `slurm_async_runner/src/py_export/mod.rs`: shared2 由来の pyclass を再 export しない
 - `gaussian-job-shared2/src/entities/.../resource_spec.rs`: `pub fn ResourceSpec::from_parts(...)` を追加
+2026-05-10: Phase C smoke passed (commit a44abe2e863f1f68611ef72797f58151edb5f4ce)
