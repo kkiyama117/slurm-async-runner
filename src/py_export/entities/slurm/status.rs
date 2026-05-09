@@ -366,7 +366,7 @@ pub(crate) mod inner_module {
     use super::*;
 
     const PYTHON_MODULE_NAME: &str =
-        "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status";
+        "slurm_async_runner._slurm_async_runner_core.entities.slurm.status";
 
     #[pymodule_export]
     use super::{PyJobReason, PyJobState, PyJobStatus};
