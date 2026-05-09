@@ -11,11 +11,8 @@ pub mod manager;
 pub mod runner;
 pub mod tssrun;
 
-// Re-export the SLURM lifecycle types so downstream Rust crates can write
-// `use slurm_async_runner::{JobStatus, JobState, JobReason}` without taking
-// a direct `gaussian_job_shared` dependency. Python users continue to import
-// from `gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status`.
-pub use gaussian_job_shared::entities::slurm::status::{JobReason, JobState, JobStatus};
+// Re-export the SLURM lifecycle types from the crate-local entities module.
+pub use crate::entities::slurm::status::{JobReason, JobState, JobStatus};
 
 // Re-export the async batch-query so callers can write
 // `use slurm_async_runner::query_job_states_batch`.
@@ -34,12 +31,8 @@ pub use dispatcher::{BackgroundDispatcher, SpawnedChild, TokioBackgroundDispatch
 
 // Re-export tssrun public API.
 pub use tssrun::cmd::TssrunCmd;
-// Re-export shared2's ResourceSpec / JobTimeLimit so downstream Rust
-// callers can write `use slurm_async_runner::ResourceSpec;` without a
-// direct dependency on `gaussian_job_shared`. The `Resource` struct
-// previously lived in `tssrun::cmd`; consult the migration notes for
-// the field shape change (CPU/GPU enum, NonZeroU32 counts, Memory).
-pub use gaussian_job_shared::entities::slurm::{
+// Re-export the SLURM resource/partition/time-limit vocabulary from the crate-local entities module.
+pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
 };
 pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};

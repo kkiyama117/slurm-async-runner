@@ -6,10 +6,10 @@
 //!   [`crate::dispatcher::TokioBackgroundDispatcher`] will hand to
 //!   `tokio::process::Command`.
 //!
-//! The `--rsc` spec is the shared
-//! [`gaussian_job_shared::entities::slurm::ResourceSpec`] (CPU / GPU
-//! enum); the wall-clock limit is the shared
-//! [`gaussian_job_shared::entities::slurm::JobTimeLimit`].
+//! The `--rsc` spec is the crate-local
+//! [`crate::entities::slurm::ResourceSpec`] (CPU / GPU
+//! enum); the wall-clock limit is the crate-local
+//! [`crate::entities::slurm::JobTimeLimit`].
 //!
 //! No I/O happens in this module — all subprocess work is in the
 //! dispatcher / handle / manager.
@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
 use anyhow::{Context, Result};
-use gaussian_job_shared::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
 
 /// Spec for a single `tssrun` invocation. Pure data + an argv builder —
 /// no subprocess work. Mirrors [`crate::manager::SlurmCmd`] in spirit but
@@ -27,7 +27,7 @@ use gaussian_job_shared::entities::slurm::{JobPartition, JobTimeLimit, ResourceS
 pub struct TssrunCmd {
     pub tssrun_bin: String,
     /// Renamed from `queue` to match Slurm's `--partition` vocabulary.
-    /// `JobPartition` is a `String` alias from `gaussian_job_shared`.
+    /// `JobPartition` is a `String` alias from `crate::entities::slurm`.
     pub partition: Option<JobPartition>,
     /// Validated wall-clock limit. Was `Option<String>` previously.
     pub time_limit: Option<JobTimeLimit>,
@@ -105,7 +105,7 @@ fn absolutize(p: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaussian_job_shared::entities::slurm::{ResourceSpecCPU, ResourceSpecGPU};
+    use crate::entities::slurm::{ResourceSpecCPU, ResourceSpecGPU};
 
     #[test]
     fn cmd_minimal_argv_is_bin_then_program() {

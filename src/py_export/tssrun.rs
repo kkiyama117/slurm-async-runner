@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use tokio::sync::watch;
 
+use crate::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
+use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
 use crate::tssrun::cmd::TssrunCmd;
-use gaussian_job_shared::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
-use gaussian_job_shared::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
 
 use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
@@ -402,11 +402,9 @@ pub mod inner_module {
     use super::PyJobStateStore;
     #[pymodule_export]
     use super::PyLogSink;
-    // Re-export shared2's ResourceSpec / JobTimeLimit pyclass wrappers
+    // Re-export the crate-local ResourceSpec / JobTimeLimit pyclass wrappers
     // so Python callers can construct them via the same import path
-    // as TssrunCmd. Both classes' canonical home remains
-    // gaussian_job_shared._gaussian_job_shared_core, but exposing them
-    // here saves an extra import for the common tssrun use case.
+    // as TssrunCmd. This saves an extra import for the common tssrun use case.
     #[pymodule_export]
     use super::PyTssrunCmd;
     #[pymodule_export]
@@ -424,9 +422,9 @@ pub mod inner_module {
     #[pymodule_export]
     use super::std_log_sink;
     #[pymodule_export]
-    use gaussian_job_shared::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
+    use crate::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
     #[pymodule_export]
-    use gaussian_job_shared::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
+    use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
