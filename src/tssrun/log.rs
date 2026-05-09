@@ -5,6 +5,7 @@
 //! on the multi-threaded tokio runtime.
 
 use std::future::Future;
+use std::sync::Mutex;
 
 use anyhow::Result;
 
@@ -32,6 +33,28 @@ impl JobLogSink for NullLogSink {
     }
 }
 
+/// Captures every appended line in memory. Test/diagnostics oriented.
+#[derive(Debug, Default)]
+pub struct InMemoryLogSink {
+    buf: Mutex<Vec<(LogStream, String)>>,
+}
+
+impl InMemoryLogSink {
+    pub fn snapshot(&self) -> Vec<(LogStream, String)> {
+        self.buf.lock().unwrap().clone()
+    }
+}
+
+impl JobLogSink for InMemoryLogSink {
+    async fn append(&self, stream: LogStream, line: &str) -> Result<()> {
+        self.buf.lock().unwrap().push((stream, line.to_string()));
+        Ok(())
+    }
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,5 +65,22 @@ mod tests {
         s.append(LogStream::Stdout, "hi").await.unwrap();
         s.append(LogStream::Stderr, "bye").await.unwrap();
         s.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_memory_sink_preserves_order() {
+        let s = InMemoryLogSink::default();
+        s.append(LogStream::Stdout, "a").await.unwrap();
+        s.append(LogStream::Stderr, "b").await.unwrap();
+        s.append(LogStream::Stdout, "c").await.unwrap();
+        let v = s.snapshot();
+        assert_eq!(
+            v,
+            vec![
+                (LogStream::Stdout, "a".to_string()),
+                (LogStream::Stderr, "b".to_string()),
+                (LogStream::Stdout, "c".to_string()),
+            ]
+        );
     }
 }
