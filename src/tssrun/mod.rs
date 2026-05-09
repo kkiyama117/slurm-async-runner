@@ -5,7 +5,7 @@
 //!
 //! - [`cmd::TssrunCmd`] — pure-data spec for one `tssrun` invocation
 //!   plus an `argv` builder. No I/O. The `--rsc` spec is the shared
-//!   `gaussian_job_shared::entities::slurm::ResourceSpec` (CPU / GPU
+//!   `crate::entities::slurm::ResourceSpec` (CPU / GPU
 //!   enum); the wall-clock limit is the shared `JobTimeLimit`.
 //! - [`manager::TssrunManager`] — orchestrates `spawn` / `attach` / state
 //!   queries with a shared log sink and (optional) on-disk state directory.

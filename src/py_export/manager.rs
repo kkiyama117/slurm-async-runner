@@ -11,7 +11,7 @@
 //! The async return values are dispatched through the same
 //! `PyOnceLock`-cached cross-module import pattern as
 //! `runner::query_job_states_batch` so `JobStatus` results stay typed
-//! end-to-end (`gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status.JobStatus`).
+//! end-to-end (`slurm_async_runner._slurm_async_runner_core.entities.slurm.status.JobStatus`).
 
 #![cfg(feature = "pyo3")]
 
@@ -157,7 +157,7 @@ impl PySlurmManager {
 // --------------------------------------------- shared cross-module-import cache
 
 const UPSTREAM_STATUS_MODULE: &str =
-    "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status";
+    "slurm_async_runner._slurm_async_runner_core.entities.slurm.status";
 
 static JOB_STATUS_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 

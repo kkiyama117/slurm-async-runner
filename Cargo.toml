@@ -54,17 +54,6 @@ itertools = "0.14.0"
 # UUID and datetime
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
-# Shared Gaussian job entities (Job, JobSpec, SlurmJobConfig, JobStatus,
-# JobState, JobReason, ResourceSpec, JobTimeLimit). We enable
-# `pyo3-types` so the pyclass wrappers (PyResourceSpec, PyJobTimeLimit,
-# etc.) are linked into our extension, but NOT the upstream
-# `pymodule-entry` feature — that would emit a
-# `PyInit__gaussian_job_shared_core` symbol that we don't want in our
-# `.so`. The shared2 wheel still ships its own
-# `_gaussian_job_shared_core` extension separately for direct Python
-# users.
-gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", rev = "299d3e80d73b1533e4dd7c5f4fdde000c7be1aae", default-features = false, features = ["pyo3-types"] }
-
 ##### OPTIONAL DEPS #####
 # PYO3
 pyo3 = { version = "0.28", features = [
@@ -107,5 +96,26 @@ toml = "1.1.2"
 [features]
 default = ["pyo3", "stub_gen"]
 
-pyo3 = ["dep:pyo3", "pyo3-async-runtimes", "pyo3-log", "pythonize"]
-stub_gen = ["pyo3-stub-gen"]
+# Canonical-wheel build: enables BOTH the pyclass impls and the
+# pymodule entry. This is the only path under which SAR's pyclass
+# code is compiled.
+#
+# ARCHITECTURE RULE — Pyclass Single Owner:
+# Downstream crates MUST NOT enable this feature. Use
+# `default-features = false` to consume Rust types only. Each
+# pyclass type has exactly one owner cdylib in the dependency
+# graph; duplicating pyclass impls into multiple cdylibs produces
+# distinct Python type objects with identical __module__ strings,
+# breaking isinstance checks. See
+# docs/superpowers/specs/2026-05-10-slurm-vocab-migration-and-pyclass-ownership-design.md
+# §2 for the full rule, and docs/error.md for the regression that
+# motivated it.
+pyo3 = [
+    "dep:pyo3",
+    "pyo3-async-runtimes",
+    "pyo3-log",
+    "pythonize",
+    "pyo3-stub-gen",
+]
+
+stub_gen = ["pyo3"]
