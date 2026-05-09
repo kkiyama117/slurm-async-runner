@@ -260,9 +260,19 @@ impl JobHandle {
 /// Read `/proc/<pid>/environ` for an arbitrary pid without holding a
 /// `JobHandle`. Used by the pyo3 wrapper to bypass the handle mutex.
 ///
-/// - On non-Linux platforms returns `Ok(None)` immediately.
-/// - On Linux, returns `Ok(None)` when the proc entry is gone (child has
-///   exited) and propagates other I/O errors.
+/// This is best-effort introspection: it returns `Ok(None)` whenever
+/// `/proc/<pid>/environ` is unobservable for any of the following reasons,
+/// none of which indicate a real failure:
+///
+/// - non-Linux platform (no `/proc` filesystem),
+/// - the child has already exited (`ENOENT`),
+/// - the kernel refuses the read (`EACCES`) because the target's
+///   `PR_SET_DUMPABLE` flag is cleared. This happens routinely when the
+///   spawned binary is setuid/setgid (e.g. the kudpc/ECCS `tssrun` wrapper):
+///   in that case `/proc/<pid>/environ` is owned by `root:root` with mode
+///   `0400` and is only readable with `CAP_SYS_PTRACE`.
+///
+/// Other I/O errors are propagated.
 pub async fn read_live_env_for_pid(pid: u32) -> Result<Option<HashMap<String, String>>> {
     if !cfg!(target_os = "linux") {
         return Ok(None);
@@ -271,7 +281,15 @@ pub async fn read_live_env_for_pid(pid: u32) -> Result<Option<HashMap<String, St
     match tokio::fs::read(&path).await {
         Ok(bytes) => Ok(Some(parse_environ(&bytes))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::debug!(
+                pid,
+                "live_env: /proc/<pid>/environ unreadable (EACCES) — \
+                 likely a non-dumpable setuid child; returning None"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to read {path}")),
     }
 }
 
@@ -576,5 +594,14 @@ echo done"#
         assert_eq!(live.get("MY_TEST_VAR").map(String::as_str), Some("ok"));
 
         let _ = h.wait().await;
+    }
+
+    #[tokio::test]
+    async fn read_live_env_for_pid_returns_none_when_pid_is_gone() {
+        // ENOENT path: best-effort is None, never an error. We use
+        // u32::MAX as a pid that the kernel will not have allocated.
+        // On non-Linux the early return makes this trivially Ok(None).
+        let res = read_live_env_for_pid(u32::MAX).await;
+        assert!(matches!(res, Ok(None)), "unexpected: {res:?}");
     }
 }

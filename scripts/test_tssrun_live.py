@@ -156,10 +156,14 @@ async def _run() -> int:
         # — but the type should still be a real dict.
         assert isinstance(sent_env, dict), type(sent_env)
 
-        # live_env returns None for two distinct reasons:
+        # live_env returns None for three distinct reasons:
         #   1. We are not on Linux (no /proc filesystem at all).
-        #   2. We are on Linux but the child has already exited (proc gone).
-        # Tell them apart so the log is honest.
+        #   2. We are on Linux but the child has already exited (ENOENT).
+        #   3. The child is a setuid/setgid binary with PR_SET_DUMPABLE
+        #      cleared, so /proc/<pid>/environ is root-only (EACCES). The
+        #      kudpc/ECCS `tssrun` wrapper falls into this bucket on the
+        #      login nodes, which is the whole reason this script exists.
+        # We tolerate all three — they are best-effort observations.
         live_env = await handle.live_env()
         if live_env is not None:
             assert isinstance(live_env, dict)
@@ -167,7 +171,10 @@ async def _run() -> int:
         elif sys.platform != "linux":
             print(f"[live] /proc not available on platform={sys.platform!r}")
         else:
-            print(f"[live] /proc/{pid}/environ unreadable (child already exited)")
+            print(
+                f"[live] /proc/{pid}/environ unreadable "
+                f"(child already exited or non-dumpable setuid binary)"
+            )
 
         try:
             code = await asyncio.wait_for(handle.wait(), timeout=overall_timeout)
