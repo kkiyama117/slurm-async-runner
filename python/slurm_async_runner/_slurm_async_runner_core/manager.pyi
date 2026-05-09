@@ -11,7 +11,7 @@ import os
 from collections.abc import Awaitable
 from typing import final
 
-from gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status import (
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.status import (
     JobStatus,
 )
 
