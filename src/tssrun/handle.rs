@@ -419,4 +419,48 @@ echo done"#
         let lines: Vec<String> = typed_sink.snapshot().into_iter().map(|(_, l)| l).collect();
         assert!(lines.iter().any(|l| l == "done"), "sink lines: {lines:?}");
     }
+
+    #[tokio::test]
+    async fn attached_handle_wait_errors_with_not_owner() {
+        let snap = snap_running();
+        let mut h = JobHandle::attach_snapshot(snap, None);
+        let err = h.wait().await.unwrap_err().to_string();
+        assert!(err.contains("not owner"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn live_env_returns_some_for_running_self() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let argv = vec!["bash".to_string(), "-c".to_string(), "sleep 0.5".into()];
+        let mut env = std::collections::HashMap::new();
+        env.insert("MY_TEST_VAR".to_string(), "ok".to_string());
+        let spawned = TokioBackgroundDispatcher
+            .spawn(&argv, &env, None)
+            .await
+            .unwrap();
+        let init = JobHandleSnapshot {
+            pid: spawned.pid,
+            argv,
+            sent_env: env,
+            cwd: None,
+            started_at_unix: 0,
+            log_locations: LogLocations::None,
+            jobid: None,
+            node: None,
+            finished: None,
+        };
+        let sink: std::sync::Arc<dyn crate::tssrun::log::JobLogSink> =
+            std::sync::Arc::new(crate::tssrun::log::NullLogSink);
+        let mut h = JobHandle::from_spawn(spawned, init, sink, None)
+            .await
+            .unwrap();
+
+        let live = h.live_env().await.unwrap();
+        let live = live.expect("live env should be readable on linux for live child");
+        assert_eq!(live.get("MY_TEST_VAR").map(String::as_str), Some("ok"));
+
+        let _ = h.wait().await;
+    }
 }
