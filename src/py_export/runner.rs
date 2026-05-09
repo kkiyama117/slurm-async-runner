@@ -14,7 +14,8 @@ use pyo3::types::PyDict;
 
 use crate::runner::query_job_states_batch as rust_query;
 
-const UPSTREAM_STATUS_MODULE: &str = "gaussian_job_shared._core.entities.slurm.status";
+const UPSTREAM_STATUS_MODULE: &str =
+    "gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status";
 
 static JOB_STATUS_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 

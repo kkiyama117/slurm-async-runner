@@ -11,7 +11,9 @@ import os
 from collections.abc import Awaitable
 from typing import final
 
-from gaussian_job_shared._core.entities.slurm.status import JobStatus
+from gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status import (
+    JobStatus,
+)
 
 __all__ = [
     "SlurmCmd",

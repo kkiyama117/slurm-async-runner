@@ -11,7 +11,7 @@ pub mod tssrun;
 // Re-export the SLURM lifecycle types so downstream Rust crates can write
 // `use slurm_async_runner::{JobStatus, JobState, JobReason}` without taking
 // a direct `gaussian_job_shared` dependency. Python users continue to import
-// from `gaussian_job_shared._core.entities.slurm.status`.
+// from `gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status`.
 pub use gaussian_job_shared::entities::slurm::status::{JobReason, JobState, JobStatus};
 
 // Re-export the async batch-query so callers can write
