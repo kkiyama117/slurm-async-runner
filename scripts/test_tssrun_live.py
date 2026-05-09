@@ -18,8 +18,8 @@ What it exercises against a real SLURM allocation
 5.  Confirms the parsed ``jobid`` and ``node`` came back from the
     ``salloc:`` banner that ``tssrun`` prints on stdout.
 6.  Confirms the persisted JSON snapshot exists at
-    ``<state_dir>/<pid>.json`` and that ``attach_file`` reconstructs an
-    equivalent read-only handle.
+    ``<state_dir>/<uuid>.json`` and that both ``attach_file`` and
+    ``attach_uuid`` reconstruct an equivalent read-only handle.
 7.  Confirms the captured stdout log file contains the marker token the
     child emitted, proving the FileLogSink tee pipeline ran.
 
@@ -147,8 +147,14 @@ async def _run() -> int:
 
         handle = await manager.spawn()
         pid = await handle.pid
+        uuid = await handle.uuid
         assert pid > 0, f"expected pid > 0, got {pid}"
-        print(f"[live] spawned pid={pid}")
+        # uuid is the canonical hyphenated form, e.g.
+        # "0190cc1c-7a48-7c0e-a0a0-1234567890ab" — 36 chars / 4 dashes.
+        assert len(uuid) == 36 and uuid.count("-") == 4, (
+            f"unexpected uuid format: {uuid!r}"
+        )
+        print(f"[live] spawned pid={pid} uuid={uuid}")
 
         sent_env = await handle.sent_env
         # tssrun inherits the parent env unless we passed an explicit dict; the
@@ -207,18 +213,31 @@ async def _run() -> int:
         assert jobid_val is not None, "expected jobid to be parsed from salloc: banner"
         assert node_val is not None, "expected node to be parsed from salloc: banner"
 
-        snap_path = state_dir / f"{pid}.json"
+        # Post-UUID-v7 migration: snapshots are persisted under {uuid}.json
+        # rather than {pid}.json. pid is reusable by the kernel; uuid is the
+        # stable primary key generated at spawn time.
+        snap_path = state_dir / f"{uuid}.json"
         assert snap_path.exists(), f"missing persisted snapshot at {snap_path}"
         print(f"[live] snapshot persisted to {snap_path}")
 
         attached = await manager.attach_file(str(snap_path))
         attached_pid = await attached.pid
+        attached_uuid = await attached.uuid
         attached_jobid = await attached.jobid
         attached_node = await attached.node
         assert attached_pid == pid, (attached_pid, pid)
+        assert attached_uuid == uuid, (attached_uuid, uuid)
         assert attached_jobid == jobid_val, (attached_jobid, jobid_val)
         assert attached_node == node_val, (attached_node, node_val)
         print("[live] attach_file round-trip OK")
+
+        # attach_uuid should resolve directly to {state_dir}/{uuid}.json
+        # without scanning, and reproduce the same snapshot.
+        attached_by_uuid = await manager.attach_uuid(uuid)
+        assert (await attached_by_uuid.uuid) == uuid
+        assert (await attached_by_uuid.pid) == pid
+        assert (await attached_by_uuid.jobid) == jobid_val
+        print("[live] attach_uuid round-trip OK")
 
         stdout_text = stdout_log.read_text() if stdout_log.exists() else ""
         assert LIVE_MARKER in stdout_text, (
