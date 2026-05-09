@@ -15,7 +15,9 @@
 //!   *would* have been spawned and returns success without touching
 //!   the OS.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -108,6 +110,75 @@ impl JobDispatcher for DryRunDispatcher {
     }
 }
 
+// -------------------------------------------------- BackgroundDispatcher
+
+/// A child spawned but **not awaited**. Caller owns the `Child` and must
+/// `wait()` it (or move it into a task that does) to avoid zombies.
+pub struct SpawnedChild {
+    pub pid: u32,
+    pub child: tokio::process::Child,
+}
+
+impl std::fmt::Debug for SpawnedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnedChild")
+            .field("pid", &self.pid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Non-blocking variant of [`JobDispatcher`]: returns immediately with a
+/// child handle whose stdout/stderr are piped.
+pub trait BackgroundDispatcher: JobDispatcher {
+    fn spawn(
+        &self,
+        argv: &[String],
+        env: &HashMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> impl std::future::Future<Output = anyhow::Result<SpawnedChild>> + Send;
+}
+
+/// Production [`BackgroundDispatcher`] backed by `tokio::process::Command`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokioBackgroundDispatcher;
+
+impl JobDispatcher for TokioBackgroundDispatcher {
+    async fn run(&self, argv: &[String]) -> anyhow::Result<i32> {
+        TokioDispatcher.run(argv).await
+    }
+    async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+        TokioDispatcher.capture(argv).await
+    }
+}
+
+impl BackgroundDispatcher for TokioBackgroundDispatcher {
+    async fn spawn(
+        &self,
+        argv: &[String],
+        env: &HashMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<SpawnedChild> {
+        use anyhow::Context as _;
+        let (program, args) = argv
+            .split_first()
+            .context("TokioBackgroundDispatcher::spawn called with empty argv")?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .envs(env);
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn `{program}`"))?;
+        let pid = child.id().context("spawned child has no pid")?;
+        Ok(SpawnedChild { pid, child })
+    }
+}
+
 // --------------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -164,5 +235,35 @@ mod tests {
         let d = TokioDispatcher;
         let err = d.run(&[]).await.unwrap_err();
         assert!(err.to_string().contains("empty argv"));
+    }
+
+    #[tokio::test]
+    async fn tokio_background_spawn_runs_to_zero() {
+        use std::collections::HashMap;
+        let d = TokioBackgroundDispatcher;
+        let argv = vec!["bash".to_string(), "-c".to_string(), "exit 0".to_string()];
+        let mut spawned = d.spawn(&argv, &HashMap::new(), None).await.unwrap();
+        assert!(spawned.pid > 0);
+        let status = spawned.child.wait().await.unwrap();
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn tokio_background_spawn_missing_binary_errors() {
+        use std::collections::HashMap;
+        let d = TokioBackgroundDispatcher;
+        let err = d
+            .spawn(
+                &["definitely-not-a-real-binary-xyz".to_string()],
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("failed to spawn") || s.contains("No such file"),
+            "unexpected error: {s}"
+        );
     }
 }
