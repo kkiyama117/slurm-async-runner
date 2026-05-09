@@ -36,6 +36,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::dispatcher::SpawnedChild;
 use crate::tssrun::log::{JobLogSink, LogStream};
@@ -60,8 +61,16 @@ pub struct FinishedInfo {
 
 /// Persistable snapshot of a tssrun job. Updated by the tee task as the
 /// `salloc:` lines arrive and by the wait task on child exit.
+///
+/// `uuid` is the stable primary key for a running job. It is generated at
+/// spawn time as a UUID v7 (time-ordered, monotonic-friendly) and is the
+/// only identifier that survives reuse hazards: `pid` may be recycled by
+/// the kernel after the child exits, and `jobid` is only known after
+/// SLURM emits the `salloc:` banner. Persisted snapshots are stored as
+/// `{state_dir}/{uuid}.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobHandleSnapshot {
+    pub uuid: Uuid,
     pub pid: u32,
     pub argv: Vec<String>,
     pub sent_env: HashMap<String, String>,
@@ -188,6 +197,9 @@ impl JobHandle {
 
     pub fn snapshot(&self) -> JobHandleSnapshot {
         self.snapshot_rx.borrow().clone()
+    }
+    pub fn uuid(&self) -> Uuid {
+        self.snapshot_rx.borrow().uuid
     }
     pub fn pid(&self) -> u32 {
         self.snapshot_rx.borrow().pid
@@ -420,6 +432,7 @@ mod tests {
 
     fn snap_running() -> JobHandleSnapshot {
         JobHandleSnapshot {
+            uuid: Uuid::now_v7(),
             pid: 31415,
             argv: vec!["tssrun".into(), "/work/job.sh".into()],
             sent_env: HashMap::from([("OMP_NUM_THREADS".into(), "8".into())]),
@@ -478,6 +491,7 @@ echo done"#
             Arc::clone(&typed_sink) as Arc<dyn crate::tssrun::log::JobLogSink>;
 
         let init = JobHandleSnapshot {
+            uuid: Uuid::now_v7(),
             pid: spawned.pid,
             argv: argv.clone(),
             sent_env: env,
@@ -526,6 +540,7 @@ echo done"#
             .unwrap();
 
         let init = JobHandleSnapshot {
+            uuid: Uuid::now_v7(),
             pid: spawned.pid,
             argv,
             sent_env: env,
@@ -565,6 +580,7 @@ echo done"#
             .await
             .unwrap();
         let init = JobHandleSnapshot {
+            uuid: Uuid::now_v7(),
             pid: spawned.pid,
             argv,
             sent_env: env,

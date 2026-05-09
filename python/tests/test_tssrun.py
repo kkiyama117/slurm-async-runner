@@ -144,11 +144,48 @@ def test_manager_attach_file_round_trip() -> None:
             manager = TssrunManager(_bash_cmd(Path(td)), state_dir=td)
             h = await manager.spawn()
             pid = await h.pid
+            uuid = await h.uuid
             await h.wait()
-            path = Path(td) / f"{pid}.json"
+            # State directory layout: {state_dir}/{uuid}.json — pid is no
+            # longer the filename key after the UUID v7 migration.
+            path = Path(td) / f"{uuid}.json"
             assert path.exists()
             attached = await manager.attach_file(str(path))
             assert (await attached.pid) == pid
+            assert (await attached.uuid) == uuid
             assert (await attached.jobid) == 555
+
+    asyncio.run(run())
+
+
+def test_manager_attach_uuid_round_trip() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            manager = TssrunManager(_bash_cmd(Path(td)), state_dir=td)
+            h = await manager.spawn()
+            pid = await h.pid
+            uuid = await h.uuid
+            await h.wait()
+            # uuid is the canonical hyphenated string, e.g.
+            # "0190cc1c-7a48-7c0e-a0a0-1234567890ab" — 36 chars.
+            assert len(uuid) == 36 and uuid.count("-") == 4
+            attached = await manager.attach_uuid(uuid)
+            assert (await attached.uuid) == uuid
+            assert (await attached.pid) == pid
+            assert (await attached.jobid) == 555
+
+    asyncio.run(run())
+
+
+def test_manager_attach_uuid_rejects_invalid_string() -> None:
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            manager = TssrunManager(_bash_cmd(Path(td)), state_dir=td)
+            try:
+                await manager.attach_uuid("not-a-uuid")
+            except RuntimeError as e:
+                assert "invalid uuid" in str(e).lower()
+            else:
+                raise AssertionError("attach_uuid must reject malformed input")
 
     asyncio.run(run())

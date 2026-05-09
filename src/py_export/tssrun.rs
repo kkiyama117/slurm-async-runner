@@ -9,6 +9,7 @@ use std::sync::Arc;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
+use uuid::Uuid;
 
 use tokio::sync::watch;
 
@@ -206,6 +207,16 @@ impl PyTssrunJobHandle {
         future_into_py(py, async move { Ok(jobid) })
     }
 
+    /// UUID v7 primary key for this job. Returned as the canonical
+    /// hyphenated string (e.g. ``"0190cc1c-7a48-7c0e-a0a0-1234567890ab"``)
+    /// so it can be passed straight back to ``attach_uuid`` or used as a
+    /// dict key without needing to depend on Python's ``uuid`` module.
+    #[getter]
+    fn uuid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let uuid = self.rx.borrow().uuid.to_string();
+        future_into_py(py, async move { Ok(uuid) })
+    }
+
     #[getter]
     fn node<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let node = self.rx.borrow().node.clone();
@@ -292,6 +303,22 @@ impl PyTssrunManager {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(PyTssrunJobHandle::from_handle(handle))
+        })
+    }
+
+    /// Attach to a previously persisted handle by its UUID v7 primary key.
+    /// Accepts the canonical hyphenated string returned by the ``uuid``
+    /// getter — invalid input raises ``RuntimeError``.
+    fn attach_uuid<'py>(&self, py: Python<'py>, uuid: &str) -> PyResult<Bound<'py, PyAny>> {
+        let parsed = Uuid::parse_str(uuid)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid uuid {uuid:?}: {e}")))?;
+        let m = self.0.clone();
+        future_into_py(py, async move {
+            let h = m
+                .attach(AttachKey::Uuid(parsed))
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(PyTssrunJobHandle::from_handle(h))
         })
     }
 

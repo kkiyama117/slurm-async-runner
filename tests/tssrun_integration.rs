@@ -40,10 +40,12 @@ async fn spawn_then_wait_then_snapshot_then_attach() {
 
     let mut handle = manager.spawn().await.unwrap();
     let pid = handle.pid();
+    let uuid = handle.uuid();
     let code = handle.wait().await.unwrap();
     assert_eq!(code, Some(0));
 
     let snap = handle.snapshot();
+    assert_eq!(snap.uuid, uuid);
     assert_eq!(snap.jobid, Some(12345));
     assert_eq!(snap.node.as_deref(), Some("node-int"));
     assert!(snap.finished.is_some());
@@ -51,7 +53,8 @@ async fn spawn_then_wait_then_snapshot_then_attach() {
     let stdout_content = tokio::fs::read_to_string(&stdout_log).await.unwrap();
     assert!(stdout_content.contains("hello from child"));
 
-    let path = state_dir.join(format!("{pid}.json"));
+    // Persisted snapshot file is named after the UUID v7 primary key, not pid.
+    let path = state_dir.join(format!("{uuid}.json"));
     assert!(
         path.exists(),
         "missing persisted handle at {}",
@@ -59,7 +62,13 @@ async fn spawn_then_wait_then_snapshot_then_attach() {
     );
 
     let attached = manager.attach(AttachKey::File(path)).await.unwrap();
+    assert_eq!(attached.uuid(), uuid);
     assert_eq!(attached.pid(), pid);
     assert_eq!(attached.jobid(), Some(12345));
     assert_eq!(attached.node().as_deref(), Some("node-int"));
+
+    // Round-trip via the new AttachKey::Uuid resolution path.
+    let by_uuid = manager.attach(AttachKey::Uuid(uuid)).await.unwrap();
+    assert_eq!(by_uuid.uuid(), uuid);
+    assert_eq!(by_uuid.pid(), pid);
 }
