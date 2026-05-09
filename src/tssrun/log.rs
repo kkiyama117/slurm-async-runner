@@ -4,8 +4,8 @@
 //! Implementations must be `Send + Sync` so the tee task can be spawned
 //! on the multi-threaded tokio runtime.
 
-use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -17,9 +17,14 @@ pub enum LogStream {
     Stderr,
 }
 
+/// Pluggable log sink. Dyn-compatible so callers can hold `Arc<dyn JobLogSink>`.
 pub trait JobLogSink: Send + Sync {
-    fn append(&self, stream: LogStream, line: &str) -> impl Future<Output = Result<()>> + Send;
-    fn flush(&self) -> impl Future<Output = Result<()>> + Send;
+    fn append<'a>(
+        &'a self,
+        stream: LogStream,
+        line: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+    fn flush(&self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 }
 
 /// Drops every line. Use when stdout is irrelevant (still parses for jobid).
@@ -27,11 +32,15 @@ pub trait JobLogSink: Send + Sync {
 pub struct NullLogSink;
 
 impl JobLogSink for NullLogSink {
-    async fn append(&self, _stream: LogStream, _line: &str) -> Result<()> {
-        Ok(())
+    fn append<'a>(
+        &'a self,
+        _stream: LogStream,
+        _line: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
     }
-    async fn flush(&self) -> Result<()> {
-        Ok(())
+    fn flush(&self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -48,12 +57,19 @@ impl InMemoryLogSink {
 }
 
 impl JobLogSink for InMemoryLogSink {
-    async fn append(&self, stream: LogStream, line: &str) -> Result<()> {
-        self.buf.lock().unwrap().push((stream, line.to_string()));
-        Ok(())
+    fn append<'a>(
+        &'a self,
+        stream: LogStream,
+        line: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        let entry = (stream, line.to_string());
+        Box::pin(async move {
+            self.buf.lock().unwrap().push(entry);
+            Ok(())
+        })
     }
-    async fn flush(&self) -> Result<()> {
-        Ok(())
+    fn flush(&self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -62,15 +78,22 @@ impl JobLogSink for InMemoryLogSink {
 pub struct StdLogSink;
 
 impl JobLogSink for StdLogSink {
-    async fn append(&self, stream: LogStream, line: &str) -> Result<()> {
-        match stream {
-            LogStream::Stdout => println!("{line}"),
-            LogStream::Stderr => eprintln!("{line}"),
-        }
-        Ok(())
+    fn append<'a>(
+        &'a self,
+        stream: LogStream,
+        line: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        let owned = line.to_string();
+        Box::pin(async move {
+            match stream {
+                LogStream::Stdout => println!("{owned}"),
+                LogStream::Stderr => eprintln!("{owned}"),
+            }
+            Ok(())
+        })
     }
-    async fn flush(&self) -> Result<()> {
-        Ok(())
+    fn flush(&self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -106,20 +129,29 @@ impl FileLogSink {
 }
 
 impl JobLogSink for FileLogSink {
-    async fn append(&self, stream: LogStream, line: &str) -> Result<()> {
-        let mut f = match stream {
-            LogStream::Stdout => self.stdout.lock().await,
-            LogStream::Stderr => self.stderr.lock().await,
-        };
-        f.write_all(line.as_bytes()).await?;
-        f.write_all(b"\n").await?;
-        Ok(())
+    fn append<'a>(
+        &'a self,
+        stream: LogStream,
+        line: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        let owned = line.to_string();
+        Box::pin(async move {
+            let mut f = match stream {
+                LogStream::Stdout => self.stdout.lock().await,
+                LogStream::Stderr => self.stderr.lock().await,
+            };
+            f.write_all(owned.as_bytes()).await?;
+            f.write_all(b"\n").await?;
+            Ok(())
+        })
     }
 
-    async fn flush(&self) -> Result<()> {
-        self.stdout.lock().await.flush().await?;
-        self.stderr.lock().await.flush().await?;
-        Ok(())
+    fn flush(&self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async {
+            self.stdout.lock().await.flush().await?;
+            self.stderr.lock().await.flush().await?;
+            Ok(())
+        })
     }
 }
 
