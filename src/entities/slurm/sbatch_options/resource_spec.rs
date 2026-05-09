@@ -10,7 +10,30 @@
 
 use std::num::NonZeroU32;
 
+use thiserror::Error;
+
 use crate::error::SchemaParseError;
+
+/// Validation error returned by [`ResourceSpec::from_parts`].
+///
+/// Distinct from [`SchemaParseError`] (which comes from the textual
+/// `--rsc` parser) because the constructor receives already-typed
+/// integer keys, so the only failure modes are "CPU and GPU keys
+/// mixed" and "an integer key was supplied as 0".
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ResourceSpecError {
+    /// CPU keys (`p`/`t`/`c`/`m`) and the GPU key (`g`) cannot
+    /// coexist in a single spec — they pick mutually exclusive
+    /// scheduling flavours.
+    #[error("CPU keys (p/t/c/m) and GPU key (g) are mutually exclusive")]
+    MixedCpuGpu,
+
+    /// One of the integer keys was passed as `0`. The wrapped
+    /// `&'static str` is the offending key name (e.g. `"processes"`,
+    /// `"gpus"`).
+    #[error("`{0}` must be positive (non-zero)")]
+    ZeroValue(&'static str),
+}
 
 /// Memory size suffix recognised by Slurm `--mem` and KUDPC `--rsc m=`.
 ///
@@ -167,6 +190,50 @@ pub struct ResourceSpecCPU {
 pub struct ResourceSpecGPU {
     /// `g=` — number of GPUs (>= 1).
     pub g: NonZeroU32,
+}
+
+impl ResourceSpec {
+    /// Construct a `ResourceSpec` from individual KUDPC `--rsc` keys.
+    ///
+    /// All five arguments are optional. `gpus` is mutually exclusive
+    /// with the four CPU keys (`processes`/`threads`/`cores`/`memory`).
+    /// When all five are `None`, returns
+    /// `ResourceSpec::CPU(ResourceSpecCPU::default())` — an empty CPU
+    /// spec is meaningful, because the scheduler's own default applies
+    /// to every omitted field and the textual form renders to `""`,
+    /// which the `tssrun` argv builder treats as "skip the `--rsc`
+    /// flag entirely".
+    ///
+    /// This is the pure-Rust validator used by both the SAR pyclass
+    /// wrapper and any future shared2 bridge type, so it must not
+    /// depend on pyo3.
+    pub fn from_parts(
+        processes: Option<u32>,
+        threads: Option<u32>,
+        cores: Option<u32>,
+        memory: Option<Memory>,
+        gpus: Option<u32>,
+    ) -> Result<Self, ResourceSpecError> {
+        let any_cpu =
+            processes.is_some() || threads.is_some() || cores.is_some() || memory.is_some();
+        if gpus.is_some() && any_cpu {
+            return Err(ResourceSpecError::MixedCpuGpu);
+        }
+        if let Some(g) = gpus {
+            let g = NonZeroU32::new(g).ok_or(ResourceSpecError::ZeroValue("gpus"))?;
+            return Ok(ResourceSpec::GPU(ResourceSpecGPU { g }));
+        }
+        let p = processes
+            .map(|v| NonZeroU32::new(v).ok_or(ResourceSpecError::ZeroValue("processes")))
+            .transpose()?;
+        let t = threads
+            .map(|v| NonZeroU32::new(v).ok_or(ResourceSpecError::ZeroValue("threads")))
+            .transpose()?;
+        let c = cores
+            .map(|v| NonZeroU32::new(v).ok_or(ResourceSpecError::ZeroValue("cores")))
+            .transpose()?;
+        Ok(ResourceSpec::CPU(ResourceSpecCPU { p, t, c, m: memory }))
+    }
 }
 
 impl std::fmt::Display for ResourceSpec {
@@ -634,5 +701,41 @@ mod tests {
     fn cpu_default_is_all_none_and_display_is_empty() {
         let r = ResourceSpec::CPU(ResourceSpecCPU::default());
         assert_eq!(r.to_string(), "");
+    }
+
+    // ---- ResourceSpec::from_parts (Task 2) ----
+
+    #[test]
+    fn from_parts_all_none_yields_default_cpu() {
+        let spec = ResourceSpec::from_parts(None, None, None, None, None).unwrap();
+        assert_eq!(spec, ResourceSpec::CPU(ResourceSpecCPU::default()));
+    }
+
+    #[test]
+    fn from_parts_cpu_partial_keeps_other_fields_none() {
+        let spec = ResourceSpec::from_parts(Some(4), None, None, None, None).unwrap();
+        let ResourceSpec::CPU(cpu) = spec else {
+            panic!("expected CPU variant");
+        };
+        assert_eq!(cpu.p, NonZeroU32::new(4));
+        assert!(cpu.t.is_none());
+    }
+
+    #[test]
+    fn from_parts_gpu_only_yields_gpu_variant() {
+        let spec = ResourceSpec::from_parts(None, None, None, None, Some(2)).unwrap();
+        assert!(matches!(spec, ResourceSpec::GPU(_)));
+    }
+
+    #[test]
+    fn from_parts_mixed_cpu_and_gpu_is_rejected() {
+        let err = ResourceSpec::from_parts(Some(4), None, None, None, Some(2)).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn from_parts_zero_processes_is_rejected() {
+        let err = ResourceSpec::from_parts(Some(0), None, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
     }
 }
