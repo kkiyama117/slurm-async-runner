@@ -198,6 +198,41 @@ impl SbatchJobHandle {
     pub fn exit_code(&self) -> Option<i32> {
         self.0.snapshot_tx.borrow().exit_code()
     }
+
+    /// Lightweight polling: `qgroup -l` → `squeue` fallback. **Never** calls
+    /// sacct. If both lookups miss, sets `lifecycle.left_active_listing = true`.
+    pub async fn refresh(&self) -> anyhow::Result<SbatchJobSnapshot> {
+        let inner = &*self.0;
+        let _guard = inner.refresh_lock.lock().await;
+
+        let mut snap = inner.snapshot_tx.borrow().clone();
+        let now = chrono::Utc::now();
+        let view = crate::dispatcher::DynView(&*inner.dispatcher);
+
+        let qgroup = crate::runner::query_job_states_via_qgroup_with(&view, &[snap.jobid]).await?;
+        if let Some(status) = qgroup.get(&snap.jobid) {
+            snap.lifecycle.last_observed_state = Some(status.clone());
+            snap.lifecycle.last_observed_at = Some(now);
+            inner.store.save(&snap).await?;
+            let _ = inner.snapshot_tx.send(snap.clone());
+            return Ok(snap);
+        }
+
+        let squeue = crate::runner::query_job_states_squeue_only_with(&view, &[snap.jobid]).await?;
+        if let Some(status) = squeue.get(&snap.jobid) {
+            snap.lifecycle.last_observed_state = Some(status.clone());
+            snap.lifecycle.last_observed_at = Some(now);
+            inner.store.save(&snap).await?;
+            let _ = inner.snapshot_tx.send(snap.clone());
+            return Ok(snap);
+        }
+
+        snap.lifecycle.left_active_listing = true;
+        snap.lifecycle.last_observed_at = Some(now);
+        inner.store.save(&snap).await?;
+        let _ = inner.snapshot_tx.send(snap.clone());
+        Ok(snap)
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +332,123 @@ mod tests {
         assert_eq!(h1.uuid(), h2.uuid());
         let _r1 = h1.watch();
         let _r2 = h2.watch();
+    }
+
+    // ---- CannedDispatcher mock for refresh tests ----
+
+    /// Mock dispatcher: returns canned outputs keyed by argv[0].
+    /// argv[0] = "qgroup" → first canned, "squeue" → second, "sacct" → third.
+    struct CannedDispatcher {
+        qgroup: std::sync::Mutex<String>,
+        squeue: std::sync::Mutex<String>,
+        sacct: std::sync::Mutex<String>,
+        sacct_call_count: std::sync::Mutex<u32>,
+    }
+
+    impl CannedDispatcher {
+        fn new(qgroup: &str, squeue: &str, sacct: &str) -> Self {
+            Self {
+                qgroup: std::sync::Mutex::new(qgroup.to_string()),
+                squeue: std::sync::Mutex::new(squeue.to_string()),
+                sacct: std::sync::Mutex::new(sacct.to_string()),
+                sacct_call_count: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn sacct_calls(&self) -> u32 {
+            *self.sacct_call_count.lock().unwrap()
+        }
+    }
+
+    impl crate::dispatcher::JobDispatcher for CannedDispatcher {
+        async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+            unimplemented!()
+        }
+
+        async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+            let bin = argv[0].as_str();
+            let out = match bin {
+                "qgroup" => self.qgroup.lock().unwrap().clone(),
+                "squeue" => self.squeue.lock().unwrap().clone(),
+                "sacct" => {
+                    *self.sacct_call_count.lock().unwrap() += 1;
+                    self.sacct.lock().unwrap().clone()
+                }
+                _ => String::new(),
+            };
+            Ok((0, out))
+        }
+    }
+
+    /// Newtype that wraps an `Arc<CannedDispatcher>` so it can be passed
+    /// to `into_dyn` (which requires `D: JobDispatcher + Send + Sync + 'static`)
+    /// while leaving the original Arc available for assertion.
+    struct MoveDispatcher(std::sync::Arc<CannedDispatcher>);
+
+    impl crate::dispatcher::JobDispatcher for MoveDispatcher {
+        async fn run(&self, argv: &[String]) -> anyhow::Result<i32> {
+            self.0.run(argv).await
+        }
+
+        async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+            self.0.capture(argv).await
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_qgroup_when_jobid_present() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(CannedDispatcher::new(
+            "QUEUE USER JOBID STATUS PROC\ngr u 12345 RUN 1\n",
+            "",
+            "",
+        ));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh().await.unwrap();
+        assert_eq!(
+            after.lifecycle.last_observed_state.unwrap().state,
+            crate::JobState::Running
+        );
+        assert!(!after.lifecycle.left_active_listing);
+    }
+
+    #[tokio::test]
+    async fn refresh_falls_back_to_squeue_when_qgroup_misses() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(CannedDispatcher::new("", "12345 RUNNING None\n", ""));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh().await.unwrap();
+        assert_eq!(
+            after.lifecycle.last_observed_state.unwrap().state,
+            crate::JobState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_marks_left_active_listing_when_both_miss() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        // Wrap a clone of the Arc in into_dyn; keep the original Arc to
+        // observe sacct call count after refresh.
+        let dispatcher = {
+            let canned = canned.clone();
+            into_dyn(MoveDispatcher(canned))
+        };
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh().await.unwrap();
+        assert!(after.lifecycle.left_active_listing);
+        assert_eq!(canned.sacct_calls(), 0, "refresh must NOT call sacct");
     }
 }
