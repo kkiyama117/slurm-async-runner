@@ -137,6 +137,22 @@ impl TryFrom<String> for MailTypeInput {
     }
 }
 
+impl std::fmt::Display for MailTypeInput {
+    /// Comma-separated rendering matching Slurm's `--mail-type` syntax.
+    /// Round-trips with [`TryFrom<String>`] for any non-empty value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for mt in &self.0 {
+            if !first {
+                f.write_str(",")?;
+            }
+            first = false;
+            std::fmt::Display::fmt(mt, f)?;
+        }
+        Ok(())
+    }
+}
+
 /// `[slurm]` table — Replesent config  of SLURM submission.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,5 +241,31 @@ mod tests {
             let parsed = MailType::try_from(rendered.as_str()).unwrap();
             assert_eq!(parsed, mt);
         }
+    }
+
+    #[test]
+    fn mail_type_input_display_joins_with_commas() {
+        let mti = MailTypeInput::try_from("BEGIN,END".to_string()).unwrap();
+        assert_eq!(mti.to_string(), "BEGIN,END");
+    }
+
+    #[test]
+    fn mail_type_input_display_single_value() {
+        let mti = MailTypeInput::try_from("FAIL".to_string()).unwrap();
+        assert_eq!(mti.to_string(), "FAIL");
+    }
+
+    #[test]
+    fn mail_type_input_display_preserves_order() {
+        let mti = MailTypeInput::try_from("END,BEGIN,FAIL".to_string()).unwrap();
+        assert_eq!(mti.to_string(), "END,BEGIN,FAIL");
+    }
+
+    #[test]
+    fn mail_type_input_display_roundtrips() {
+        let original = MailTypeInput::try_from("ALL".to_string()).unwrap();
+        let rendered = original.to_string();
+        let parsed = MailTypeInput::try_from(rendered).unwrap();
+        assert_eq!(parsed, original);
     }
 }
