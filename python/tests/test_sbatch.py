@@ -121,3 +121,14 @@ def test_sbatch_cmd_mail_types_kwarg(tmp_path):
     job.write_text("#!/usr/bin/env bash\necho hi\n")
     cmd = SbatchCmd(str(job), mail_types=MailTypeInput.parse("BEGIN,END"))
     assert cmd is not None
+
+
+def test_sbatch_cmd_kwargs_listed_in_runtime_signature():
+    """Smoke: pyo3 must accept all three P2 kwargs as recognized names."""
+    cmd = SbatchCmd(
+        "/tmp/job.sh",
+        dependency=None,
+        mail_user=None,
+        mail_types=None,
+    )
+    assert cmd is not None
