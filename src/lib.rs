@@ -56,8 +56,9 @@ pub use tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
 pub use sbatch::cmd::SbatchCmd;
 pub use sbatch::error::SbatchSpawnError;
 pub use sbatch::handle::{
-    FinishedInfo as SbatchFinishedInfo, LogPathSpec, SbatchAttachKey, SbatchJobHandle,
-    SbatchJobSnapshot, SbatchLifecycle,
+    FinishedInfo as SbatchFinishedInfo, LogPathSpec, LogReadError as SbatchLogReadError,
+    LogStream as SbatchLogStream, SbatchAttachKey, SbatchJobHandle, SbatchJobSnapshot,
+    SbatchLifecycle,
 };
 pub use sbatch::manager::SbatchManager;
 pub use sbatch::parse::{parse_submitted_jobid, resolve_log_path};

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use thiserror::Error;
 use tokio::sync::{Mutex as TokioMutex, watch};
 
 use chrono::{DateTime, Utc};
@@ -110,6 +111,22 @@ impl SbatchJobSnapshot {
     }
 }
 
+/// Which job log stream to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// Errors that can occur while reading a job's log file.
+#[derive(Debug, Error)]
+pub enum LogReadError {
+    #[error("log path not resolved on snapshot (template missing)")]
+    PathNotResolved,
+    #[error("io error reading log: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 #[derive(Debug, Clone)]
 pub enum SbatchAttachKey {
     Uuid(Uuid),
@@ -203,6 +220,58 @@ impl SbatchJobHandle {
     /// or if `finished` is not yet recorded.
     pub fn exit_code(&self) -> Option<i32> {
         self.0.snapshot_tx.borrow().exit_code()
+    }
+
+    // -------- Log read API (Phase 2 P1) --------
+
+    /// Read the last `n` lines of the job's stdout/stderr log file.
+    ///
+    /// Returns an empty `Vec` if the log file does not yet exist (job
+    /// pending or just submitted). Returns `LogReadError::PathNotResolved`
+    /// if the snapshot does not carry the corresponding log template.
+    /// Other I/O errors are propagated as `LogReadError::Io`.
+    ///
+    /// Phase 2 P1 implements this with a full read of the file followed
+    /// by line splitting; for very large logs (> ~10MB) consider Phase 3
+    /// optimization with reverse seek.
+    pub async fn log_lines(
+        &self,
+        stream: LogStream,
+        n: usize,
+    ) -> Result<Vec<String>, LogReadError> {
+        let snap = self.0.snapshot_tx.borrow().clone();
+        let path = match stream {
+            LogStream::Stdout => snap.output_path(),
+            LogStream::Stderr => snap.error_path(),
+        };
+        let path = path.ok_or(LogReadError::PathNotResolved)?;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                let start = lines.len().saturating_sub(n);
+                Ok(lines[start..].to_vec())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(LogReadError::Io(e)),
+        }
+    }
+
+    /// Read the full contents of the job's stdout/stderr log file.
+    ///
+    /// Returns an empty string if the log file does not yet exist.
+    /// Same error semantics as [`SbatchJobHandle::log_lines`] otherwise.
+    pub async fn read_log_to_end(&self, stream: LogStream) -> Result<String, LogReadError> {
+        let snap = self.0.snapshot_tx.borrow().clone();
+        let path = match stream {
+            LogStream::Stdout => snap.output_path(),
+            LogStream::Stderr => snap.error_path(),
+        };
+        let path = path.ok_or(LogReadError::PathNotResolved)?;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => Ok(content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(LogReadError::Io(e)),
+        }
     }
 
     /// Lightweight polling: `qgroup -l` → `squeue` fallback. **Never** calls
@@ -625,5 +694,90 @@ mod tests {
             0,
             "wait_terminal must NEVER call sacct"
         );
+    }
+
+    // ---- log_lines / read_log_to_end ----
+
+    use std::io::Write as _;
+
+    fn snap_with_log_path(jobid: u64, stdout_path: &str, stderr_path: &str) -> SbatchJobSnapshot {
+        let mut s = snap(jobid);
+        s.log = LogPathSpec {
+            output_template: Some(stdout_path.to_string()),
+            error_template: Some(stderr_path.to_string()),
+        };
+        s
+    }
+
+    #[tokio::test]
+    async fn log_lines_returns_empty_when_file_missing() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+        let s = snap_with_log_path(
+            12345,
+            "/nonexistent/stdout-%j.out",
+            "/nonexistent/stderr-%j.err",
+        );
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+        let lines = h.log_lines(LogStream::Stdout, 5).await.unwrap();
+        assert_eq!(lines, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn log_lines_returns_path_not_resolved_when_no_template() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+        let mut s = snap(12345);
+        s.log = LogPathSpec::default();
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+        let err = h.log_lines(LogStream::Stdout, 5).await.unwrap_err();
+        assert!(matches!(err, LogReadError::PathNotResolved));
+    }
+
+    #[tokio::test]
+    async fn log_lines_returns_last_n_lines() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout-12345.out");
+        let mut f = std::fs::File::create(&stdout_path).unwrap();
+        for i in 0..20 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        drop(f);
+
+        let s = snap_with_log_path(12345, stdout_path.to_str().unwrap(), "ignored.err");
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+
+        let lines = h.log_lines(LogStream::Stdout, 5).await.unwrap();
+        assert_eq!(
+            lines,
+            vec!["line 15", "line 16", "line 17", "line 18", "line 19"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_log_to_end_returns_full_content() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout-12345.out");
+        std::fs::write(&stdout_path, "hello\nworld\n").unwrap();
+
+        let s = snap_with_log_path(12345, stdout_path.to_str().unwrap(), "ignored.err");
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+
+        let content = h.read_log_to_end(LogStream::Stdout).await.unwrap();
+        assert_eq!(content, "hello\nworld\n");
     }
 }
