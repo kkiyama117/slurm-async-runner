@@ -91,6 +91,24 @@ pub struct JobHandleSnapshot {
     pub finished: Option<FinishedInfo>,
 }
 
+impl JobHandleSnapshot {
+    /// True while the child process is still alive (no `finished` recorded).
+    pub fn is_running(&self) -> bool {
+        self.finished.is_none()
+    }
+
+    /// True once the child has exited (regardless of how).
+    pub fn is_finished(&self) -> bool {
+        self.finished.is_some()
+    }
+
+    /// Exit code if the child exited normally; `None` if killed by signal
+    /// or if `finished` is not yet recorded.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.finished.as_ref().and_then(|f| f.exit_code)
+    }
+}
+
 /// In-process handle to a spawned `tssrun` child plus the tee/wait tasks
 /// that keep its [`JobHandleSnapshot`] up to date.
 pub struct JobHandle {
@@ -234,14 +252,15 @@ impl JobHandle {
         self.snapshot_rx.borrow().sent_env.clone()
     }
     pub fn is_running(&self) -> bool {
-        self.snapshot_rx.borrow().finished.is_none()
+        self.snapshot_rx.borrow().is_running()
     }
+
+    pub fn is_finished(&self) -> bool {
+        self.snapshot_rx.borrow().is_finished()
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
-        self.snapshot_rx
-            .borrow()
-            .finished
-            .as_ref()
-            .and_then(|f| f.exit_code)
+        self.snapshot_rx.borrow().exit_code()
     }
 
     /// Wait for the child to exit and return its exit status code.
@@ -644,5 +663,37 @@ echo done"#
         // On non-Linux the early return makes this trivially Ok(None).
         let res = read_live_env_for_pid(u32::MAX).await;
         assert!(matches!(res, Ok(None)), "unexpected: {res:?}");
+    }
+
+    #[test]
+    fn snapshot_is_running_when_finished_is_none() {
+        let s = snap_running();
+        assert!(s.is_running());
+        assert!(!s.is_finished());
+        assert_eq!(s.exit_code(), None);
+    }
+
+    #[test]
+    fn snapshot_is_finished_after_normal_exit() {
+        let mut s = snap_running();
+        s.finished = Some(FinishedInfo {
+            exit_code: Some(0),
+            finished_at_unix: 1,
+        });
+        assert!(!s.is_running());
+        assert!(s.is_finished());
+        assert_eq!(s.exit_code(), Some(0));
+    }
+
+    #[test]
+    fn snapshot_signal_killed_has_none_exit_code() {
+        let mut s = snap_running();
+        s.finished = Some(FinishedInfo {
+            exit_code: None,
+            finished_at_unix: 1,
+        });
+        assert!(!s.is_running());
+        assert!(s.is_finished());
+        assert_eq!(s.exit_code(), None);
     }
 }
