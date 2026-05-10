@@ -105,13 +105,18 @@ impl JobState {
             "SUSPENDED" | "S" => Self::Suspended,
             "STOPPED" | "ST" => Self::Stopped,
 
-            "RUNNING" | "R" => Self::Running,
+            // KUDPC qgroup -l active token
+            "RUNNING" | "R" | "RUN" => Self::Running,
             "COMPLETING" | "CG" => Self::Completing,
             "RESIZING" | "RS" => Self::Resizing,
             "SIGNALING" | "SI" => Self::Signaling,
             "STAGE_OUT" | "SO" => Self::StageOut,
 
-            "COMPLETED" | "CD" => Self::Completed,
+            // KUDPC qgroup -l pending token
+            "QUE" => Self::Pending,
+
+            // KUDPC qgroup -l completed token
+            "COMPLETED" | "CD" | "CMP" => Self::Completed,
 
             "BOOT_FAIL" | "BF" => Self::BootFail,
             "CANCELLED" | "CA" => Self::Cancelled,
