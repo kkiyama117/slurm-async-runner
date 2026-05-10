@@ -164,6 +164,93 @@ pub(crate) fn parse_sacct(text: &str) -> HashMap<u64, JobStatus> {
     out
 }
 
+/// Parse `qgroup -l` output into a `{jobid: JobStatus}` map.
+///
+/// Expected layout (KUDPC):
+/// ```text
+/// QUEUE     USER     JOBID          STATUS  PROC  CORE    MEM    ELAPSE(    limit)
+/// gr19999b  b59999   12345          RUN        4     1  4570M  00:00:07( 01:00:00)
+/// ```
+///
+/// Behaviour:
+/// - Whitespace-split each line; take field index 2 as JOBID and 3 as STATUS.
+/// - Lines without at least 4 fields are skipped (header, blanks).
+/// - Lines whose JOBID field is not a valid u64 are skipped.
+/// - State strings are forwarded to `JobState::parse` (handles "RUN", "QUE",
+///   "CMP", and SLURM long forms thanks to forward-compat fallbacks).
+/// - Reason is set to `JobReason::None` (qgroup -l does not surface reasons).
+pub fn parse_qgroup_l(stdout: &str) -> HashMap<u64, JobStatus> {
+    let mut out = HashMap::new();
+    for line in stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let _queue = fields.next();
+        let _user = fields.next();
+        let jobid_str = match fields.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let state_str = match fields.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let Ok(jobid) = jobid_str.parse::<u64>() else {
+            continue;
+        };
+        out.insert(
+            jobid,
+            JobStatus {
+                state: JobState::parse(state_str),
+                reason: JobReason::None,
+            },
+        );
+    }
+    out
+}
+
+/// Bulk-query KUDPC's `qgroup -l` for the given `jobids`. Cheap (KUDPC
+/// docs do not flag it as system-intensive). Returns only the jobids that
+/// `qgroup -l` reports; missing ids are simply absent from the map (caller
+/// decides whether to fall back to squeue / sacct).
+pub async fn query_job_states_via_qgroup_with<D: JobDispatcher>(
+    dispatcher: &D,
+    jobids: &[u64],
+) -> Result<HashMap<u64, JobStatus>> {
+    if jobids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let argv = vec!["qgroup".to_string(), "-l".to_string()];
+    let (_, stdout) = dispatcher.capture(&argv).await?;
+    let all = parse_qgroup_l(&stdout);
+    let wanted: HashSet<u64> = jobids.iter().copied().collect();
+    Ok(all
+        .into_iter()
+        .filter(|(k, _)| wanted.contains(k))
+        .collect())
+}
+
+/// Like [`query_job_states_batch_with`] but **squeue only**, no sacct
+/// fallback. Returns only the jobids squeue reports; missing ids are
+/// absent from the map.
+pub async fn query_job_states_squeue_only_with<D: JobDispatcher>(
+    dispatcher: &D,
+    jobids: &[u64],
+) -> Result<HashMap<u64, JobStatus>> {
+    if jobids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let unique = dedupe_preserving_order(jobids);
+    let argv = vec![
+        "squeue".to_string(),
+        "-h".to_string(),
+        "-j".to_string(),
+        csv_join(&unique),
+        "-o".to_string(),
+        "%i %T %r".to_string(),
+    ];
+    let (_, out) = dispatcher.capture(&argv).await?;
+    Ok(parse_squeue(&out))
+}
+
 /// Resolve every input id from `(active → history → Unknown)`.
 ///
 /// Uses `JobStatus::default()` (state=Unknown, reason=None) for ids that
@@ -366,5 +453,43 @@ mod tests {
     async fn empty_input_short_circuits() {
         let m = query_job_states_batch(&[]).await.unwrap();
         assert!(m.is_empty());
+    }
+
+    // ---- parse_qgroup_l ----
+
+    #[test]
+    fn parse_qgroup_l_extracts_jobid_and_state() {
+        let out = "\
+QUEUE     USER     JOBID          STATUS  PROC  CORE    MEM    ELAPSE(    limit)
+gr19999b  b59999   12345          RUN        4     1  4570M  00:00:07( 01:00:00)
+gr19999b  b59999   12346          QUE        1     1   100M  00:00:00( 00:30:00)
+";
+        let map = super::parse_qgroup_l(out);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&12345).unwrap().state, JobState::Running);
+        assert_eq!(map.get(&12346).unwrap().state, JobState::Pending);
+    }
+
+    #[test]
+    fn parse_qgroup_l_skips_blank_and_short_lines() {
+        let out = "\
+QUEUE USER JOBID STATUS
+
+short
+gr19999b u 9999 RUN 1 1 1M 0:0:1(0:1:0)
+";
+        let map = super::parse_qgroup_l(out);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&9999));
+    }
+
+    #[test]
+    fn parse_qgroup_l_handles_completed_state() {
+        let out = "\
+QUEUE USER JOBID STATUS PROC
+gr19999b u 5555 CMP 1
+";
+        let map = super::parse_qgroup_l(out);
+        assert_eq!(map.get(&5555).map(|s| s.state), Some(JobState::Completed));
     }
 }
