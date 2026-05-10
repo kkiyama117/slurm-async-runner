@@ -48,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
 
 ```python
 import asyncio
-from slurm_async_runner._core.manager import SlurmCmd, SlurmManager
-from slurm_async_runner._core.runner import query_job_states_batch
+from slurm_async_runner._slurm_async_runner_core.manager import SlurmCmd, SlurmManager
+from slurm_async_runner._slurm_async_runner_core.runner import query_job_states_batch
 from gaussian_job_shared._core.entities.slurm.status import JobStatus
 
 async def main():
@@ -100,7 +100,7 @@ and snapshot-based environment inspection.
 
 ```python
 import asyncio
-from slurm_async_runner._core.tssrun import (
+from slurm_async_runner._slurm_async_runner_core.tssrun import (
     Resource, TssrunCmd, TssrunManager, file_log_sink,
 )
 

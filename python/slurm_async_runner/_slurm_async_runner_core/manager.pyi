@@ -1,4 +1,4 @@
-# Hand-written stubs for slurm_async_runner._core.manager.
+# Hand-written stubs for slurm_async_runner._slurm_async_runner_core.manager.
 #
 # pyo3-stub-gen does not derive stubs for:
 #   - pyclasses inside #[pymodule] sub-modules wired via #[pymodule_export]
@@ -11,7 +11,9 @@ import os
 from collections.abc import Awaitable
 from typing import final
 
-from gaussian_job_shared._core.entities.slurm.status import JobStatus
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.status import (
+    JobStatus,
+)
 
 __all__ = [
     "SlurmCmd",

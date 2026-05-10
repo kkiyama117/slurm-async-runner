@@ -1,4 +1,4 @@
-# Hand-written stubs for slurm_async_runner._core.tssrun.
+# Hand-written stubs for slurm_async_runner._slurm_async_runner_core.tssrun.
 # pyo3-stub-gen does not derive stubs for pyclasses inside #[pymodule]
 # sub-modules wired via #[pymodule_export], so this file is maintained
 # by hand. Keep it in sync with src/py_export/tssrun.rs.
@@ -9,8 +9,14 @@ import os
 from collections.abc import Awaitable
 from typing import final
 
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+    JobTimeLimit,
+    ResourceSpec,
+)
+
 __all__ = [
-    "Resource",
+    "ResourceSpec",
+    "JobTimeLimit",
     "TssrunCmd",
     "LogSink",
     "JobStateStore",
@@ -24,34 +30,15 @@ __all__ = [
 ]
 
 @final
-class Resource:
-    """Resource spec for ``tssrun --rsc p=:t=:c=:m=:g=``."""
-
-    processes: builtins.int | None
-    threads: builtins.int | None
-    cores: builtins.int | None
-    memory: builtins.str | None
-    gpus: builtins.int | None
-
-    def __init__(
-        self,
-        processes: builtins.int | None = ...,
-        threads: builtins.int | None = ...,
-        cores: builtins.int | None = ...,
-        memory: builtins.str | None = ...,
-        gpus: builtins.int | None = ...,
-    ) -> None: ...
-
-@final
 class TssrunCmd:
     """Spec for one ``tssrun`` invocation. Pure data + ``build_argv``."""
     def __init__(
         self,
         program: builtins.str | os.PathLike[builtins.str],
         args: builtins.list[builtins.str] = ...,
-        queue: builtins.str | None = ...,
-        time_limit: builtins.str | None = ...,
-        rsc: Resource | None = ...,
+        partition: builtins.str | None = ...,
+        time_limit: JobTimeLimit | None = ...,
+        rsc: ResourceSpec | None = ...,
         x11: builtins.bool = ...,
         env: builtins.dict[builtins.str, builtins.str] = ...,
         cwd: builtins.str | os.PathLike[builtins.str] | None = ...,

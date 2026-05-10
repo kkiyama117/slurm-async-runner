@@ -241,25 +241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaussian_job_shared"
-version = "0.1.0"
-source = "git+https://github.com/kkiyama117/gaussian_job_shared?branch=main#e40205da46326dbf7aeb247a801458ef0180b056"
-dependencies = [
- "anyhow",
- "chrono",
- "futures",
- "itertools 0.14.0",
- "log",
- "serde",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "getopts"
 version = "0.2.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -986,7 +967,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "gaussian_job_shared",
+ "itertools 0.14.0",
  "log",
  "pyo3",
  "pyo3-async-runtimes",
@@ -998,6 +979,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

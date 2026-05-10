@@ -27,7 +27,7 @@ async fn spawn_then_wait_then_snapshot_then_attach() {
     cmd.tssrun_bin = "bash".to_string();
     // rsc is intentionally omitted: build_argv would emit --rsc p=1:m=128M
     // *before* the script path, which bash interprets as an unknown option
-    // (exit 2). The Resource type is still exercised by unit tests in cmd.rs.
+    // (exit 2). The ResourceSpec type is still exercised by unit tests in cmd.rs.
 
     let sink: Arc<dyn JobLogSink> = Arc::new(
         FileLogSink::create(stdout_log.clone(), stderr_log.clone())

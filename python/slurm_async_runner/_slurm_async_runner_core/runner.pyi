@@ -1,4 +1,4 @@
-# Hand-written stubs for slurm_async_runner._core.runner.
+# Hand-written stubs for slurm_async_runner._slurm_async_runner_core.runner.
 #
 # pyo3-stub-gen does not derive stubs for async pyfunctions returned via
 # pyo3_async_runtimes::tokio::future_into_py, so this file is maintained by
@@ -8,7 +8,9 @@
 import builtins
 from collections.abc import Awaitable
 
-from gaussian_job_shared._core.entities.slurm.status import JobStatus
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.status import (
+    JobStatus,
+)
 
 __all__ = [
     "query_job_states_batch",

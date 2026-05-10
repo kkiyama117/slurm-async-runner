@@ -1,61 +1,23 @@
 //! Pure-data spec types for one `tssrun` invocation:
 //!
-//! - [`Resource`] — `--rsc p=:t=:c=:m=:g=` builder; only fields set to
-//!   `Some(_)` are emitted, in a fixed order, joined by `:`.
 //! - [`TssrunCmd`] — full argv spec including binary path, optional
-//!   queue / time-limit / x11 / explicit env / cwd, plus
+//!   partition / time-limit / x11 / explicit env / cwd, plus
 //!   [`TssrunCmd::build_argv`] which produces the argv that
 //!   [`crate::dispatcher::TokioBackgroundDispatcher`] will hand to
 //!   `tokio::process::Command`.
 //!
+//! The `--rsc` spec is the crate-local
+//! [`crate::entities::slurm::ResourceSpec`] (CPU / GPU
+//! enum); the wall-clock limit is the crate-local
+//! [`crate::entities::slurm::JobTimeLimit`].
+//!
 //! No I/O happens in this module — all subprocess work is in the
 //! dispatcher / handle / manager.
-
-/// Resource spec passed to `tssrun --rsc p=:t=:c=:m=:g=`.
-///
-/// All fields are optional; `render` only emits keys whose value is `Some`.
-/// Order is fixed: `p`, `t`, `c`, `m`, `g`. The `memory` field is a free
-/// string (`"2G"`, `"512M"`, etc.) since SLURM accepts unit suffixes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Resource {
-    pub processes: Option<u32>,
-    pub threads: Option<u32>,
-    pub cores: Option<u32>,
-    pub memory: Option<String>,
-    pub gpus: Option<u32>,
-}
-
-impl Resource {
-    /// Renders the colon-joined `p=…:t=…:m=…:g=…` string.
-    /// Returns `None` if every field is `None`.
-    pub fn render(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::with_capacity(5);
-        if let Some(p) = self.processes {
-            parts.push(format!("p={p}"));
-        }
-        if let Some(t) = self.threads {
-            parts.push(format!("t={t}"));
-        }
-        if let Some(c) = self.cores {
-            parts.push(format!("c={c}"));
-        }
-        if let Some(m) = &self.memory {
-            parts.push(format!("m={m}"));
-        }
-        if let Some(g) = self.gpus {
-            parts.push(format!("g={g}"));
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(":"))
-        }
-    }
-}
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
 use anyhow::{Context, Result};
 
 /// Spec for a single `tssrun` invocation. Pure data + an argv builder —
@@ -64,9 +26,13 @@ use anyhow::{Context, Result};
 #[derive(Debug, Clone)]
 pub struct TssrunCmd {
     pub tssrun_bin: String,
-    pub queue: Option<String>,
-    pub time_limit: Option<String>,
-    pub rsc: Option<Resource>,
+    /// Renamed from `queue` to match Slurm's `--partition` vocabulary.
+    /// `JobPartition` is a `String` alias from `crate::entities::slurm`.
+    pub partition: Option<JobPartition>,
+    /// Validated wall-clock limit. Was `Option<String>` previously.
+    pub time_limit: Option<JobTimeLimit>,
+    /// Validated `--rsc` spec. Was the local `Resource` previously.
+    pub rsc: Option<ResourceSpec>,
     pub x11: bool,
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -79,7 +45,7 @@ impl TssrunCmd {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             tssrun_bin: "tssrun".to_string(),
-            queue: None,
+            partition: None,
             time_limit: None,
             rsc: None,
             x11: false,
@@ -90,28 +56,30 @@ impl TssrunCmd {
         }
     }
 
-    /// Build the argv: `[bin, -p QUEUE?, -t TIME?, --rsc SPEC?, --x11?, program_abs, args…]`.
+    /// Build the argv: `[bin, -p PARTITION?, -t TIME?, --rsc SPEC?, --x11?, program_abs, args…]`.
     pub fn build_argv(&self) -> Result<Vec<String>> {
-        // Maximum prelude slots: bin + (-p QUEUE) + (-t TIME) + (--rsc SPEC)
-        // + --x11 + program = 8. All flags except the bin and program are
-        // optional, so the actual length will usually be smaller.
+        // Maximum prelude slots: bin + (-p PARTITION) + (-t TIME) + (--rsc SPEC)
+        // + --x11 + program = 8.
         const MAX_PRELUDE_SLOTS: usize = 8;
         let mut argv: Vec<String> = Vec::with_capacity(MAX_PRELUDE_SLOTS + self.args.len());
         argv.push(self.tssrun_bin.clone());
 
-        if let Some(q) = &self.queue {
+        if let Some(p) = &self.partition {
             argv.push("-p".to_string());
-            argv.push(q.clone());
+            argv.push(p.clone());
         }
         if let Some(t) = &self.time_limit {
             argv.push("-t".to_string());
-            argv.push(t.clone());
+            argv.push(t.to_string());
         }
-        if let Some(r) = &self.rsc
-            && let Some(spec) = r.render()
-        {
-            argv.push("--rsc".to_string());
-            argv.push(spec);
+        if let Some(r) = &self.rsc {
+            // Display emits "" for the all-None CPU case; treat that
+            // identically to `rsc: None` (omit `--rsc` entirely).
+            let spec = r.to_string();
+            if !spec.is_empty() {
+                argv.push("--rsc".to_string());
+                argv.push(spec);
+            }
         }
         if self.x11 {
             argv.push("--x11".to_string());
@@ -137,33 +105,7 @@ fn absolutize(p: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resource_default_renders_none() {
-        assert_eq!(Resource::default().render(), None);
-    }
-
-    #[test]
-    fn resource_full_renders_in_order() {
-        let r = Resource {
-            processes: Some(4),
-            threads: Some(8),
-            cores: Some(8),
-            memory: Some("2G".into()),
-            gpus: Some(1),
-        };
-        assert_eq!(r.render().as_deref(), Some("p=4:t=8:c=8:m=2G:g=1"));
-    }
-
-    #[test]
-    fn resource_partial_skips_none_keys() {
-        let r = Resource {
-            processes: Some(4),
-            memory: Some("2G".into()),
-            ..Default::default()
-        };
-        assert_eq!(r.render().as_deref(), Some("p=4:m=2G"));
-    }
+    use crate::entities::slurm::{ResourceSpecCPU, ResourceSpecGPU};
 
     #[test]
     fn cmd_minimal_argv_is_bin_then_program() {
@@ -182,17 +124,17 @@ mod tests {
     }
 
     #[test]
-    fn cmd_full_flags_in_documented_order() {
+    fn cmd_full_flags_cpu_variant() {
+        use std::num::NonZeroU32;
         let mut c = TssrunCmd::new("/work/job.sh");
-        c.queue = Some("gr19999b".into());
-        c.time_limit = Some("1:0:0".into());
-        c.rsc = Some(Resource {
-            processes: Some(4),
-            threads: Some(8),
-            cores: Some(8),
-            memory: Some("2G".into()),
-            gpus: Some(1),
-        });
+        c.partition = Some("gr19999b".into());
+        c.time_limit = Some("1:0:0".parse().unwrap());
+        c.rsc = Some(ResourceSpec::CPU(ResourceSpecCPU {
+            p: NonZeroU32::new(4),
+            t: NonZeroU32::new(8),
+            c: NonZeroU32::new(8),
+            m: Some("2G".parse().unwrap()),
+        }));
         c.x11 = true;
         c.args = vec!["--flag".into(), "value".into()];
         let argv = c.build_argv().unwrap();
@@ -203,9 +145,9 @@ mod tests {
                 "-p".to_string(),
                 "gr19999b".to_string(),
                 "-t".to_string(),
-                "1:0:0".to_string(),
+                "01:00:00".to_string(),
                 "--rsc".to_string(),
-                "p=4:t=8:c=8:m=2G:g=1".to_string(),
+                "p=4:t=8:c=8:m=2G".to_string(),
                 "--x11".to_string(),
                 "/work/job.sh".to_string(),
                 "--flag".to_string(),
@@ -215,22 +157,43 @@ mod tests {
     }
 
     #[test]
-    fn cmd_rsc_with_only_some_keys() {
+    fn cmd_full_flags_gpu_variant() {
+        use std::num::NonZeroU32;
         let mut c = TssrunCmd::new("/work/job.sh");
-        c.rsc = Some(Resource {
-            processes: Some(4),
-            memory: Some("2G".into()),
+        c.rsc = Some(ResourceSpec::GPU(ResourceSpecGPU {
+            g: NonZeroU32::new(1).unwrap(),
+        }));
+        let argv = c.build_argv().unwrap();
+        assert!(argv.contains(&"--rsc".to_string()));
+        assert!(argv.contains(&"g=1".to_string()));
+    }
+
+    #[test]
+    fn cmd_rsc_partial_cpu_emits_only_some_keys() {
+        use std::num::NonZeroU32;
+        let mut c = TssrunCmd::new("/work/job.sh");
+        c.rsc = Some(ResourceSpec::CPU(ResourceSpecCPU {
+            p: NonZeroU32::new(4),
+            m: Some("2G".parse().unwrap()),
             ..Default::default()
-        });
+        }));
         let argv = c.build_argv().unwrap();
         assert!(argv.contains(&"--rsc".to_string()));
         assert!(argv.contains(&"p=4:m=2G".to_string()));
     }
 
     #[test]
-    fn cmd_rsc_all_none_omits_flag_entirely() {
+    fn cmd_rsc_empty_cpu_omits_flag() {
+        // Some(ResourceSpec::CPU(default)) renders to "" → omit --rsc.
         let mut c = TssrunCmd::new("/work/job.sh");
-        c.rsc = Some(Resource::default());
+        c.rsc = Some(ResourceSpec::CPU(ResourceSpecCPU::default()));
+        let argv = c.build_argv().unwrap();
+        assert!(!argv.contains(&"--rsc".to_string()));
+    }
+
+    #[test]
+    fn cmd_rsc_none_omits_flag() {
+        let c = TssrunCmd::new("/work/job.sh");
         let argv = c.build_argv().unwrap();
         assert!(!argv.contains(&"--rsc".to_string()));
     }

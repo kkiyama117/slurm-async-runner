@@ -1,7 +1,7 @@
 //! pyo3 async wrapper for [`crate::runner::query_job_states_batch`].
 //!
 //! Exposes a Python coroutine that returns `dict[int, JobStatus]` where
-//! `JobStatus` is the upstream `gaussian_job_shared` Python class —
+//! `JobStatus` is the `slurm_async_runner` Python class —
 //! cross-module imported at first call and cached via [`PyOnceLock`]
 //! so the import cost is paid once per interpreter.
 
@@ -14,7 +14,8 @@ use pyo3::types::PyDict;
 
 use crate::runner::query_job_states_batch as rust_query;
 
-const UPSTREAM_STATUS_MODULE: &str = "gaussian_job_shared._core.entities.slurm.status";
+const UPSTREAM_STATUS_MODULE: &str =
+    "slurm_async_runner._slurm_async_runner_core.entities.slurm.status";
 
 static JOB_STATUS_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
@@ -61,7 +62,7 @@ fn query_job_states_batch<'py>(py: Python<'py>, jobids: Vec<u64>) -> PyResult<Bo
 pub(crate) mod inner_module {
     use super::*;
 
-    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.runner";
+    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.runner";
 
     #[pymodule_export]
     use super::query_job_states_batch;

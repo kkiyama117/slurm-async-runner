@@ -90,7 +90,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # Imported only for type hints. Real import lives inside ``_run`` so
     # the SKIP path doesn't require the extension to be built.
-    from slurm_async_runner._core.tssrun import (
+    from slurm_async_runner._slurm_async_runner_core.tssrun import (
         JobStateStore,
         Resource,
         TssrunCmd,
@@ -327,7 +327,7 @@ async def _run() -> int:
 
     # Imported lazily so the SKIP path doesn't require the extension to be
     # built (e.g. on a fresh clone before `maturin develop`).
-    from slurm_async_runner._core.tssrun import (
+    from slurm_async_runner._slurm_async_runner_core.tssrun import (
         Resource,
         TssrunCmd,
         TssrunManager,

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`slurm_async_runner::tssrun` Rust module and `slurm_async_runner._core.tssrun`
+- **`slurm_async_runner::tssrun` Rust module and `slurm_async_runner._slurm_async_runner_core.tssrun`
   Python submodule.** Provides `TssrunCmd` (typed `tssrun` argv builder),
   `TssrunManager` (background spawn / attach / state query), `JobHandle`
   with watch-based snapshot, and a pluggable `JobLogSink` trait
@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Re-exports** of `JobStatus`, `JobState`, `JobReason` from
   [`gaussian_job_shared`](https://github.com/kkiyama117/gaussian_job_shared)
   so downstream Rust callers don't need a direct dependency.
-- **Python sub-modules** `slurm_async_runner._core.manager` (`SlurmCmd`,
-  `SlurmManager`) and `slurm_async_runner._core.runner`
+- **Python sub-modules** `slurm_async_runner._slurm_async_runner_core.manager` (`SlurmCmd`,
+  `SlurmManager`) and `slurm_async_runner._slurm_async_runner_core.runner`
   (`query_job_states_batch`). Async pyo3 returns native Python coroutines.
 - **Hand-written `.pyi` stubs** for the new submodules at
   `python/slurm_async_runner/_core/manager.pyi` and `runner.pyi` (the

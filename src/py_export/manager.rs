@@ -1,6 +1,6 @@
 //! pyo3 wrappers for [`crate::manager::{SlurmCmd, SlurmManager}`].
 //!
-//! Exposed at `slurm_async_runner._core.manager`:
+//! Exposed at `slurm_async_runner._slurm_async_runner_core.manager`:
 //!
 //! - `SlurmCmd(srun_cmd="srun")` — frozen wrapper around the launcher
 //!   binary name.
@@ -11,7 +11,7 @@
 //! The async return values are dispatched through the same
 //! `PyOnceLock`-cached cross-module import pattern as
 //! `runner::query_job_states_batch` so `JobStatus` results stay typed
-//! end-to-end (`gaussian_job_shared._core.entities.slurm.status.JobStatus`).
+//! end-to-end (`slurm_async_runner._slurm_async_runner_core.entities.slurm.status.JobStatus`).
 
 #![cfg(feature = "pyo3")]
 
@@ -29,7 +29,7 @@ use crate::manager::{SlurmCmd, SlurmManager};
 
 #[pyclass(
     name = "SlurmCmd",
-    module = "slurm_async_runner._core.manager",
+    module = "slurm_async_runner._slurm_async_runner_core.manager",
     from_py_object,
     frozen,
     eq,
@@ -60,7 +60,7 @@ impl PySlurmCmd {
 
 #[pyclass(
     name = "SlurmManager",
-    module = "slurm_async_runner._core.manager",
+    module = "slurm_async_runner._slurm_async_runner_core.manager",
     skip_from_py_object
 )]
 #[derive(Clone)]
@@ -156,7 +156,8 @@ impl PySlurmManager {
 
 // --------------------------------------------- shared cross-module-import cache
 
-const UPSTREAM_STATUS_MODULE: &str = "gaussian_job_shared._core.entities.slurm.status";
+const UPSTREAM_STATUS_MODULE: &str =
+    "slurm_async_runner._slurm_async_runner_core.entities.slurm.status";
 
 static JOB_STATUS_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
@@ -174,7 +175,7 @@ fn job_status_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 pub(crate) mod inner_module {
     use super::*;
 
-    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.manager";
+    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.manager";
 
     #[pymodule_export]
     use super::{PySlurmCmd, PySlurmManager};

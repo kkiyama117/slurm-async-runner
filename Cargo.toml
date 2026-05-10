@@ -48,20 +48,11 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.10"
+# Iterator adapters (`Itertools::try_collect`) used by entities::slurm.
+itertools = "0.14.0"
 
 # UUID and datetime
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
-
-# Shared Gaussian job entities (Job, JobSpec, SlurmJobConfig, JobStatus,
-# JobState, JobReason). `default-features = false` is REQUIRED: upstream
-# defaults enable its `pyo3` feature, which compiles `py_export` and emits
-# `PyInit__core`. This crate also exports its own `_core` pymodule, so the
-# linker refuses with "duplicate symbol PyInit__core". Disabling defaults
-# here gives us the Rust types only; Python users import the Py* wrappers
-# directly from `gaussian_job_shared._core.entities.slurm.status`.
-# Pinned to `branch = "main"` during migration; tighten to a `rev`/`tag`
-# after S6 stabilizes the public API.
-gaussian_job_shared = { git = "https://github.com/kkiyama117/gaussian_job_shared", branch = "main", default-features = false }
 
 ##### OPTIONAL DEPS #####
 # PYO3
@@ -98,8 +89,33 @@ pyo3-stub-gen = { git = "https://github.com/Jij-Inc/pyo3-stub-gen", branch = "ma
   "infer_signature"
 ], optional = true }
 
+[dev-dependencies]
+# TOML round-trip used by `entities::slurm::status` and `array_spec` test modules.
+toml = "1.1.2"
+
 [features]
 default = ["pyo3", "stub_gen"]
 
-pyo3 = ["dep:pyo3", "pyo3-async-runtimes", "pyo3-log", "pythonize"]
-stub_gen = ["pyo3-stub-gen"]
+# Canonical-wheel build: enables BOTH the pyclass impls and the
+# pymodule entry. This is the only path under which SAR's pyclass
+# code is compiled.
+#
+# ARCHITECTURE RULE — Pyclass Single Owner:
+# Downstream crates MUST NOT enable this feature. Use
+# `default-features = false` to consume Rust types only. Each
+# pyclass type has exactly one owner cdylib in the dependency
+# graph; duplicating pyclass impls into multiple cdylibs produces
+# distinct Python type objects with identical __module__ strings,
+# breaking isinstance checks. See
+# docs/superpowers/specs/2026-05-10-slurm-vocab-migration-and-pyclass-ownership-design.md
+# §2 for the full rule, and docs/error.md for the regression that
+# motivated it.
+pyo3 = [
+    "dep:pyo3",
+    "pyo3-async-runtimes",
+    "pyo3-log",
+    "pythonize",
+    "pyo3-stub-gen",
+]
+
+stub_gen = ["pyo3"]

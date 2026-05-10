@@ -157,7 +157,13 @@ impl TssrunManager {
             node: None,
             finished: None,
         };
-        JobHandle::from_spawn(spawned, init, self.log_sink.clone(), Some(self.store.clone())).await
+        JobHandle::from_spawn(
+            spawned,
+            init,
+            self.log_sink.clone(),
+            Some(self.store.clone()),
+        )
+        .await
     }
 
     /// Re-attach to a previously persisted handle.

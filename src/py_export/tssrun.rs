@@ -1,4 +1,4 @@
-//! pyo3 wrappers for the `slurm_async_runner._core.tssrun` submodule.
+//! pyo3 wrappers for the `slurm_async_runner._slurm_async_runner_core.tssrun` submodule.
 
 #![cfg(feature = "pyo3")]
 
@@ -13,69 +13,20 @@ use uuid::Uuid;
 
 use tokio::sync::watch;
 
-use crate::tssrun::cmd::{Resource, TssrunCmd};
+use crate::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
+use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
+use crate::tssrun::cmd::TssrunCmd;
+
 use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
 use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
 
-// ---------- Resource ----------
-
-#[pyclass(
-    name = "Resource",
-    module = "slurm_async_runner._core.tssrun",
-    from_py_object,
-    frozen
-)]
-#[derive(Clone)]
-pub struct PyResource(pub Resource);
-
-#[pymethods]
-impl PyResource {
-    #[new]
-    #[pyo3(signature = (processes = None, threads = None, cores = None, memory = None, gpus = None))]
-    fn new(
-        processes: Option<u32>,
-        threads: Option<u32>,
-        cores: Option<u32>,
-        memory: Option<String>,
-        gpus: Option<u32>,
-    ) -> Self {
-        Self(Resource {
-            processes,
-            threads,
-            cores,
-            memory,
-            gpus,
-        })
-    }
-    #[getter]
-    fn processes(&self) -> Option<u32> {
-        self.0.processes
-    }
-    #[getter]
-    fn threads(&self) -> Option<u32> {
-        self.0.threads
-    }
-    #[getter]
-    fn cores(&self) -> Option<u32> {
-        self.0.cores
-    }
-    #[getter]
-    fn memory(&self) -> Option<String> {
-        self.0.memory.clone()
-    }
-    #[getter]
-    fn gpus(&self) -> Option<u32> {
-        self.0.gpus
-    }
-}
-
 // ---------- TssrunCmd ----------
 
 #[pyclass(
     name = "TssrunCmd",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object
 )]
 #[derive(Clone)]
@@ -88,7 +39,7 @@ impl PyTssrunCmd {
     #[pyo3(signature = (
         program,
         args = Vec::new(),
-        queue = None,
+        partition = None,
         time_limit = None,
         rsc = None,
         x11 = false,
@@ -99,9 +50,9 @@ impl PyTssrunCmd {
     fn new(
         program: PathBuf,
         args: Vec<String>,
-        queue: Option<String>,
-        time_limit: Option<String>,
-        rsc: Option<PyResource>,
+        partition: Option<String>,
+        time_limit: Option<PyJobTimeLimit>,
+        rsc: Option<PyResourceSpec>,
         x11: bool,
         env: HashMap<String, String>,
         cwd: Option<PathBuf>,
@@ -109,8 +60,8 @@ impl PyTssrunCmd {
     ) -> Self {
         Self(TssrunCmd {
             tssrun_bin,
-            queue,
-            time_limit,
+            partition,
+            time_limit: time_limit.map(|t| t.0),
             rsc: rsc.map(|r| r.0),
             x11,
             program,
@@ -131,7 +82,7 @@ impl PyTssrunCmd {
 
 #[pyclass(
     name = "LogSink",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object,
     frozen
 )]
@@ -177,7 +128,7 @@ fn file_log_sink<'py>(
 /// backends should be added in Rust and re-exported here.
 #[pyclass(
     name = "JobStateStore",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object,
     frozen
 )]
@@ -221,7 +172,10 @@ fn file_system_state_store(dir: PathBuf) -> PyJobStateStore {
 ///   review).
 /// - `inner`: a `Mutex<JobHandle>` that exists solely so `wait()` can
 ///   `.take()` the join handle once. Snapshot getters never touch it.
-#[pyclass(name = "TssrunJobHandle", module = "slurm_async_runner._core.tssrun")]
+#[pyclass(
+    name = "TssrunJobHandle",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun"
+)]
 pub struct PyTssrunJobHandle {
     rx: watch::Receiver<JobHandleSnapshot>,
     inner: Arc<tokio::sync::Mutex<JobHandle>>,
@@ -339,7 +293,7 @@ impl PyTssrunJobHandle {
 
 #[pyclass(
     name = "TssrunManager",
-    module = "slurm_async_runner._core.tssrun",
+    module = "slurm_async_runner._slurm_async_runner_core.tssrun",
     from_py_object
 )]
 #[derive(Clone)]
@@ -442,14 +396,15 @@ impl PyTssrunManager {
 pub mod inner_module {
     use pyo3::prelude::*;
 
-    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._core.tssrun";
+    const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.tssrun";
 
     #[pymodule_export]
     use super::PyJobStateStore;
     #[pymodule_export]
     use super::PyLogSink;
-    #[pymodule_export]
-    use super::PyResource;
+    // Re-export the crate-local ResourceSpec / JobTimeLimit pyclass wrappers
+    // so Python callers can construct them via the same import path
+    // as TssrunCmd. This saves an extra import for the common tssrun use case.
     #[pymodule_export]
     use super::PyTssrunCmd;
     #[pymodule_export]
@@ -466,6 +421,10 @@ pub mod inner_module {
     use super::null_log_sink;
     #[pymodule_export]
     use super::std_log_sink;
+    #[pymodule_export]
+    use crate::py_export::entities::slurm::sbatch_options::resource_spec::PyResourceSpec;
+    #[pymodule_export]
+    use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

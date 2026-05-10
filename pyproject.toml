@@ -26,7 +26,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "slurm_async_runner._core"
+module-name = "slurm_async_runner._slurm_async_runner_core"
 profile = "dev"
 python-packages = ["slurm_async_runner"]
 python-source = "python"

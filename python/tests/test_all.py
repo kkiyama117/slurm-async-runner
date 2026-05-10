@@ -9,9 +9,9 @@ import asyncio
 
 import pytest
 
-from slurm_async_runner._core import sum_as_string
-from slurm_async_runner._core.manager import SlurmCmd, SlurmManager
-from slurm_async_runner._core.runner import query_job_states_batch
+from slurm_async_runner._slurm_async_runner_core import sum_as_string
+from slurm_async_runner._slurm_async_runner_core.manager import SlurmCmd, SlurmManager
+from slurm_async_runner._slurm_async_runner_core.runner import query_job_states_batch
 
 
 # ---------- legacy smoke ----------
