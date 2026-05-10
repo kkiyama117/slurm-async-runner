@@ -172,9 +172,24 @@ pub struct SbatchCmd {
 
 ---
 
-## 5. Store 層: tssrun と sbatch で共有
+## 5. Store 層: tssrun と sbatch で共有 (同一ディレクトリ + kind discriminator)
 
-### 5.1 汎用 trait
+### 5.1 設計方針
+
+UUID v7 が事実上衝突しないことを利用し、tssrun と sbatch のスナップショットを **同じ `{root}/<uuid>.json` 名前空間** に共存させる。物理的なサブディレクトリ分割は行わず、JSON ファイル内に `kind` 識別子を埋めて論理分離する。
+
+利点:
+
+- UUID 1 つを渡せば (種別を知らなくても) 該当ファイルを直接読める
+- root を 1 つだけ管理すれば良い (ユーザの mental model がシンプル)
+- 移動先/移動元のサブディレクトリを誤る運用ミスがなくなる
+- 既存 tssrun ファイルは path 移動なし (= migration が小さくなる)
+
+トレードオフ:
+
+- `list()` / `find_by_jobid()` の scan 時に「自分の kind ではない JSON」をスキップするオーバーヘッド (= ファイル読み + kind フィールド peek、わずか)
+
+### 5.2 汎用 trait
 
 ```rust
 // src/store.rs
@@ -183,7 +198,9 @@ pub trait JobSnapshot:
 {
     fn uuid(&self) -> Uuid;
     fn jobid(&self) -> Option<u64>;
-    fn store_subdir() -> &'static str;
+    /// On-disk JSON の `kind` フィールド値。
+    /// scan 時に他の kind の snapshot を silent skip するために使う。
+    fn kind() -> &'static str;
 }
 
 #[async_trait]
@@ -199,42 +216,85 @@ pub struct InMemoryStateStore<S: JobSnapshot> {
 }
 
 pub struct FileSystemStateStore<S: JobSnapshot> {
-    root: PathBuf,
+    root: PathBuf,                                     // 単一ディレクトリ、subdir なし
     _phantom: PhantomData<S>,
-}
-
-impl<S: JobSnapshot> FileSystemStateStore<S> {
-    fn effective_dir(&self) -> PathBuf { self.root.join(S::store_subdir()) }
 }
 ```
 
-### 5.2 各 snapshot の実装
+### 5.3 各 snapshot の実装
 
 ```rust
 // src/tssrun/store.rs
 impl JobSnapshot for JobHandleSnapshot {
     fn uuid(&self) -> Uuid { self.uuid }
     fn jobid(&self) -> Option<u64> { self.jobid }
-    fn store_subdir() -> &'static str { "tssrun" }     // ← 既存 root 直下から移設
+    fn kind() -> &'static str { "tssrun" }
 }
 
 // src/sbatch/store.rs
 impl JobSnapshot for SbatchJobSnapshot {
     fn uuid(&self) -> Uuid { self.uuid }
     fn jobid(&self) -> Option<u64> { Some(self.jobid) }
-    fn store_subdir() -> &'static str { "sbatch" }
+    fn kind() -> &'static str { "sbatch" }
 }
 ```
 
-### 5.3 移行の影響 (breaking change)
+### 5.4 On-disk JSON スキーマ
 
-- 既存 `tssrun::store::JobStateStore` (concrete trait) → `JobStateStore<JobHandleSnapshot>` (parametrized) への置換。
-- 既存 `Arc<dyn tssrun::store::JobStateStore>` 呼び出しは `Arc<dyn JobStateStore<JobHandleSnapshot>>` に書き換え。
-- 既存ファイルレイアウト `{root}/<uuid>.json` → `{root}/tssrun/<uuid>.json` に移動。crate 0.1.x のため CHANGELOG に **手動 migration** の 1 行を載せる:
-  ```bash
-  mkdir -p {root}/tssrun && mv {root}/*.json {root}/tssrun/
-  ```
-- 同じ root を tssrun と sbatch で共有しても、各 snapshot 型がそれぞれの subdir に閉じるので scan/list/find_by_jobid は互いに干渉しない。
+各ファイルは `{root}/<uuid>.json` で、トップレベルに `kind` フィールドを含む:
+
+```jsonc
+// {root}/01927a4d-7c8b-7000-8000-abcdef012345.json (tssrun snapshot)
+{
+  "kind": "tssrun",
+  "uuid": "01927a4d-7c8b-7000-8000-abcdef012345",
+  "pid": 12345,
+  "argv": ["tssrun", "..."],
+  "jobid": 102362
+  // ...
+}
+
+// {root}/01927a4e-9d2c-7000-9100-fedcba987654.json (sbatch snapshot)
+{
+  "kind": "sbatch",
+  "uuid": "01927a4e-9d2c-7000-9100-fedcba987654",
+  "jobid": 102363,
+  "argv": ["sbatch", "..."]
+  // ...
+}
+```
+
+`kind` は serde の flatten/wrap で snapshot 構造体外側に付与する (snapshot struct 自体には kind フィールドを持たない、store 層で envelope する)。
+
+### 5.5 FileSystemStateStore の load / list 実装メモ
+
+```rust
+async fn load(&self, uuid: Uuid) -> Result<Option<S>> {
+    let path = self.root.join(format!("{uuid}.json"));
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value.get("kind").and_then(|v| v.as_str()) != Some(S::kind()) {
+        // ファイルは存在するが別 kind (例: tssrun の load() が sbatch ファイルを引いた)
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(value)?))
+}
+```
+
+`list()` と `find_by_jobid()` は同じパターンで dir を scan し、kind 不一致の JSON は silent skip。`save()` は serialize 後に envelope で `{"kind": S::kind(), ...flattened snapshot}` を作って atomic-rename。
+
+### 5.6 移行の影響 (breaking change、ただし path 不変)
+
+- API: 既存 `tssrun::store::JobStateStore` (concrete trait) → `JobStateStore<JobHandleSnapshot>` (parametrized) への置換。`Arc<dyn JobStateStore<JobHandleSnapshot>>` に書き換え。
+- ファイルレイアウト: **path は変わらず `{root}/<uuid>.json` のまま** (= ユーザの手動 mv 不要)。
+- JSON 形式: 既存 tssrun ファイルには `kind` フィールドが無い。**load 時の互換性ハンドリング**を 2 通りから選択:
+  1. **Lenient**: kind フィールドが無い tssrun ファイルは "tssrun" とみなして読む (legacy fallback)。次の save で kind が自動付与される
+  2. **Strict**: kind 必須、無いファイルは load() が `None` を返す
+- 0.1.x なので Lenient を採用、CHANGELOG に「次の save で kind が補完される」旨を記載。新 sbatch ファイルは最初から kind 付き。
 
 ---
 
@@ -713,8 +773,9 @@ Phase 1 を以下の順序で実装することを想定:
 
 1. **Store 層の generify** (tssrun への影響を先に吸収)
    - `src/store.rs` 新設、`JobSnapshot` / `JobStateStore<S>` / `InMemoryStateStore<S>` / `FileSystemStateStore<S>`
-   - `tssrun::store` を `impl JobSnapshot for JobHandleSnapshot` だけに縮小、`store_subdir = "tssrun"`
-   - tssrun 既存テストを generic 版に置換、CHANGELOG に手動 mv migration を記載
+   - `tssrun::store` を `impl JobSnapshot for JobHandleSnapshot` だけに縮小、`kind = "tssrun"`
+   - JSON envelope に `kind` フィールドを追加 (lenient legacy fallback で既存ファイルも読める)
+   - tssrun 既存テストを generic 版に置換、CHANGELOG に「JSON 形式拡張、path 不変」を記載
 2. **`runner.rs` に qgroup -l パーサ追加**
    - `parse_qgroup_l` (実出力サンプルが必要 — 実装時 KUDPC 上で取得)
    - `query_*_via_qgroup` (squeue/sacct と並列の API)
@@ -723,7 +784,7 @@ Phase 1 を以下の順序で実装することを想定:
    - `parse_submitted_jobid` + `resolve_log_path`
 4. **sbatch Snapshot / Lifecycle / Store**
    - `SbatchJobSnapshot` + `SbatchLifecycle` + `FinishedInfo` + `ResolvedLogPaths`
-   - `impl JobSnapshot for SbatchJobSnapshot` (`store_subdir = "sbatch"`)
+   - `impl JobSnapshot for SbatchJobSnapshot` (`kind = "sbatch"`)
 5. **sbatch Handle**
    - `SbatchJobHandle` + Arc-wrapped Inner、watch::Sender、refresh_lock
    - `refresh` / `refresh_with_sacct` / `wait_terminal` 実装
@@ -746,7 +807,7 @@ Phase 1 を以下の順序で実装することを想定:
 - **Spec 型に I/O を入れない**。`SbatchCmd::build_argv` 内で stat/glob しない。テスト独立性とランタイム選択の柔軟性が消える。
 - **`refresh()` は sacct を絶対に呼ばない**。`refresh_with_sacct()` のみが sacct 経路を持つ。混同するとクラスタ負荷が爆発する。
 - **`wait_terminal()` は軽量ループ**。caller が exit_code を欲しければ戻り値後に `refresh_with_sacct()` を **1 回だけ** 呼ぶ。
-- **store の `{root}/<kind>/<uuid>.json` レイアウト**。tssrun と sbatch を混ぜないが root 共有は OK。`tssrun::store_subdir = "tssrun"`、`sbatch::store_subdir = "sbatch"`。
+- **store の `{root}/<uuid>.json` レイアウト**。tssrun と sbatch は同一ディレクトリで物理的に共存し、JSON 内の `kind` フィールド (`"tssrun"` / `"sbatch"`) で論理分離する。subdir は無い。`load(uuid)` で別 kind を引いた場合は silent に `None` を返す。
 - **`SubmittedButUnpersisted` は致命的**。SLURM 側はジョブが生きている。`scancel` を打つか、jobid を別経路で記録する責任が caller にある。
 - **`resolved_log_paths` は最良推定**。`%x` が job_name なしで指定されている場合 raw が残る → SLURM が実際に書く path と食い違う。
 - **`gaussian_job_shared` の `pyo3` feature を絶対に有効化しない**。シンボル衝突で `PyInit__core` が duplicate symbol になる (既存の Pyclass Single Owner ルール参照)。
