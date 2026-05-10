@@ -15,7 +15,8 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 ```
 +------------------------------------------------------------------+
 |                Python 利用者                                       |
-|   slurm_async_runner._core.{manager, runner, tssrun}              |
+|   slurm_async_runner._slurm_async_runner_core.                    |
+|     {manager, runner, tssrun, entities.slurm.*}                   |
 +----------------------------+-------------------------------------+
                              | pyo3 (async = pyo3-async-runtimes)
 +----------------------------v-------------------------------------+
@@ -58,7 +59,7 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 
 | 層 | 型 | 役割 | I/O |
 |---|---|---|---|
-| Spec | `SlurmCmd`, `TssrunCmd`, `Resource` | 引数を typed に持ち、`build_argv()` だけを提供 | なし（純データ） |
+| Spec | `SlurmCmd`, `TssrunCmd`, `ResourceSpec`, `JobTimeLimit`, `JobPartition`, `Memory` | 引数を typed に持ち、`build_argv()` だけを提供 | なし（純データ） |
 | Runtime | `JobDispatcher` trait, `TokioDispatcher`, `DryRunDispatcher`, `BackgroundDispatcher`, `TokioBackgroundDispatcher` | `argv` を受け取りプロセスを起動 | tokio |
 
 このため、
@@ -88,8 +89,14 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 - `src/manager.rs::SlurmManager` … `SlurmCmd` を保持するだけ。
   `run_job` / `query_job_state` / `query_job_states_batch` の
   メソッドはあるが、内部では Runtime 層と Query 層を呼ぶだけ。
-- `src/tssrun/cmd.rs::TssrunCmd` / `Resource` … `tssrun --rsc p=...:t=...` の
+- `src/tssrun/cmd.rs::TssrunCmd` … `tssrun -p ... -t ... --rsc p=...:t=...` の
   引数を typed フィールドで持ち、`build_argv()` で argv 配列を生成。
+  リソース仕様は `crate::entities::slurm::ResourceSpec`（CPU / GPU enum、
+  KUDPC マニュアル準拠の partial CPU 許容）、時間制限は `JobTimeLimit`、
+  パーティション名は `JobPartition`、メモリは `Memory` を使う。
+  PR #5 までは `tssrun::cmd::Resource` というローカル型を使っていたが、
+  `gaussian_job_shared` の vocab を in-tree に取り込んだタイミングで
+  `ResourceSpec` 1 つに統合された。
 
 > **重要**: Spec 型は I/O を一切やりません。プロセス起動・ファイル
 > アクセス・SLURM 通信は必ず Runtime / Query / tssrun ハンドル側で
@@ -120,9 +127,10 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
   4. 結果を `HashMap<u64, JobStatus>` で返す
 
 - `query_job_states_batch(jobids)` は上記の `TokioDispatcher` 既定版。
-- パースは `JobState::parse` / `JobReason::parse`（`gaussian_job_shared`
-  クレート提供）に委譲し、未知トークンは `Unknown` / `Other(String)` に
-  落とす forward-compat 設計。
+- パースは `JobState::parse` / `JobReason::parse`
+  （`crate::entities::slurm::status` 提供 — PR #5 で `gaussian_job_shared`
+  から in-tree 移管）に委譲し、未知トークンは `Unknown` / `Other(String)`
+  に落とす forward-compat 設計。
 
 ### 3.4 tssrun サブシステム（`src/tssrun/`）
 
@@ -187,34 +195,48 @@ ECCS の `tssrun`（= `salloc` + `srun` 対話バッチフロントエンド）�
 - **Rust 側からも単独で使えるライブラリにする**。`crate-type = ["cdylib", "rlib"]`
   になっているのはこのため。`pyo3` 依存は `feature = "pyo3"` でゲートされ、
   `--no-default-features` でビルドすれば pure Rust ライブラリになる。
-- **`JobStatus` 型を `gaussian_job_shared` に集約**。SLURM の状態/理由
-  enum は別クレートが正本で、ここでは re-export と Python 側ブリッジ
-  だけを行う。`Cargo.toml` で `default-features = false` にしているのは、
-  upstream の `pyo3` feature が `_core` シンボルを生成して衝突するのを
-  防ぐため（`Cargo.toml:50-59` のコメント参照）。
+- **SLURM 語彙を in-tree で集約**（PR #5、Pyclass Single Owner ルール）。
+  `JobStatus` / `JobState` / `JobReason` / `ResourceSpec` / `JobTimeLimit`
+  / `JobPartition` / `Memory` などの SLURM enum/値型は **このクレートが
+  正本**。Python の pyclass はこの cdylib にちょうど 1 つだけぶら下がり、
+  下流クレートは `default-features = false`（必要なら `features =
+  ["pyo3-types"]`）で **Rust 型のみ** を取り込む。同じ pyclass 実装が
+  複数 cdylib に重複コンパイルされると、`__module__` が同一でも
+  `id(cls)` が異なる別 Python 型になり `isinstance` が壊れる — それを
+  避けるためのアーキテクチャルールが Cargo.toml の `pyo3` feature
+  コメント（`Cargo.toml:99-112`）に明記されています。
 
 ## 5. pyo3 公開層の構造（`src/py_export/`）
 
-Python の名前空間 `slurm_async_runner._core` 配下に 3 つのサブモジュールが
-ぶら下がります。トップレベルは `src/py_export/mod.rs::slurm_async_runner`
-の `#[pymodule]` で組み立てています。
+Python の名前空間 `slurm_async_runner._slurm_async_runner_core` 配下に
+複数のサブモジュールがぶら下がります。トップレベルは
+`src/py_export/mod.rs::slurm_async_runner` の `#[pymodule]` で組み立てて
+います。pymodule 名は `_core` ではなく
+`_slurm_async_runner_core` です（PR #5 で `gaussian_job_shared` 側との
+`PyInit__core` シンボル衝突を避けるために rename されました）。
 
 | Python のパス | 実体（Rust） | 主なエクスポート |
 |---|---|---|
-| `slurm_async_runner._core` | `py_export/mod.rs` | `sum_as_string` (デモ) |
-| `slurm_async_runner._core.manager` | `py_export/manager.rs::inner_module` | `SlurmCmd`, `SlurmManager` |
-| `slurm_async_runner._core.runner` | `py_export/runner.rs::inner_module` | `query_job_states_batch` |
-| `slurm_async_runner._core.tssrun` | `py_export/tssrun.rs::inner_module` | `Resource`, `TssrunCmd`, `LogSink`, `TssrunJobHandle`, `TssrunManager`, `null_log_sink`, `std_log_sink`, `file_log_sink` |
+| `slurm_async_runner._slurm_async_runner_core` | `py_export/mod.rs` | `sum_as_string` (デモ) |
+| `slurm_async_runner._slurm_async_runner_core.manager` | `py_export/manager.rs::inner_module` | `SlurmCmd`, `SlurmManager` |
+| `slurm_async_runner._slurm_async_runner_core.runner` | `py_export/runner.rs::inner_module` | `query_job_states_batch` |
+| `slurm_async_runner._slurm_async_runner_core.tssrun` | `py_export/tssrun.rs::inner_module` | `TssrunCmd`, `LogSink`, `TssrunJobHandle`, `TssrunManager`, `JobStateStore`, `ResourceSpec`, `JobTimeLimit`（再エクスポート）, `null_log_sink`, `std_log_sink`, `file_log_sink`, `in_memory_state_store`, `file_system_state_store` |
+| `slurm_async_runner._slurm_async_runner_core.entities.slurm.status` | `py_export/entities/slurm/status.rs` | `JobStatus`, `JobState`, `JobReason` |
+| `slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options` | `py_export/entities/slurm/sbatch_options.rs` | `ResourceSpec`, `ResourceSpecCPU`, `ResourceSpecGPU`, `JobTimeLimit`, `JobPartition`, `Memory`, `MemoryUnit`, `ArraySpec` ほか |
 
 それぞれの `#[pymodule_init]` で `sys.modules` に明示登録しているのは、
 サブモジュールの import が pyo3 規約上で `module-name` フルパスから
 解決されるようにするため。
 
-`JobStatus` を Python に渡すときは、毎回 `gaussian_job_shared._core.entities.slurm.status`
+`JobStatus` を Python に渡すときは、毎回
+`slurm_async_runner._slurm_async_runner_core.entities.slurm.status`
 を `py.import` するとコストが重いので、`PyOnceLock<Py<PyAny>>` で
 **プロセス内 1 回だけインポートしてキャッシュ**しています
-（`py_export/runner.rs:19` の `JOB_STATUS_CLS` と同じパターンが
-`py_export/manager.rs:161` にも存在）。
+（`py_export/runner.rs:17` の `UPSTREAM_STATUS_MODULE` /
+`JOB_STATUS_CLS` と同じパターンが `py_export/manager.rs:159` にも存在）。
+PR #5 までは `gaussian_job_shared._core.entities.slurm.status` から
+取り込んでいましたが、Pyclass Single Owner ルールで in-tree に移管
+されたため、SAR は自前のモジュールパスを参照します。
 
 ## 6. 不変条件と落とし穴
 
@@ -244,7 +266,15 @@ Python の名前空間 `slurm_async_runner._core` 配下に 3 つのサブモジ
   全部 `None` に丸めています（`src/tssrun/handle.rs::read_live_env_for_pid`）。
   `Err` で返すと ECCS の `tssrun`（setuid）で必ず失敗するため、この丸めが
   仕様です。
-- **`gaussian_job_shared` の `pyo3` feature を絶対に有効化しない**。
-  両クレートがそれぞれ `_core` という Python モジュール名を持っているため、
-  シンボル衝突して `PyInit__core` が duplicate symbol になります。
-  `Cargo.toml:50-59` のコメントが warning として残っています。
+- **このクレートの `pyo3` feature を下流クレートで有効化しない**
+  （Pyclass Single Owner ルール）。SAR の cdylib が
+  `PyInit__slurm_async_runner_core` を発行する側の唯一の owner です。
+  下流クレートが SAR の pyclass を使うなら `default-features = false`
+  もしくは `features = ["pyo3-types"]`（pyclass 実装は持つが pymodule
+  entry は出さない）に留めること。両側で feature を有効化すると
+  `PyInit__slurm_async_runner_core` が duplicate symbol になりますし、
+  そもそも実装が複製されると `isinstance` が壊れます。詳細は
+  `Cargo.toml:99-112` の `[features]` コメント、および
+  `docs/superpowers/specs/2026-05-10-slurm-vocab-migration-and-pyclass-ownership-design.md`
+  §2 を参照。`gaussian_job_shared` 側にも同じ ownership ルールが適用
+  されています。

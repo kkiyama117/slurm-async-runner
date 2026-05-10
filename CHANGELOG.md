@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **PR #5: Slurm vocab migration with single-owner pyclass rule.** The
+  `tssrun` Resource type and the broader Slurm vocabulary now live in
+  this crate's `entities::slurm` module. Concretely:
+  - Rust: `Resource` is **deleted**. Use [`ResourceSpec`](src/entities/slurm)
+    (CPU / GPU enum with `Option<NonZeroU32>` slots — partial CPU specs
+    like `p=60:t=1:c=1` are accepted per the KUDPC manual).
+    `TssrunCmd::queue` is renamed to `partition` (matching Slurm's
+    `--partition` flag). `TssrunCmd::time_limit` is retyped from
+    `Option<String>` to `Option<JobTimeLimit>` (canonical `HH:MM:SS`
+    `Display`). `TssrunCmd::rsc` is retyped from `Option<Resource>` to
+    `Option<ResourceSpec>`. New crate-root re-exports: `JobPartition`,
+    `JobTimeLimit`, `Memory`, `MemoryUnit`, `ResourceSpec`,
+    `ResourceSpecCPU`, `ResourceSpecGPU`.
+  - Python: `Resource(...)` is **deleted**. Use
+    `ResourceSpec(processes=..., memory=Memory("2G"), ...)` or the GPU
+    form `ResourceSpec(gpus=1)`. `TssrunCmd(queue=...)` becomes
+    `TssrunCmd(partition=...)`; `time_limit=` requires a
+    `JobTimeLimit("1:00:00")` value (no implicit string coercion);
+    `rsc=` requires a `ResourceSpec(...)` value. `Memory` requires
+    explicit wrapping — pass `Memory("2G")` or
+    `Memory.from_value(2, MemoryUnit.Giga)`. `ResourceSpec` and
+    `JobTimeLimit` are re-exported from the `tssrun` submodule for
+    one-stop import; `Memory` lives in
+    `entities.slurm.sbatch_options`.
+  - **Pymodule entry rename.** Both crates renamed their pymodule entry
+    from `_core` to `_<package>_core` to avoid `PyInit__core`
+    duplicate-symbol clashes when both are linked into one process.
+    Python imports change accordingly:
+    `slurm_async_runner._core.*` → `slurm_async_runner._slurm_async_runner_core.*`,
+    `gaussian_job_shared._core.*` → `gaussian_job_shared._gaussian_job_shared_core.*`.
+  - **`JobStatus` is now owned by this crate** (single-owner rule for
+    pyclass wrappers). The Python type lives at
+    `slurm_async_runner._slurm_async_runner_core.entities.slurm.status.JobStatus`.
+    The `gaussian_job_shared._gaussian_job_shared_core.entities.slurm.status`
+    location is no longer authoritative for in-process pyclass identity.
+
 ### Added
 
 - **`slurm_async_runner::tssrun` Rust module and `slurm_async_runner._slurm_async_runner_core.tssrun`
@@ -37,8 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SlurmManager`) and `slurm_async_runner._slurm_async_runner_core.runner`
   (`query_job_states_batch`). Async pyo3 returns native Python coroutines.
 - **Hand-written `.pyi` stubs** for the new submodules at
-  `python/slurm_async_runner/_core/manager.pyi` and `runner.pyi` (the
-  auto-generated `__init__.pyi` only covers sync, top-level pyfunctions).
+  `python/slurm_async_runner/_slurm_async_runner_core/manager.pyi` and
+  `runner.pyi` (the auto-generated `__init__.pyi` only covers sync,
+  top-level pyfunctions).
 - **CI: cargo + Python pipeline** at `.github/workflows/test.yml`. Runs
   `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --lib`,
   `maturin develop`, `pytest`, and `ruff` on every push and PR.
@@ -69,10 +108,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- `gaussian_job_shared` is pulled in with `default-features = false`. Upstream's
-  `pyo3` feature emits its own `PyInit__core`, which would clash with this
-  crate's `_core` pymodule at link time. Python users continue to import
-  `JobStatus` etc. directly from `gaussian_job_shared._core.entities.slurm.status`.
+- **Note (superseded by PR #5).** Earlier drafts pinned
+  `gaussian_job_shared` with `default-features = false` to avoid a
+  `PyInit__core` duplicate-symbol clash. PR #5 supersedes that workaround:
+  the Slurm vocab (`JobStatus`, `JobState`, `JobReason`, `ResourceSpec`,
+  `JobTimeLimit`, `Memory`, ...) is now owned in-tree under
+  `entities::slurm`, so this crate no longer depends on
+  `gaussian_job_shared` at all. Each pyclass type has exactly one owner
+  cdylib in the dependency graph (Pyclass Single Owner rule — see
+  `docs/superpowers/specs/2026-05-10-slurm-vocab-migration-and-pyclass-ownership-design.md`).
 - All 35 Rust unit tests run without a real SLURM cluster — the test suite
   substitutes the coreutils `true` / `false` / `echo` binaries through
   `SlurmCmd::new(...)`, plus a `MockDispatcher` for argv-plumbing assertions.

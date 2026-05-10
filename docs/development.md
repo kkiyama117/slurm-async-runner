@@ -73,7 +73,7 @@ uv run pytest python/tests -v
 uv run pytest python/tests/test_tssrun.py -v
 ```
 
-`maturin develop` 後でないと `_core` が見えないので注意。
+`maturin develop` 後でないと `_slurm_async_runner_core` が見えないので注意。
 
 ### 3.4 Python ライブテスト（要 ECCS / kudpc 環境）
 
@@ -114,8 +114,9 @@ CI が `-D warnings` で clippy を回しているので、警告 1 つでも残
 
 | ファイル | 種別 | 再生成タイミング |
 |---|---|---|
-| `python/slurm_async_runner/_core/__init__.pyi` | **自動生成** | top-level の sync な `#[pyfunction]` を増減した時 |
-| `python/slurm_async_runner/_core/{manager,runner,tssrun}.pyi` | **手書き** | `#[pyclass]` や async pyfunction を増減した時。サブモジュール内の export はジェネレータの対象外なので必ず手で更新 |
+| `python/slurm_async_runner/_slurm_async_runner_core/__init__.pyi` | **自動生成** | top-level の sync な `#[pyfunction]` を増減した時 |
+| `python/slurm_async_runner/_slurm_async_runner_core/{manager,runner,tssrun}.pyi` | **手書き** | `#[pyclass]` や async pyfunction を増減した時。サブモジュール内の export はジェネレータの対象外なので必ず手で更新 |
+| `python/slurm_async_runner/_slurm_async_runner_core/entities/slurm/{status,sbatch_options}/__init__.pyi` | **自動生成** | `#[gen_stub_pyclass]` 付き pyclass を `entities::slurm::*` に増減した時 |
 
 自動生成側のコマンド:
 
@@ -137,11 +138,17 @@ uv run ruff format python/        # pyo3-stub-gen の出力は ruff 整形済み
 `stub_gen` バイナリが libpython を二重リンクして失敗するからです。
 維持してください（`Cargo.toml:71-83` 参照）。
 
-### 5.2 `PyInit__core` の duplicate symbol エラー
+### 5.2 `PyInit__slurm_async_runner_core` の duplicate symbol エラー
 
-`gaussian_job_shared` の `pyo3` feature を有効にしてしまうと、
-upstream も `_core` という Python モジュールを生成して衝突します。
-`Cargo.toml` の `default-features = false` は外さないこと。
+下流クレートで SAR 自身の `pyo3` feature（pymodule entry を出す側）を
+有効にしてしまうと、`PyInit__slurm_async_runner_core` が duplicate
+symbol になります。下流は `default-features = false`、または
+`features = ["pyo3-types"]`（pyclass 実装は持つが pymodule entry は
+出さない）に留めること。これが Pyclass Single Owner ルールで、
+`Cargo.toml` の `[features]` セクション（`Cargo.toml:99-112`）に
+警告コメントが残っています。`gaussian_job_shared` 側にも同じルールが
+適用されており、PR #5 で SAR は `gaussian_job_shared` への直接依存を
+撤廃しています（SLURM 語彙は in-tree に移管済み）。
 
 ### 5.3 `cargo test --lib` は通るのに `pytest` が ImportError
 
@@ -165,8 +172,8 @@ attach 済みハンドルでも同様。テストで再現する場合は
 
 ### 5.6 `live_env()` が ECCS 上で `Err` を返す
 
-`uv run maturin develop` で `_core` を最新ビルドに上げ直してください。
-`PermissionDenied → None` の丸めは
+`uv run maturin develop` で `_slurm_async_runner_core` を最新ビルドに
+上げ直してください。`PermissionDenied → None` の丸めは
 `src/tssrun/handle.rs::read_live_env_for_pid` で行われており、
 古い拡張モジュールを残したままだと旧挙動を引きずります。
 
@@ -184,7 +191,7 @@ let mgr = TssrunManager::new(cmd).with_state_dir("/var/lib/slurm-runner");
 
 ```python
 # Python
-from slurm_async_runner._core.tssrun import (
+from slurm_async_runner._slurm_async_runner_core.tssrun import (
     TssrunManager, file_system_state_store,
 )
 mgr = TssrunManager(cmd, store=file_system_state_store("/var/lib/slurm-runner"))

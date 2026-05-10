@@ -20,20 +20,25 @@ slurm-async-runner2/
 │   ├── manager.rs         # SlurmCmd / SlurmManager (Spec 層)
 │   ├── dispatcher.rs      # JobDispatcher / Background系 (Runtime 層)
 │   ├── runner.rs          # squeue/sacct パース + バッチ問合せ (Query 層)
+│   ├── entities/          # in-tree SLURM 語彙 (PR #5 で gaussian_job_shared から移管)
+│   │   └── slurm/         # JobStatus / JobState / JobReason / ResourceSpec /
+│   │                      # JobTimeLimit / JobPartition / Memory / ArraySpec ...
 │   ├── tssrun/            # tssrun サブシステム
 │   │   ├── mod.rs         # 公開 re-export と概要
-│   │   ├── cmd.rs         # TssrunCmd / Resource (Spec)
+│   │   ├── cmd.rs         # TssrunCmd (rsc: ResourceSpec / time_limit: JobTimeLimit)
 │   │   ├── parse.rs       # salloc: 行パーサ (純関数)
 │   │   ├── log.rs         # JobLogSink trait + 4 実装
 │   │   ├── handle.rs      # JobHandle / Snapshot / live_env
 │   │   ├── store.rs       # JobStateStore trait + InMemory / FS 実装
 │   │   └── manager.rs     # TssrunManager: spawn / attach / query_state
 │   ├── py_export/         # pyo3 公開層
-│   │   ├── mod.rs         # _core モジュール定義
+│   │   ├── mod.rs         # _slurm_async_runner_core モジュール定義
 │   │   ├── manager.rs     # PySlurmCmd / PySlurmManager
 │   │   ├── runner.rs      # query_job_states_batch (async)
-│   │   └── tssrun.rs      # PyResource / PyTssrunCmd / PyLogSink /
-│   │                      # PyTssrunJobHandle / PyTssrunManager
+│   │   ├── tssrun.rs      # PyTssrunCmd / PyLogSink / PyTssrunJobHandle /
+│   │   │                  # PyTssrunManager / PyJobStateStore (PyResourceSpec /
+│   │   │                  # PyJobTimeLimit を再エクスポート)
+│   │   └── entities/      # SLURM 語彙の pyclass (status / sbatch_options)
 │   └── bin/
 │       └── stub_gen.rs    # pyo3-stub-gen を起動して .pyi を再生成
 │
@@ -42,12 +47,15 @@ slurm-async-runner2/
 │
 ├── python/                # Python 側パッケージ
 │   ├── slurm_async_runner/
-│   │   ├── __init__.py    # _core を import するだけの薄いラッパ
-│   │   └── _core/         # *.pyi 型スタブ置き場
-│   │       ├── __init__.pyi   # 自動生成 (pyo3-stub-gen)
-│   │       ├── manager.pyi    # 手書き (async pyfunctions)
-│   │       ├── runner.pyi     # 手書き
-│   │       └── tssrun.pyi     # 手書き
+│   │   ├── __init__.py    # _slurm_async_runner_core を _core エイリアスで import
+│   │   └── _slurm_async_runner_core/   # *.pyi 型スタブ置き場
+│   │       ├── __init__.pyi            # 自動生成 (pyo3-stub-gen)
+│   │       ├── manager.pyi             # 手書き (async pyfunctions)
+│   │       ├── runner.pyi              # 手書き
+│   │       ├── tssrun.pyi              # 手書き
+│   │       └── entities/slurm/         # 自動生成 (status / sbatch_options)
+│   │           ├── status/__init__.pyi
+│   │           └── sbatch_options/__init__.pyi
 │   └── tests/             # pytest スイート
 │       ├── test_all.py        # 既存挙動の regression
 │       ├── test_tssrun.py     # tssrun サブシステムの async テスト
@@ -78,15 +86,15 @@ slurm-async-runner2/
 
 | ファイル | 中身 |
 |---|---|
-| `Cargo.toml` | 依存（anyhow / thiserror / tokio / serde / **uuid (v4+v7)** / **async-trait** / pyo3 / pyo3-async-runtimes / pyo3-stub-gen / `gaussian_job_shared`）と `[features] default = ["pyo3", "stub_gen"]`。`gaussian_job_shared` は `default-features = false` 必須（理由は同ファイルのコメント参照） |
-| `pyproject.toml` | maturin の `module-name = "slurm_async_runner._core"` 設定、`features = ["pyo3/extension-module"]`、ruff の `target-version = "py312"` |
+| `Cargo.toml` | 依存（anyhow / thiserror / tokio / serde / **uuid (v4+v7)** / **async-trait** / pyo3 / pyo3-async-runtimes / pyo3-stub-gen）と `[features] default = ["pyo3", "stub_gen"]`。PR #5 で `gaussian_job_shared` への直接依存は撤廃（SLURM 語彙は in-tree に移管）。`pyo3` feature は **このクレートが pyclass の唯一の owner** ということを宣言している（Pyclass Single Owner ルール、`Cargo.toml:99-112` のコメント参照） |
+| `pyproject.toml` | maturin の `module-name = "slurm_async_runner._slurm_async_runner_core"` 設定、`features = ["pyo3/extension-module"]`、ruff の `target-version = "py312"` |
 | `rust-toolchain.toml` | `channel = "nightly"`（pyo3 の `"nightly"` feature が要求） |
 
 ### 2.2 Rust コア (`src/`)
 
 | ファイル | 公開している主な型/関数 | 行数の目安 |
 |---|---|---|
-| `lib.rs` | `pub use` の集中管理。`JobReason` / `JobState` / `JobStatus` / `SlurmCmd` / `SlurmManager` / `JobDispatcher` / `TokioDispatcher` / `DryRunDispatcher` / `BackgroundDispatcher` / `SpawnedChild` / `TokioBackgroundDispatcher` / tssrun モジュールの主要型（`JobStateStore` / `InMemoryStateStore` / `FileSystemStateStore` 含む） | 67 |
+| `lib.rs` | `pub use` の集中管理。`JobReason` / `JobState` / `JobStatus`（in-tree 移管後）/ `SlurmCmd` / `SlurmManager` / `JobDispatcher` / `TokioDispatcher` / `DryRunDispatcher` / `BackgroundDispatcher` / `SpawnedChild` / `TokioBackgroundDispatcher` / tssrun モジュールの主要型（`JobStateStore` / `InMemoryStateStore` / `FileSystemStateStore` 含む）/ SLURM 語彙再エクスポート（`JobPartition` / `JobTimeLimit` / `Memory` / `MemoryUnit` / `ResourceSpec` / `ResourceSpecCPU` / `ResourceSpecGPU`） | 71 |
 | `manager.rs` | `SlurmCmd::new / build_argv`, `SlurmManager::{run_job, run_job_with, query_job_state, query_job_states_batch}` | 243 |
 | `dispatcher.rs` | `JobDispatcher`, `TokioDispatcher`, `DryRunDispatcher`, `BackgroundDispatcher`, `SpawnedChild`, `TokioBackgroundDispatcher` | 269 |
 | `runner.rs` | `query_job_states_batch`, `query_job_states_batch_with`, 内部 `parse_squeue` / `parse_sacct` / `merge_results` | 370 |
@@ -96,7 +104,7 @@ slurm-async-runner2/
 | ファイル | 公開している主な型/関数 |
 |---|---|
 | `mod.rs` | サブモジュール宣言と概要 doc-comment |
-| `cmd.rs` | `Resource { processes, threads, cores, memory, gpus }`, `TssrunCmd { tssrun_bin, queue, time_limit, rsc, x11, program, args, env, cwd }`, `TssrunCmd::build_argv` |
+| `cmd.rs` | `TssrunCmd { tssrun_bin, partition: Option<JobPartition>, time_limit: Option<JobTimeLimit>, rsc: Option<ResourceSpec>, x11, program, args, env, cwd }`, `TssrunCmd::build_argv`。リソース仕様型は in-tree の `crate::entities::slurm::ResourceSpec`（PR #5 で旧 `Resource` をリプレース） |
 | `parse.rs` | `parse_salloc_jobid(line) -> Option<u64>`, `parse_salloc_node(line) -> Option<String>` |
 | `log.rs` | `LogStream`, `JobLogSink` trait, `NullLogSink`, `StdLogSink`, `InMemoryLogSink`, `FileLogSink::create` |
 | `handle.rs` | `LogLocations`, `FinishedInfo`, `JobHandleSnapshot { uuid, pid, argv, sent_env, cwd, started_at_unix, log_locations, jobid, node, finished }`, `JobHandle::{from_spawn, attach_snapshot, watch, snapshot, uuid, pid, jobid, node, sent_env, is_running, exit_code, wait, refresh_from_disk, live_env}`, free fn `read_live_env_for_pid` |
@@ -107,28 +115,34 @@ slurm-async-runner2/
 
 | ファイル | Python 名 | 中身 |
 |---|---|---|
-| `mod.rs` | `slurm_async_runner._core` | トップ pymodule。`runner` / `manager` / `tssrun` の inner_module を export。`sum_as_string` というデモ関数も入っている |
-| `manager.rs` | `slurm_async_runner._core.manager` | `SlurmCmd` / `SlurmManager`。`run_job` / `query_job_state` / `query_job_states_batch` は `pyo3_async_runtimes::tokio::future_into_py` で coroutine 化 |
-| `runner.rs` | `slurm_async_runner._core.runner` | `query_job_states_batch`。`PyOnceLock<Py<PyAny>>` で `gaussian_job_shared` 側の `JobStatus` クラスをプロセス内 1 回だけ import |
-| `tssrun.rs` | `slurm_async_runner._core.tssrun` | `Resource` / `TssrunCmd` / `LogSink` / `TssrunJobHandle` / `TssrunManager` + 3 つの sink ファクトリ関数。**スナップショット getter は `watch::Receiver` から読む**ので `wait()` の Mutex を持たない（lock-free 設計） |
+| `mod.rs` | `slurm_async_runner._slurm_async_runner_core` | トップ pymodule（pymodule 名は PR #5 で `_core` から rename）。`runner` / `manager` / `tssrun` / `entities.slurm.*` の inner_module を export。`sum_as_string` というデモ関数も入っている |
+| `manager.rs` | `slurm_async_runner._slurm_async_runner_core.manager` | `SlurmCmd` / `SlurmManager`。`run_job` / `query_job_state` / `query_job_states_batch` は `pyo3_async_runtimes::tokio::future_into_py` で coroutine 化 |
+| `runner.rs` | `slurm_async_runner._slurm_async_runner_core.runner` | `query_job_states_batch`。`PyOnceLock<Py<PyAny>>` で **このクレート自身の** `JobStatus` クラスをプロセス内 1 回だけ import（PR #5 で `gaussian_job_shared` から in-tree 移管） |
+| `tssrun.rs` | `slurm_async_runner._slurm_async_runner_core.tssrun` | `TssrunCmd` / `LogSink` / `TssrunJobHandle` / `TssrunManager` / `JobStateStore` + sink ファクトリ（`null_log_sink` / `std_log_sink` / `file_log_sink`）と store ファクトリ（`in_memory_state_store` / `file_system_state_store`）、加えて再エクスポート pyclass の `ResourceSpec` / `JobTimeLimit`。**スナップショット getter は `watch::Receiver` から読む**ので `wait()` の Mutex を持たない（lock-free 設計） |
+| `entities/slurm/status.rs` | `slurm_async_runner._slurm_async_runner_core.entities.slurm.status` | `JobStatus` / `JobState` / `JobReason` の pyclass。PR #5 で `gaussian_job_shared` から本クレートに移管された SLURM 語彙の正本 |
+| `entities/slurm/sbatch_options.rs` | `slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options` | `ResourceSpec` / `ResourceSpecCPU` / `ResourceSpecGPU` / `JobTimeLimit` / `JobPartition` / `Memory` / `MemoryUnit` / `ArraySpec` ほか sbatch オプション系の pyclass |
 
 ### 2.5 stub 生成 (`src/bin/stub_gen.rs`)
 
 `pyo3-stub-gen` を呼び、自動生成可能な範囲（= top-level の sync な
-pyfunction）の型スタブを `python/slurm_async_runner/_core/__init__.pyi`
-に書き出します。`#[pymodule_export]` でぶら下げた pyclass や async
-pyfunction はこのジェネレータの対象外なので、`manager.pyi` /
-`runner.pyi` / `tssrun.pyi` は **手書き** です。
+pyfunction、および `#[gen_stub_pyclass]` を付けた pyclass）の型スタブを
+`python/slurm_async_runner/_slurm_async_runner_core/__init__.pyi` ほか
+配下のサブモジュール stub に書き出します。`#[pymodule_export]` でぶら
+下げた async pyfunction や lock-free getter はジェネレータの対象外
+なので、`manager.pyi` / `runner.pyi` / `tssrun.pyi` は **手書き** です
+（`entities/slurm/*` 配下は stub_gen 側で自動生成）。
 
 ### 2.6 Python パッケージ (`python/slurm_async_runner/`)
 
 | ファイル | 中身 |
 |---|---|
-| `__init__.py` | `from slurm_async_runner import _core` だけの 7 行。`__doc__` / `__all__` を継承 |
-| `_core/__init__.pyi` | `pyo3-stub-gen` 自動生成（`sum_as_string` のみ） |
-| `_core/manager.pyi` | 手書き。`SlurmCmd`, `SlurmManager` の型 |
-| `_core/runner.pyi` | 手書き。`query_job_states_batch` の型 |
-| `_core/tssrun.pyi` | 手書き。`Resource`/`TssrunCmd`/`LogSink`/`TssrunJobHandle`/`TssrunManager` |
+| `__init__.py` | `from slurm_async_runner import _slurm_async_runner_core as _core` だけの 7 行。`__doc__` / `__all__` を継承 |
+| `_slurm_async_runner_core/__init__.pyi` | `pyo3-stub-gen` 自動生成（`sum_as_string` のみ） |
+| `_slurm_async_runner_core/manager.pyi` | 手書き。`SlurmCmd`, `SlurmManager` の型 |
+| `_slurm_async_runner_core/runner.pyi` | 手書き。`query_job_states_batch` の型 |
+| `_slurm_async_runner_core/tssrun.pyi` | 手書き。`TssrunCmd`/`LogSink`/`TssrunJobHandle`/`TssrunManager`/`JobStateStore`、再エクスポート `ResourceSpec`/`JobTimeLimit`、各 sink/store ファクトリ |
+| `_slurm_async_runner_core/entities/slurm/status/__init__.pyi` | stub_gen 自動生成。`JobStatus` / `JobState` / `JobReason` |
+| `_slurm_async_runner_core/entities/slurm/sbatch_options/__init__.pyi` | stub_gen 自動生成。`ResourceSpec` / `ResourceSpecCPU` / `ResourceSpecGPU` / `JobTimeLimit` / `JobPartition` / `Memory` / `MemoryUnit` / `ArraySpec` |
 
 ### 2.7 テスト
 
@@ -156,8 +170,8 @@ pyfunction はこのジェネレータの対象外なので、`manager.pyi` /
 | 別のジョブランチャ（例: `mpirun`）に対応させる | `SlurmCmd::srun_cmd` を変えるだけで OK。`JobDispatcher` には触らない |
 | dry-run の出力フォーマットを変える | `src/dispatcher.rs::DryRunDispatcher` |
 | `squeue` の出力フォーマットを変える | `src/runner.rs::query_job_states_batch_with` の argv と `parse_squeue` |
-| 新しい SLURM 状態トークンに対応する | このリポジトリではなく [`gaussian_job_shared`](https://github.com/kkiyama117/gaussian_job_shared) 側で追加 |
-| `tssrun` の `--rsc` キーを増やす | `src/tssrun/cmd.rs::Resource` のフィールドと `render` |
+| 新しい SLURM 状態トークンに対応する | `src/entities/slurm/status.rs` の `JobState` / `JobReason` に variant を追加（PR #5 で in-tree 移管済み） |
+| `tssrun` の `--rsc` キーを増やす | `src/entities/slurm/sbatch_options/resource_spec.rs::ResourceSpecCPU` / `ResourceSpecGPU` のフィールドと `Display` |
 | `salloc:` バナーが site-specific に書き換わった | `src/tssrun/parse.rs` に新しい prefix を追加（既存をいじらず分岐推奨） |
 | ログ出力先を増やす（DB / 外部 API） | `src/tssrun/log.rs` で `JobLogSink` を実装した型を追加 |
 | Snapshot 永続化バックエンドを増やす（Redis / SQLite 等） | `src/tssrun/store.rs` で `#[async_trait] impl JobStateStore for X` を追加し、`TssrunManager::with_state_store(Arc::new(X))` で注入 |

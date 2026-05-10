@@ -65,7 +65,7 @@ exit_code = await manager.run_job("./job.sh", dry_run=False)
 ### Python 側のコード例
 
 ```python
-from slurm_async_runner._core.runner import query_job_states_batch
+from slurm_async_runner._slurm_async_runner_core.runner import query_job_states_batch
 states: dict[int, JobStatus] = await query_job_states_batch([12345, 12346, 12347])
 ```
 
@@ -118,9 +118,11 @@ runner::query_job_states_batch_with(dispatcher, jobids)
 1. `pyo3_async_runtimes::tokio::future_into_py` で Python coroutine を作る
 2. await 後の Rust `HashMap` を `Python::attach` 内で
    `PyDict::new(py)` に展開
-3. 各エントリで `gaussian_job_shared._core.entities.slurm.status.JobStatus`
+3. 各エントリで
+   `slurm_async_runner._slurm_async_runner_core.entities.slurm.status.JobStatus`
    クラスを `PyOnceLock` キャッシュから取り出し、
    `JobStatus.parse(state_token, reason_str)` を呼ぶ
+   （PR #5 で `gaussian_job_shared` から in-tree に移管された）
 4. 結果の Python `JobStatus` を dict にセット
 
 > **重要**: Rust 側の `JobStatus` 構造体と Python 側の `JobStatus` クラスは
@@ -133,7 +135,7 @@ runner::query_job_states_batch_with(dispatcher, jobids)
 ### Python 側のコード例
 
 ```python
-from slurm_async_runner._core.tssrun import (
+from slurm_async_runner._slurm_async_runner_core.tssrun import (
     TssrunManager, file_system_state_store, file_log_sink,
 )
 
@@ -143,7 +145,7 @@ manager = TssrunManager(
     log_sink=await file_log_sink("/tmp/o.log", "/tmp/e.log"),
 )
 handle = await manager.spawn()
-print("uuid", handle.uuid)                 # <- primary key（UUID v7 文字列）
+print("uuid", await handle.uuid)           # <- primary key（UUID v7 文字列）
 print("pid", await handle.pid)             # <- wait と並行して読める
 print("jobid", await handle.jobid)         # <- wait と並行して読める
 code = await handle.wait()                 # <- 子の終了を待つ
@@ -244,7 +246,7 @@ code = await handle.wait()                 # <- 子の終了を待つ
 
 ```python
 # プロセス A で投入したジョブを、プロセス B から再 attach する
-from slurm_async_runner._core.tssrun import (
+from slurm_async_runner._slurm_async_runner_core.tssrun import (
     TssrunManager, file_system_state_store,
 )
 
