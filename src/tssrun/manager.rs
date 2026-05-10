@@ -53,10 +53,11 @@ use uuid::Uuid;
 use crate::JobStatus;
 use crate::dispatcher::{BackgroundDispatcher, TokioBackgroundDispatcher};
 use crate::runner;
+use crate::store::JobStateStore;
 use crate::tssrun::cmd::TssrunCmd;
 use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, LogLocations};
 use crate::tssrun::log::{JobLogSink, StdLogSink};
-use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
+use crate::tssrun::store::{self, FileSystemStateStore, InMemoryStateStore};
 
 /// Identifies a previously-persisted handle to attach to.
 #[derive(Debug, Clone)]
@@ -85,7 +86,7 @@ pub enum AttachKey {
 /// `with_*` builders for new managers.
 pub struct TssrunManager {
     pub(crate) cmd: TssrunCmd,
-    pub(crate) store: Arc<dyn JobStateStore>,
+    pub(crate) store: Arc<dyn JobStateStore<JobHandleSnapshot>>,
     pub(crate) log_sink: Arc<dyn JobLogSink>,
 }
 
@@ -113,7 +114,7 @@ impl TssrunManager {
     }
 
     /// Wire an arbitrary [`JobStateStore`] backend.
-    pub fn with_state_store(mut self, store: Arc<dyn JobStateStore>) -> Self {
+    pub fn with_state_store(mut self, store: Arc<dyn JobStateStore<JobHandleSnapshot>>) -> Self {
         self.store = store;
         self
     }
@@ -125,7 +126,7 @@ impl TssrunManager {
 
     /// Borrow the configured store. Useful when a caller wants to save
     /// or load snapshots out-of-band (e.g. a CLI listing all known jobs).
-    pub fn store(&self) -> &Arc<dyn JobStateStore> {
+    pub fn store(&self) -> &Arc<dyn JobStateStore<JobHandleSnapshot>> {
         &self.store
     }
 
@@ -186,9 +187,7 @@ impl TssrunManager {
                 Ok(JobHandle::attach_snapshot(snap, Some(self.store.clone())))
             }
             AttachKey::Pid(pid) => {
-                let snap = self
-                    .store
-                    .find_by_pid(pid)
+                let snap = store::find_by_pid(self.store.as_ref(), pid)
                     .await?
                     .ok_or_else(|| anyhow!("no persisted handle matched pid {pid}"))?;
                 Ok(JobHandle::attach_snapshot(snap, Some(self.store.clone())))

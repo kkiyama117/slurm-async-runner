@@ -17,10 +17,11 @@ use crate::py_export::entities::slurm::sbatch_options::resource_spec::PyResource
 use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimit;
 use crate::tssrun::cmd::TssrunCmd;
 
+use crate::store::JobStateStore;
 use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
-use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
+use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore};
 
 // ---------- TssrunCmd ----------
 
@@ -118,7 +119,7 @@ fn file_log_sink<'py>(
 
 // ---------- JobStateStore ----------
 
-/// Opaque Python handle to an [`Arc<dyn JobStateStore>`]. Construct via
+/// Opaque Python handle to an [`Arc<dyn JobStateStore<JobHandleSnapshot>>`]. Construct via
 /// the `in_memory_state_store` / `file_system_state_store` factories and
 /// pass the result to ``TssrunManager(cmd, store=...)``.
 ///
@@ -133,7 +134,7 @@ fn file_log_sink<'py>(
     frozen
 )]
 #[derive(Clone)]
-pub struct PyJobStateStore(pub Arc<dyn JobStateStore>);
+pub struct PyJobStateStore(pub Arc<dyn JobStateStore<JobHandleSnapshot>>);
 
 /// Build an in-process, in-memory state store.
 ///
