@@ -23,9 +23,9 @@ pub(crate) fn absolutize(p: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
+    #[cfg(unix)]
     fn absolute_path_roundtrips() {
         let abs = absolutize(Path::new("/tmp/foo")).unwrap();
         assert_eq!(abs, "/tmp/foo");
@@ -35,17 +35,15 @@ mod tests {
     fn relative_path_is_made_absolute() {
         let abs = absolutize(Path::new("foo.sh")).unwrap();
         let cwd = std::env::current_dir().unwrap();
-        assert_eq!(abs, format!("{}/foo.sh", cwd.display()));
+        let expected = cwd.join("foo.sh").to_str().unwrap().to_owned();
+        assert_eq!(abs, expected);
     }
 
     #[test]
     fn handles_dot_segments() {
         let abs = absolutize(Path::new("./bar")).unwrap();
         let cwd = std::env::current_dir().unwrap();
-        assert!(
-            abs.starts_with(&cwd.display().to_string()),
-            "abs={abs} should start with {cwd:?}"
-        );
-        let _ = PathBuf::from(&abs);
+        let expected = cwd.join("bar").to_str().unwrap().to_owned();
+        assert_eq!(abs, expected, "dot segment should be normalized away");
     }
 }
