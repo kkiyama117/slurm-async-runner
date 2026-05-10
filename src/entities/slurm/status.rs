@@ -94,6 +94,26 @@ impl JobState {
         matches!(self, JobState::Running)
     }
 
+    /// True if the state means the job will never run again (`Completed`,
+    /// `Failed`, `Cancelled`, `Timeout`, etc.). Pending/Running/etc. are NOT
+    /// terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobState::Completed
+                | JobState::BootFail
+                | JobState::Cancelled
+                | JobState::Deadline
+                | JobState::Failed
+                | JobState::NodeFail
+                | JobState::OutOfMemory
+                | JobState::Preempted
+                | JobState::Revoked
+                | JobState::SpecialExit
+                | JobState::Timeout
+        )
+    }
+
     /// Parse a raw `squeue` / `sacct` state token.
     ///
     /// Accepts SLURM long forms (`"PENDING"`, `"OUT_OF_MEMORY"`, …),
