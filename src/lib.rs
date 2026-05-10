@@ -36,13 +36,14 @@ pub use tssrun::cmd::TssrunCmd;
 pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
 };
+pub use crate::store::JobStateStore;
 pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};
 pub use tssrun::log::{
     FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,
 };
 pub use tssrun::manager::{AttachKey, TssrunManager};
 pub use tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
-pub use tssrun::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
+pub use tssrun::store::{FileSystemStateStore, InMemoryStateStore};
 
 #[cfg(test)]
 mod tests {

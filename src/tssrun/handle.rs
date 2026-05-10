@@ -47,9 +47,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::dispatcher::SpawnedChild;
+use crate::store::JobStateStore;
 use crate::tssrun::log::{JobLogSink, LogStream};
 use crate::tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
-use crate::tssrun::store::JobStateStore;
 
 /// Where the tee task is writing the child's logs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,7 +99,7 @@ pub struct JobHandle {
     wait_handle: Option<JoinHandle<Result<Option<i32>>>>,
     tee_stdout_handle: Option<JoinHandle<()>>,
     tee_stderr_handle: Option<JoinHandle<()>>,
-    store: Option<Arc<dyn JobStateStore>>,
+    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
 }
 
 impl JobHandle {
@@ -114,7 +114,7 @@ impl JobHandle {
         mut spawned: SpawnedChild,
         init: JobHandleSnapshot,
         log_sink: Arc<dyn JobLogSink>,
-        store: Option<Arc<dyn JobStateStore>>,
+        store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
     ) -> Result<Self> {
         let (tx, rx) = watch::channel(init);
 
@@ -192,7 +192,10 @@ impl JobHandle {
     }
 
     /// Build a read-only handle from a previously persisted snapshot.
-    pub fn attach_snapshot(snap: JobHandleSnapshot, store: Option<Arc<dyn JobStateStore>>) -> Self {
+    pub fn attach_snapshot(
+        snap: JobHandleSnapshot,
+        store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+    ) -> Self {
         let (tx, rx) = watch::channel(snap);
         Self {
             snapshot_rx: rx,
@@ -357,7 +360,7 @@ async fn tee_stdout(
     stdout: ChildStdout,
     sink: Arc<dyn JobLogSink>,
     tx: watch::Sender<JobHandleSnapshot>,
-    store: Option<Arc<dyn JobStateStore>>,
+    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
 ) {
     tee_lines(stdout, LogStream::Stdout, sink, tx, store).await;
 }
@@ -366,7 +369,7 @@ async fn tee_stderr(
     stderr: ChildStderr,
     sink: Arc<dyn JobLogSink>,
     tx: watch::Sender<JobHandleSnapshot>,
-    store: Option<Arc<dyn JobStateStore>>,
+    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
 ) {
     tee_lines(stderr, LogStream::Stderr, sink, tx, store).await;
 }
@@ -376,7 +379,7 @@ async fn tee_lines<R>(
     stream_kind: LogStream,
     sink: Arc<dyn JobLogSink>,
     tx: watch::Sender<JobHandleSnapshot>,
-    store: Option<Arc<dyn JobStateStore>>,
+    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -432,7 +435,11 @@ fn now_unix() -> i64 {
 /// The wait/tee tasks call this as the child progresses; a transient
 /// store outage must not crash the job, just leave the persisted view
 /// slightly stale until the next mutation.
-async fn persist_warn(store: &dyn JobStateStore, snap: &JobHandleSnapshot, when: &str) {
+async fn persist_warn(
+    store: &dyn JobStateStore<JobHandleSnapshot>,
+    snap: &JobHandleSnapshot,
+    when: &str,
+) {
     if let Err(e) = store.save(snap).await {
         tracing::warn!(error = %e, when, uuid = %snap.uuid, "store.save failed");
     }
