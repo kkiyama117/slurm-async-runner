@@ -87,6 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generic store layer: `JobSnapshot` trait + `JobStateStore<S>` + `InMemoryStateStore<S>`
   + `FileSystemStateStore<S>`. Both `tssrun` and `sbatch` use it; on-disk JSON
   files now include a top-level `"kind"` discriminator.
+- Dyn-compatible dispatcher facade: `DynJobDispatcher` trait + `DynDispatcherAdapter`
+  newtype + `DynView` borrow adapter + `into_dyn(d)` helper. Required because the
+  base `JobDispatcher` trait uses RPITIT (return-position impl Trait in trait) and is
+  not directly dyn-compatible. `into_dyn` is the canonical entry point for callers
+  who need `Arc<dyn DynJobDispatcher>` (e.g. `SbatchManager::with_dispatcher`).
 
 ### Changed (BREAKING)
 
