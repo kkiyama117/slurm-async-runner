@@ -101,6 +101,29 @@ impl TryFrom<&str> for MailType {
     }
 }
 
+impl MailType {
+    /// Render this mail type as the canonical uppercase Slurm token
+    /// (`BEGIN`, `END`, `FAIL`, `REQUEUE`, `ALL`).
+    ///
+    /// This is the exact string accepted by sbatch's `--mail-type` flag and
+    /// produced by sacct, so `Display` is implemented in terms of this method.
+    pub const fn as_slurm_str(self) -> &'static str {
+        match self {
+            MailType::BEGIN => "BEGIN",
+            MailType::END => "END",
+            MailType::FAIL => "FAIL",
+            MailType::REQUEUE => "REQUEUE",
+            MailType::ALL => "ALL",
+        }
+    }
+}
+
+impl std::fmt::Display for MailType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_slurm_str())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MailTypeInput(Vec<MailType>);
 
@@ -161,4 +184,46 @@ pub struct SlurmJobConfig {
     /// p=PROCS:t=THREADSc=CORES:m=MEMORY (or g=GPU)
     #[serde(default)]
     pub resource_spec: Option<ResourceSpec>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mail_type_as_slurm_str_matches_kudpc_tokens() {
+        assert_eq!(MailType::BEGIN.as_slurm_str(), "BEGIN");
+        assert_eq!(MailType::END.as_slurm_str(), "END");
+        assert_eq!(MailType::FAIL.as_slurm_str(), "FAIL");
+        assert_eq!(MailType::REQUEUE.as_slurm_str(), "REQUEUE");
+        assert_eq!(MailType::ALL.as_slurm_str(), "ALL");
+    }
+
+    #[test]
+    fn mail_type_display_matches_as_slurm_str() {
+        for mt in [
+            MailType::BEGIN,
+            MailType::END,
+            MailType::FAIL,
+            MailType::REQUEUE,
+            MailType::ALL,
+        ] {
+            assert_eq!(mt.to_string(), mt.as_slurm_str());
+        }
+    }
+
+    #[test]
+    fn mail_type_display_roundtrips_through_try_from() {
+        for mt in [
+            MailType::BEGIN,
+            MailType::END,
+            MailType::FAIL,
+            MailType::REQUEUE,
+            MailType::ALL,
+        ] {
+            let rendered = mt.to_string();
+            let parsed = MailType::try_from(rendered.as_str()).unwrap();
+            assert_eq!(parsed, mt);
+        }
+    }
 }
