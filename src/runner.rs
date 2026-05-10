@@ -183,6 +183,9 @@ pub fn parse_qgroup_l(stdout: &str) -> HashMap<u64, JobStatus> {
     let mut out = HashMap::new();
     for line in stdout.lines() {
         let mut fields = line.split_whitespace();
+        // Skip the QUEUE and USER columns; KUDPC's `qgroup -l` always
+        // outputs them as the first two columns. If that layout changes,
+        // adjust both this skip count AND the field indices below.
         let _queue = fields.next();
         let _user = fields.next();
         let jobid_str = match fields.next() {
@@ -453,6 +456,70 @@ mod tests {
     async fn empty_input_short_circuits() {
         let m = query_job_states_batch(&[]).await.unwrap();
         assert!(m.is_empty());
+    }
+
+    // ---- test fixtures for async query functions ----
+
+    struct PanicDispatcher;
+    impl JobDispatcher for PanicDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            panic!("PanicDispatcher.run called")
+        }
+        async fn capture(&self, _argv: &[String]) -> Result<(i32, String)> {
+            panic!("PanicDispatcher.capture called")
+        }
+    }
+
+    struct MockCapture {
+        expected_argv: Vec<String>,
+        stdout: String,
+    }
+    impl JobDispatcher for MockCapture {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            panic!("not used")
+        }
+        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+            assert_eq!(argv, self.expected_argv.as_slice());
+            Ok((0, self.stdout.clone()))
+        }
+    }
+
+    // ---- query_job_states_via_qgroup_with ----
+
+    #[tokio::test]
+    async fn query_via_qgroup_short_circuits_on_empty_input() {
+        // No dispatcher call should happen for empty input.
+        let m = super::query_job_states_via_qgroup_with(&PanicDispatcher, &[])
+            .await
+            .unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_squeue_only_short_circuits_on_empty_input() {
+        let m = super::query_job_states_squeue_only_with(&PanicDispatcher, &[])
+            .await
+            .unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_via_qgroup_filters_to_requested_jobids() {
+        // qgroup returns jobs 1, 2, 3; we only ask for 2 — only 2 should come back.
+        let stdout = "\
+queue user 1 RUN 1 1 1M 0:0:1(0:1:0)
+queue user 2 RUN 1 1 1M 0:0:1(0:1:0)
+queue user 3 RUN 1 1 1M 0:0:1(0:1:0)
+";
+        let mock = MockCapture {
+            expected_argv: vec!["qgroup".into(), "-l".into()],
+            stdout: stdout.to_string(),
+        };
+        let m = super::query_job_states_via_qgroup_with(&mock, &[2])
+            .await
+            .unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key(&2));
     }
 
     // ---- parse_qgroup_l ----
