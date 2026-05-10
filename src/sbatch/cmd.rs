@@ -29,6 +29,12 @@ pub struct SbatchCmd {
 
     pub env: HashMap<String, String>,
 
+    /// `--no-requeue` flag. When `true`, the job is not requeued on node failure.
+    pub no_requeue: bool,
+
+    /// `--comment` flag value. When `Some`, emitted as `--comment <value>`.
+    pub comment: Option<String>,
+
     pub script: PathBuf,
     pub args: Vec<String>,
 }
@@ -45,6 +51,8 @@ impl SbatchCmd {
             error: None,
             chdir: None,
             env: HashMap::new(),
+            no_requeue: false,
+            comment: None,
             script: script.into(),
             args: Vec::new(),
         }
@@ -87,6 +95,13 @@ impl SbatchCmd {
         }
         if !self.env.is_empty() {
             argv.push(format!("--export={}", render_export(&self.env)));
+        }
+        if self.no_requeue {
+            argv.push("--no-requeue".to_string());
+        }
+        if let Some(c) = &self.comment {
+            argv.push("--comment".to_string());
+            argv.push(c.clone());
         }
         argv.push(absolutize(&self.script)?);
         argv.extend(self.args.iter().cloned());
@@ -200,5 +215,39 @@ mod tests {
         let argv = cmd.build_argv().unwrap();
         assert!(argv.contains(&"--rsc".to_string()));
         assert!(argv.contains(&"g=1".to_string()));
+    }
+
+    #[test]
+    fn no_requeue_flag_is_emitted_when_true() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.no_requeue = true;
+        let argv = cmd.build_argv().unwrap();
+        assert!(argv.iter().any(|a| a == "--no-requeue"));
+    }
+
+    #[test]
+    fn no_requeue_flag_is_omitted_when_false() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "--no-requeue"));
+    }
+
+    #[test]
+    fn comment_flag_emits_value() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.comment = Some("post-deadline rerun".to_string());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--comment")
+            .expect("--comment present");
+        assert_eq!(argv[i + 1], "post-deadline rerun");
+    }
+
+    #[test]
+    fn comment_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "--comment"));
     }
 }
