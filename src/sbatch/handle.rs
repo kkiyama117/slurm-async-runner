@@ -233,6 +233,60 @@ impl SbatchJobHandle {
         let _ = inner.snapshot_tx.send(snap.clone());
         Ok(snap)
     }
+
+    /// Heavyweight finalizer. Calls `refresh()` first; only invokes
+    /// sacct if the job has actually left both `qgroup -l` and `squeue`
+    /// **and** `lifecycle.finished` is still None. Otherwise behaves
+    /// identically to `refresh()`.
+    pub async fn refresh_with_sacct(&self) -> anyhow::Result<SbatchJobSnapshot> {
+        let mut snap = self.refresh().await?;
+        if snap.lifecycle.finished.is_some() {
+            return Ok(snap);
+        }
+        if !snap.lifecycle.left_active_listing {
+            return Ok(snap);
+        }
+
+        let inner = &*self.0;
+        let _guard = inner.refresh_lock.lock().await;
+        let view = crate::dispatcher::DynView(&*inner.dispatcher);
+
+        let map = crate::runner::query_job_states_batch_with(&view, &[snap.jobid]).await?;
+        let final_status = map.get(&snap.jobid).cloned().unwrap_or_default();
+        snap.lifecycle.finished = Some(FinishedInfo {
+            final_state: final_status.state,
+            final_reason: final_status.reason,
+            // sacct's ExitCode is not currently parsed by query_job_states_batch_with;
+            // surface as None for now. Phase 2 may extend the parser.
+            exit_code: None,
+            finished_at: chrono::Utc::now(),
+        });
+        inner.store.save(&snap).await?;
+        let _ = inner.snapshot_tx.send(snap.clone());
+        Ok(snap)
+    }
+
+    /// Lightweight polling loop. Calls `refresh()` (sacct-free) at the
+    /// supplied interval until either (a) the observed state is terminal,
+    /// or (b) the job leaves both active listings. Caller may follow up
+    /// with one `refresh_with_sacct()` if exit_code resolution is needed.
+    pub async fn wait_terminal(
+        &self,
+        poll_interval: std::time::Duration,
+    ) -> anyhow::Result<SbatchJobSnapshot> {
+        loop {
+            let snap = self.refresh().await?;
+            if let Some(state) = &snap.lifecycle.last_observed_state
+                && state.state.is_terminal()
+            {
+                return Ok(snap);
+            }
+            if snap.lifecycle.left_active_listing {
+                return Ok(snap);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,5 +504,80 @@ mod tests {
         let after = h.refresh().await.unwrap();
         assert!(after.lifecycle.left_active_listing);
         assert_eq!(canned.sacct_calls(), 0, "refresh must NOT call sacct");
+    }
+
+    #[tokio::test]
+    async fn refresh_with_sacct_skips_sacct_when_qgroup_hits() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "QUEUE USER JOBID STATUS PROC\ngr u 12345 RUN 1\n",
+            "",
+            "",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        assert!(after.lifecycle.finished.is_none());
+        assert_eq!(canned.sacct_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_with_sacct_calls_sacct_once_after_vanish() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None\n"));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        assert!(after.lifecycle.finished.is_some());
+        assert_eq!(canned.sacct_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_returns_when_state_is_terminal() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(CannedDispatcher::new(
+            "QUEUE USER JOBID STATUS PROC\ngr u 12345 CMP 1\n",
+            "",
+            "",
+        ));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h
+            .wait_terminal(std::time::Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.lifecycle.last_observed_state.unwrap().state,
+            crate::JobState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_returns_on_left_active_listing() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h
+            .wait_terminal(std::time::Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(after.lifecycle.left_active_listing);
+        assert_eq!(
+            canned.sacct_calls(),
+            0,
+            "wait_terminal must NEVER call sacct"
+        );
     }
 }
