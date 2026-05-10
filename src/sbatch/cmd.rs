@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
+use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec, SlurmDependency};
 use crate::util::path::absolutize;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,10 @@ pub struct SbatchCmd {
     pub output: Option<String>,
     pub error: Option<String>,
     pub chdir: Option<PathBuf>,
+
+    /// `--dependency` (`-d`) spec. When `Some`, emitted as `["-d", dep.to_string()]`
+    /// (e.g. `["-d", "afterok:200,afterany:201"]`).
+    pub dependency: Option<SlurmDependency>,
 
     pub env: HashMap<String, String>,
 
@@ -50,6 +54,7 @@ impl SbatchCmd {
             output: None,
             error: None,
             chdir: None,
+            dependency: None,
             env: HashMap::new(),
             no_requeue: false,
             comment: None,
@@ -95,6 +100,10 @@ impl SbatchCmd {
         }
         if !self.env.is_empty() {
             argv.push(format!("--export={}", render_export(&self.env)));
+        }
+        if let Some(dep) = &self.dependency {
+            argv.push("-d".to_string());
+            argv.push(dep.to_string());
         }
         if self.no_requeue {
             argv.push("--no-requeue".to_string());
@@ -249,5 +258,39 @@ mod tests {
         let cmd = SbatchCmd::new("/w/job.sh");
         let argv = cmd.build_argv().unwrap();
         assert!(!argv.iter().any(|a| a == "--comment"));
+    }
+
+    #[test]
+    fn dependency_emits_dash_d_with_display_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.dependency = Some("afterok:200".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv.iter().position(|a| a == "-d").expect("-d present");
+        assert_eq!(argv[i + 1], "afterok:200");
+    }
+
+    #[test]
+    fn dependency_with_and_join_emits_comma_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.dependency = Some("afterok:200,afterany:201".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv.iter().position(|a| a == "-d").expect("-d present");
+        assert_eq!(argv[i + 1], "afterok:200,afterany:201");
+    }
+
+    #[test]
+    fn dependency_with_or_join_emits_question_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.dependency = Some("afterok:200?afterany:201".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv.iter().position(|a| a == "-d").expect("-d present");
+        assert_eq!(argv[i + 1], "afterok:200?afterany:201");
+    }
+
+    #[test]
+    fn dependency_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "-d"));
     }
 }
