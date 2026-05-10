@@ -96,6 +96,32 @@ pub fn into_dyn<D: JobDispatcher + Send + Sync + 'static>(
     std::sync::Arc::new(DynDispatcherAdapter(d))
 }
 
+/// Borrowed view that implements [`JobDispatcher`] for a `&dyn DynJobDispatcher`.
+///
+/// Used to cross from the dyn-erased dispatcher held by handles back to
+/// the generic-bound `JobDispatcher` API expected by `runner::query_*`.
+///
+/// ```rust,ignore
+/// let view = DynView(&*inner.dispatcher);
+/// let result = query_job_states_via_qgroup_with(&view, &[jobid]).await?;
+/// ```
+pub struct DynView<'a>(pub &'a dyn DynJobDispatcher);
+
+impl<'a> JobDispatcher for DynView<'a> {
+    // The `impl Future` return form is intentional here: `async fn` would
+    // capture `self` instead of only the inner pointer, which causes
+    // lifetime conflicts when bridging `&dyn DynJobDispatcher`.
+    #[allow(clippy::manual_async_fn)]
+    fn run(&self, argv: &[String]) -> impl Future<Output = Result<i32>> + Send {
+        async move { self.0.run(argv).await }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn capture(&self, argv: &[String]) -> impl Future<Output = Result<(i32, String)>> + Send {
+        async move { self.0.capture(argv).await }
+    }
+}
+
 // --------------------------------------------------------- TokioDispatcher
 
 /// Production [`JobDispatcher`] backed by `tokio::process::Command`.

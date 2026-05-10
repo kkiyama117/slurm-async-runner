@@ -27,8 +27,8 @@ pub use manager::{SlurmCmd, SlurmManager};
 // Re-export the dispatcher abstraction so callers can plug in custom
 // runtime implementations or use the shipped Tokio / dry-run flavors.
 pub use dispatcher::{
-    DryRunDispatcher, DynDispatcherAdapter, DynJobDispatcher, JobDispatcher, TokioDispatcher,
-    into_dyn,
+    DryRunDispatcher, DynDispatcherAdapter, DynJobDispatcher, DynView, JobDispatcher,
+    TokioDispatcher, into_dyn,
 };
 
 // Re-export background dispatcher types.
