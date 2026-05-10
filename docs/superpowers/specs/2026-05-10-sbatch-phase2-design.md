@@ -99,6 +99,16 @@ Phase 1 で確立された 3 層を Phase 2 でも維持:
 
 `tokio::sync::watch::Sender` で snapshot を broadcast、getter は all lock-free、`refresh_lock: Mutex<()>` で並行 refresh のみ単一化。Phase 2 で新 getter を足すときも **`async` にしない、`Mutex` を持たせない**。
 
+### 2.5 Pyclass Single Owner ルール
+
+ハンドオーバ §3.2 を継承。Phase 2 で新規追加する pyo3 binding（`PySbatchManager::run` / `cancel` / `spawn_array`、`SlurmSignalSpec` の py wrapper、配列 task 用 `PyArrayJobHandle` 等）は **1 つの Rust struct を 2 個以上の pyclass が共有しない** 規律を厳守する。
+
+- `Py<...>` で wrap、`from_py_object` で Rust に渡す
+- 配列ジョブの `Vec<SbatchJobHandle>` を Python 側に返すときは `Py<PyList>` of `Py<PySbatchJobHandle>` 形式とし、各要素が独立した Rust ownership を持つ
+- 共有が必要な場合は `Arc<RwLock<T>>` を 1 pyclass に置き、他は参照経由（Phase 1 の `PySbatchManager` 同様のパターン）
+
+clone semantics 不明確な共有は Phase 1 で問題化（handover §3.2）したため、Phase 2 でも厳守。
+
 ---
 
 ## 3. モジュールレイアウト変更
@@ -518,9 +528,24 @@ pub(crate) fn resolve_log_path(
 - 新メソッド `attach_array_jobid(master_jobid) -> Vec<SbatchJobHandle>` を追加（task index 昇順で返す）
 - 既存 `attach_jobid(jobid) -> SbatchJobHandle` は単発 snapshot のみ返す挙動を維持。複数マッチ時は新エラー `SbatchAttachError::MultipleMatch { jobid, count }` を返す（破壊的だが、Phase 1 では起き得なかったケースなので互換性影響なし）
 
+**kind peek の遵守**（ハンドオーバ §2.4 必須要件）: `attach_array_jobid` も **既存 attach 経路と同じく on-disk JSON の `kind` フィールドを peek し、`"sbatch"` 以外を silent skip する**。`FileSystemStateStore::find_*_by_array_jobid` 系の新スキャンメソッドは Phase 1 の既存 scan と同一の skip ロジックを継承する。kind 不一致拒否のテストを `attach_array_jobid` にも追加すること（handover §4 の "attach_file が kind チェックを忘れていた" 教訓を継承）。
+
 ---
 
 ## 6. Tier 2-B: `sbatch --wait` 相当 `run()` (#6) 詳細
+
+### 6.0 handover §5.3 からの逸脱と理由（明示）
+
+**handover §5.3 のタイトル**は "`sbatch --wait based run()`" であり、`--wait` フラグを使った同期 sbatch 起動を前提としていた。本 spec は **意図的に `--wait` を使わず、`spawn → wait_terminal` ポーリング実装を採用** する。
+
+**逸脱の理由**:
+
+1. **接続断による孤児ジョブのリスクが構造的に回避できない** — handover §5.3 自身も「コネクション切断 (timeout) で残骸ジョブが残るリスクあり」と警告。`--wait` を保持する Rust プロセスが SIGKILL/OOM/SSH 切断で死亡した場合、`Drop` impl が走らないので scancel が発火しない。KUDPC は長時間ジョブ（hours/days）が日常で SSH 切断が発生しやすく、構造的脆弱性となる。
+2. **Phase 1 の "subprocess は短命、state は永続 snapshot" 不変条件と整合** — `--wait` は数時間 subprocess を保持する設計で、Phase 1 が確立した「sbatch は瞬時に jobid を返して終了 → snapshot は disk に永続 → 別プロセスから attach 可能」モデルと逆行する。Poll 実装なら spawn 直後に snapshot 永続化され、Rust プロセスが死んでも jobid で再 attach できる。
+3. **KUDPC 負荷ガイドラインへの整合** — handover §5.1 が sacct について "ライセンス的に重い" と明記している通り、KUDPC は CLI 呼び出し負荷を懸念事項として挙げている。`--wait` で sbatch CLI を hours オーダーで保持するより、squeue ポーリング（既存 `wait_terminal` と同等、追加負荷ゼロ）の方が KUDPC 流儀に沿う。
+4. **timeout 制御の単純さ** — `tokio::time::timeout(dur, mgr.run(cmd))` でユーザが包めるため、API 表面は最小。`--wait` 採用なら subprocess kill + scancel + drop 連携の重ね合わせで複雑化する。
+
+**handover §5.3 の意図の解釈**: handover の bullet 2 「`timeout / cancel-on-drop の挙動を明記`」は **「--wait のリスクを書け」と読めると同時に、「リスク回避設計を選ぶ自由度」も含意する**。本 spec はこの自由度を行使し、§6.1 の poll 実装を採用する。
 
 ### 6.1 設計（C-7 採用案: tokio::time::timeout でユーザが包む）
 
@@ -587,22 +612,27 @@ pub enum SbatchRunError {
 
 ### 7.1 naming 規律宣言
 
-Phase 2 で tssrun と sbatch の handle 双方が以下のシグネチャを持つことを **明文化**する（実 trait 化は Phase 3）:
+Phase 2 で tssrun と sbatch の handle 双方が以下のシグネチャを持つことを **明文化**する（実 trait 化は Phase 3）。命名は **handover §5.4 由来のコア 5 names** と、**spec §7.2 の trait 化条件達成時に検討する拡張 2 names** の 2 段階に区別する:
 
 ```rust
 // 規律宣言のみ — concrete trait は Phase 3
 trait JobHandleNaming {
+    // ─── handover §5.4 由来のコア 5 names（Phase 2 で必ず収斂させる） ───
     fn uuid(&self) -> Uuid;
     fn jobid(&self) -> Option<u64>;
     fn is_running(&self) -> bool;
     fn is_finished(&self) -> bool;
     fn exit_code(&self) -> Option<i32>;
+
+    // ─── spec §7.2 の trait 化条件達成時に追加検討（Phase 2 では命名整合のみ） ───
     async fn wait_terminal(&self) -> Result<()>;
     async fn refresh(&self) -> Result<()>;
 }
 ```
 
-Phase 2 PR レビューで既存・新規 handle メソッドがこの命名から逸れる場合は指摘し修正する。
+**Phase 2 で必ず守る範囲**: コア 5 names は `SbatchJobHandle` と `TssrunJobHandle` の両方で **同一シグネチャ**を持つこと。`wait_terminal` / `refresh` の async fn は Phase 2 では命名一致のみ（戻り値型の細部は handle ごとに異なってよい — 例: tssrun には sacct 概念がないので戻り値の error variant が異なる）。
+
+Phase 2 PR レビューで既存・新規 handle メソッドがこの命名から逸れる場合は指摘し修正する。handover §5.4 が明記する **「sbatch の log path / sacct opt-in / array task は tssrun に対応物がない → trait に含めない」** 原則も継承し、Phase 2 でこれらを共通 trait に含めようとしない。
 
 ### 7.2 trait 化を実施する条件
 
@@ -714,6 +744,13 @@ PR は plan 単位 → develop マージ。Plan ごとに `cargo test --lib --fe
 - [ ] `cargo test --lib --features pyo3` / `cargo clippy --all-targets --features pyo3 -- -D warnings` / `cargo fmt --all --check` / `uv run pytest python/tests` 全 pass
 - [ ] Live smoke（KUDPC で実行可能なら）
 - [ ] Plan の依存関係（P1→P5/P6）を尊重
+- [ ] **Phase 1 の「計画見落とし」教訓 6 項目（handover §4）への照合済み**:
+  - [ ] trait/method の存在は `grep` で実存確認してから計画に書いた
+  - [ ] 入力データのバリエーション（KUDPC `RUN`/`QUE`/`CMP` 等）を実物で確認しテストに再現
+  - [ ] 公開 alias 変更は `grep -r` で全 usage 走査済み
+  - [ ] dyn-safe にしたい trait は専用 wrapper trait + 明示 constructor 経由（blanket impl 禁止）
+  - [ ] 公開 attach 経路は kind peek + 拒否テスト追加済み（spec §5.6 含む）
+  - [ ] async 文脈の lock は `tokio::sync::Mutex` のみ
 
 ---
 
