@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 2 P1)
+
+- **sacct `ExitCode` parser.** `SbatchJobHandle::refresh_with_sacct()` now
+  populates `FinishedInfo::exit_code` (and the `exit_code()` getter on
+  `SbatchLifecycle` / `SbatchJobSnapshot` / `SbatchJobHandle`). Sacct is
+  still opt-in. See `parse_sacct_exit_code` in `src/sbatch/parse.rs` and
+  the new `query_job_states_with_exit_code_with` in `src/runner.rs`
+  (the legacy `query_job_states_batch_with` is unchanged for backward compat).
+- **`SbatchCmd::no_requeue: bool`** — emits `--no-requeue` when `true`.
+  Python: `PySbatchCmd(..., no_requeue=True)`.
+- **`SbatchCmd::comment: Option<String>`** — emits `--comment <value>`
+  when `Some`. Python: `PySbatchCmd(..., comment="...")`.
+- **`SbatchJobHandle::log_lines` / `read_log_to_end`** — read job
+  stdout/stderr via `LogStream { Stdout, Stderr }`. Missing files return
+  empty (`Ok(vec![])` / `Ok(String::new())`); template missing returns
+  `LogReadError::PathNotResolved`; other I/O via `LogReadError::Io`.
+  Python: `PySbatchJobHandle.log_lines(stream: int, n: int)` and
+  `read_log_to_end(stream: int)` (`stream`: 0 = stdout, 1 = stderr).
+
+### Refactor (Phase 2 P1)
+
+- **DRY: `absolutize` consolidated to `src/util/path.rs`.** The duplicate
+  `fn absolutize` in `src/sbatch/cmd.rs` and `src/tssrun/cmd.rs`, plus
+  the inline `std::path::absolute` use in `src/manager.rs`, all now go
+  through `crate::util::path::absolutize`. No public API change.
+
+### Docs (Phase 2 P1)
+
+- Removed Phase 1 "this returns None until Phase 2" limitation notes from
+  `exit_code` doc-comments on `SbatchLifecycle`, `SbatchJobSnapshot`, and
+  `SbatchJobHandle`, and from the corresponding Python `.pyi` docstrings.
+
 ### Changed (BREAKING)
 
 - **PR #5: Slurm vocab migration with single-owner pyclass rule.** The
