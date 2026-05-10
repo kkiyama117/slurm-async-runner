@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec, SlurmDependency};
+use crate::entities::slurm::{
+    JobPartition, JobTimeLimit, MailAddress, MailTypeInput, ResourceSpec, SlurmDependency,
+};
 use crate::util::path::absolutize;
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,15 @@ pub struct SbatchCmd {
     /// `--dependency` (`-d`) spec. When `Some`, emitted as `["-d", dep.to_string()]`
     /// (e.g. `["-d", "afterok:200,afterany:201"]`).
     pub dependency: Option<SlurmDependency>,
+
+    /// `--mail-user` value. When `Some`, emitted as `["--mail-user", addr.clone()]`.
+    /// Stored as [`MailAddress`] (a `String` alias from
+    /// `crate::entities::slurm::sbatch_options`).
+    pub mail_user: Option<MailAddress>,
+
+    /// `--mail-type` list. When `Some`, emitted as `["--mail-type", types.to_string()]`
+    /// in the canonical comma-separated Slurm form (e.g. `"BEGIN,END"`).
+    pub mail_types: Option<MailTypeInput>,
 
     pub env: HashMap<String, String>,
 
@@ -55,6 +66,8 @@ impl SbatchCmd {
             error: None,
             chdir: None,
             dependency: None,
+            mail_user: None,
+            mail_types: None,
             env: HashMap::new(),
             no_requeue: false,
             comment: None,
@@ -104,6 +117,14 @@ impl SbatchCmd {
         if let Some(dep) = &self.dependency {
             argv.push("-d".to_string());
             argv.push(dep.to_string());
+        }
+        if let Some(addr) = &self.mail_user {
+            argv.push("--mail-user".to_string());
+            argv.push(addr.clone());
+        }
+        if let Some(mts) = &self.mail_types {
+            argv.push("--mail-type".to_string());
+            argv.push(mts.to_string());
         }
         if self.no_requeue {
             argv.push("--no-requeue".to_string());
@@ -292,5 +313,69 @@ mod tests {
         let cmd = SbatchCmd::new("/w/job.sh");
         let argv = cmd.build_argv().unwrap();
         assert!(!argv.iter().any(|a| a == "-d"));
+    }
+
+    #[test]
+    fn mail_user_emits_flag_and_value() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.mail_user = Some("alice@example.com".to_string());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--mail-user")
+            .expect("--mail-user present");
+        assert_eq!(argv[i + 1], "alice@example.com");
+    }
+
+    #[test]
+    fn mail_user_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "--mail-user"));
+    }
+
+    #[test]
+    fn mail_types_emits_comma_separated_list() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.mail_types = Some("BEGIN,END".to_string().try_into().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--mail-type")
+            .expect("--mail-type present");
+        assert_eq!(argv[i + 1], "BEGIN,END");
+    }
+
+    #[test]
+    fn mail_types_single_value_emits_one_token() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.mail_types = Some("FAIL".to_string().try_into().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--mail-type")
+            .expect("--mail-type present");
+        assert_eq!(argv[i + 1], "FAIL");
+    }
+
+    #[test]
+    fn mail_types_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "--mail-type"));
+    }
+
+    #[test]
+    fn mail_user_and_mail_types_emit_in_stable_order() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.mail_user = Some("bob@example.com".to_string());
+        cmd.mail_types = Some("ALL".to_string().try_into().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let user_idx = argv.iter().position(|a| a == "--mail-user").unwrap();
+        let type_idx = argv.iter().position(|a| a == "--mail-type").unwrap();
+        assert!(
+            user_idx < type_idx,
+            "expected --mail-user before --mail-type, got argv={argv:?}"
+        );
     }
 }
