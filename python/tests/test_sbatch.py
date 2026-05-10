@@ -71,3 +71,24 @@ def test_attach_uuid_round_trips(tmp_path: Path):
         return h.uuid == h2.uuid and h2.jobid == 12345
 
     assert asyncio.run(go())
+
+
+def test_sbatch_cmd_no_requeue_kwarg(tmp_path):
+    """no_requeue=True kwarg should produce --no-requeue in argv."""
+    job = tmp_path / "job.sh"
+    job.write_text("#!/bin/sh\necho hi\n")
+
+    cmd = SbatchCmd(str(job), no_requeue=True)
+    argv = cmd.build_argv()
+    assert "--no-requeue" in argv
+
+
+def test_sbatch_cmd_comment_kwarg(tmp_path):
+    """comment kwarg should produce --comment <value> in argv."""
+    job = tmp_path / "job.sh"
+    job.write_text("#!/bin/sh\necho hi\n")
+
+    cmd = SbatchCmd(str(job), comment="phase 2 smoke")
+    argv = cmd.build_argv()
+    i = argv.index("--comment")
+    assert argv[i + 1] == "phase 2 smoke"

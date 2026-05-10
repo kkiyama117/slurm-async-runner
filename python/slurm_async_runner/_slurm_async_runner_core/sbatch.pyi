@@ -33,6 +33,8 @@ class SbatchCmd:
         chdir: builtins.str | os.PathLike[builtins.str] | None = None,
         env: builtins.dict[builtins.str, builtins.str] | None = None,
         args: builtins.list[builtins.str] | None = None,
+        no_requeue: builtins.bool = False,
+        comment: builtins.str | None = None,
     ) -> None: ...
 
 @final
@@ -45,12 +47,6 @@ class SbatchJobHandle:
     ``Some(int)`` for spawned/attached handles since sbatch always
     returns a jobid; the ``Optional[int]`` return shape mirrors the
     underlying Rust trait but the value is never ``None`` in practice.
-
-    Note (Phase 1 limitation): ``exit_code()`` returns ``None`` even
-    after a successful ``refresh_with_sacct()`` call. The sacct
-    ``ExitCode`` column is not yet parsed by the underlying Rust
-    implementation. A future release will extend the sacct parser to
-    capture exit codes.
     """
 
     @property
@@ -77,6 +73,23 @@ class SbatchJobHandle:
     def refresh(self) -> Awaitable[None]: ...
     def refresh_with_sacct(self) -> Awaitable[None]: ...
     def wait_terminal(self, poll_interval_secs: builtins.float) -> Awaitable[None]: ...
+    def log_lines(
+        self, stream: builtins.int, n: builtins.int
+    ) -> Awaitable[builtins.list[builtins.str]]:
+        """Read the last ``n`` lines of the job's stdout (stream=0) or stderr (stream=1).
+
+        Returns an empty list if the log file does not yet exist.
+        Raises ``ValueError`` if ``stream`` is not 0 or 1.
+        """
+        ...
+
+    def read_log_to_end(self, stream: builtins.int) -> Awaitable[builtins.str]:
+        """Read the full contents of the job's stdout (0) or stderr (1) log.
+
+        Returns an empty string if the log file does not yet exist.
+        Same error semantics as ``log_lines``.
+        """
+        ...
 
 @final
 class SbatchManager:
