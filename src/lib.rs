@@ -10,6 +10,7 @@ pub use py_export::stub_info;
 pub mod dispatcher;
 pub mod manager;
 pub mod runner;
+pub mod sbatch;
 pub mod tssrun;
 
 // Re-export the SLURM lifecycle types from the crate-local entities module.
