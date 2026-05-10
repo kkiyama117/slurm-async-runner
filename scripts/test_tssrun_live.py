@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     # the SKIP path doesn't require the extension to be built.
     from slurm_async_runner._slurm_async_runner_core.tssrun import (
         JobStateStore,
-        Resource,
+        ResourceSpec,
         TssrunCmd,
         TssrunManager,
     )
@@ -127,24 +127,15 @@ def _build_child_script(workdir: Path) -> Path:
     return script
 
 
-def _parse_resource(rsc_raw: str | None, Resource: type[Resource]) -> Resource | None:
-    """Parse ``"p=1:c=1:m=512M"`` into a ``Resource``. Unknown keys are
-    silently ignored; the renderer reproduces them anyway for the known
-    fields."""
+def _parse_resource(
+    rsc_raw: str | None, ResourceSpec: type[ResourceSpec]
+) -> ResourceSpec | None:
+    """Parse ``"p=1:c=1:m=512M"`` into a ``ResourceSpec`` via the Rust-side
+    canonical parser, so this script and the production code share the same
+    grammar."""
     if rsc_raw is None:
         return None
-    kv: dict[str, str] = {}
-    for part in rsc_raw.split(":"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            kv[k.strip()] = v.strip()
-    return Resource(
-        processes=int(kv["p"]) if "p" in kv else None,
-        threads=int(kv["t"]) if "t" in kv else None,
-        cores=int(kv["c"]) if "c" in kv else None,
-        memory=kv.get("m"),
-        gpus=int(kv["g"]) if "g" in kv else None,
-    )
+    return ResourceSpec.from_str(rsc_raw)
 
 
 async def _exercise_backend(
@@ -328,7 +319,8 @@ async def _run() -> int:
     # Imported lazily so the SKIP path doesn't require the extension to be
     # built (e.g. on a fresh clone before `maturin develop`).
     from slurm_async_runner._slurm_async_runner_core.tssrun import (
-        Resource,
+        JobTimeLimit,
+        ResourceSpec,
         TssrunCmd,
         TssrunManager,
         file_log_sink,
@@ -339,12 +331,12 @@ async def _run() -> int:
     with tempfile.TemporaryDirectory(prefix="tssrun-live-") as td_str:
         td = Path(td_str)
         script_path = _build_child_script(td)
-        rsc = _parse_resource(rsc_raw, Resource)
+        rsc = _parse_resource(rsc_raw, ResourceSpec)
 
         cmd = TssrunCmd(
             program=str(script_path),
-            queue=queue,
-            time_limit=time_limit,
+            partition=queue,
+            time_limit=JobTimeLimit(time_limit),
             rsc=rsc,
             tssrun_bin=bin_path,
         )
