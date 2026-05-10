@@ -87,6 +87,13 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// True for states that mean "the job is currently using compute".
+    /// Per SLURM convention: only `Running` qualifies. Pending/Configuring
+    /// /Suspended/etc. do NOT count as running.
+    pub fn is_running(&self) -> bool {
+        matches!(self, JobState::Running)
+    }
+
     /// Parse a raw `squeue` / `sacct` state token.
     ///
     /// Accepts SLURM long forms (`"PENDING"`, `"OUT_OF_MEMORY"`, …),
