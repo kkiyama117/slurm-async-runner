@@ -92,3 +92,32 @@ def test_sbatch_cmd_comment_kwarg(tmp_path):
     argv = cmd.build_argv()
     i = argv.index("--comment")
     assert argv[i + 1] == "phase 2 smoke"
+
+
+def test_sbatch_cmd_dependency_kwarg(tmp_path):
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmDependency,
+    )
+
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho hi\n")
+    cmd = SbatchCmd(str(job), dependency=SlurmDependency.parse("afterok:200"))
+    assert cmd is not None
+
+
+def test_sbatch_cmd_mail_user_kwarg(tmp_path):
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho hi\n")
+    cmd = SbatchCmd(str(job), mail_user="alice@example.com")
+    assert cmd is not None
+
+
+def test_sbatch_cmd_mail_types_kwarg(tmp_path):
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        MailTypeInput,
+    )
+
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho hi\n")
+    cmd = SbatchCmd(str(job), mail_types=MailTypeInput.parse("BEGIN,END"))
+    assert cmd is not None
