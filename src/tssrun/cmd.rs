@@ -17,9 +17,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use anyhow::Result;
+
 use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
 use crate::util::path::absolutize;
-use anyhow::Result;
 
 /// Spec for a single `tssrun` invocation. Pure data + an argv builder —
 /// no subprocess work. Mirrors [`crate::manager::SlurmCmd`] in spirit but

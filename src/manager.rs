@@ -54,7 +54,7 @@ impl SlurmCmd {
 
     /// Build the argv that would dispatch `batch_file`.
     ///
-    /// The path is resolved to absolute form via [`crate::util::path::absolutize`]
+    /// The path is resolved to absolute form via `crate::util::path::absolutize`
     /// (matches Python `Path.absolute()` — no symlink resolution, no
     /// existence requirement).
     pub fn build_argv(&self, batch_file: &Path) -> Result<Vec<String>> {
