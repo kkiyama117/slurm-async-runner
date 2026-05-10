@@ -19,6 +19,9 @@ use slurm_async_runner::{
     SlurmCmd, SlurmManager,
     JobDispatcher, TokioDispatcher, DryRunDispatcher,
     JobStatus, JobState, JobReason,
+    // tssrun vocabulary lives in this crate (migrated out of gaussian_job_shared in PR #5):
+    JobPartition, JobTimeLimit, Memory, MemoryUnit,
+    ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
     query_job_states_batch, query_job_states_batch_with,
 };
 use std::path::Path;
@@ -50,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
 import asyncio
 from slurm_async_runner._slurm_async_runner_core.manager import SlurmCmd, SlurmManager
 from slurm_async_runner._slurm_async_runner_core.runner import query_job_states_batch
-from gaussian_job_shared._core.entities.slurm.status import JobStatus
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.status import JobStatus
 
 async def main():
     manager = SlurmManager()                      # launcher = "srun"
@@ -68,10 +71,13 @@ asyncio.run(main())
 ```
 
 `JobStatus` carries `(state, reason)` and is parsed from SLURM's `squeue`
-output (`-o "%i %T %r"`) with an `sacct` fallback for completed jobs. See
-[`gaussian_job_shared`](https://github.com/kkiyama117/gaussian_job_shared) for
-the full state/reason taxonomies (24 official states, ~80 reason codes, with
-`Unknown` / `Other(String)` forward-compat fallbacks).
+output (`-o "%i %T %r"`) with an `sacct` fallback for completed jobs. The
+state/reason vocabularies (24 official states, ~80 reason codes, with
+`Unknown` / `Other(String)` forward-compat fallbacks) live in this crate's
+`entities::slurm` module, re-exposed to Python via
+`slurm_async_runner._slurm_async_runner_core.entities.slurm.*`. They were
+migrated out of [`gaussian_job_shared`](https://github.com/kkiyama117/gaussian_job_shared)
+in PR #5 (single-owner rule for pyclass wrappers).
 
 ## Architecture
 
@@ -101,25 +107,44 @@ and snapshot-based environment inspection.
 ```python
 import asyncio
 from slurm_async_runner._slurm_async_runner_core.tssrun import (
-    Resource, TssrunCmd, TssrunManager, file_log_sink,
+    JobTimeLimit, ResourceSpec, TssrunCmd, TssrunManager,
+    file_log_sink, file_system_state_store,
+)
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+    Memory,
 )
 
 async def main():
     cmd = TssrunCmd(
         program="/work/job.sh",
-        queue="gr19999b", time_limit="1:00:00",
-        rsc=Resource(processes=4, memory="2G"),
+        partition="gr19999b",
+        time_limit=JobTimeLimit("1:00:00"),
+        rsc=ResourceSpec(processes=4, memory=Memory("2G")),
     )
     sink = await file_log_sink("/tmp/job.out", "/tmp/job.err")
-    manager = TssrunManager(cmd, state_dir="/var/lib/slurm-runner", log_sink=sink)
+    manager = TssrunManager(
+        cmd,
+        store=file_system_state_store("/var/lib/slurm-runner"),
+        log_sink=sink,
+    )
 
     handle = await manager.spawn()
-    print("pid", await handle.pid, "jobid", await handle.jobid)
+    print("uuid", await handle.uuid, "pid", await handle.pid, "jobid", await handle.jobid)
     code = await handle.wait()  # int on normal exit, None on signal kill
     print("exit", code)
 
 asyncio.run(main())
 ```
+
+> **PR #5 migration note.** `Resource(processes=4, memory="2G")` is gone —
+> use `ResourceSpec(processes=4, memory=Memory("2G"))` instead. `queue=`
+> was renamed to `partition=` (matching Slurm's `--partition` flag), and
+> `time_limit=` now expects a `JobTimeLimit(...)` value instead of a raw
+> string. `TssrunManager` no longer accepts `state_dir=`; pass
+> `store=file_system_state_store(path)` (or omit `store=` for the default
+> in-memory backend). `ResourceSpec` and `JobTimeLimit` are re-exported
+> from the `tssrun` submodule for one-stop import; `Memory` lives in
+> `entities.slurm.sbatch_options`.
 
 ### Handle API contract
 
@@ -143,6 +168,7 @@ The full snapshot surface:
 
 | Reader (lock-free) | Returns | Notes |
 |---|---|---|
+| `await handle.uuid` | `str` | UUID v7 primary key (canonical hyphenated string). Pass straight back to `attach_uuid` |
 | `await handle.pid` | `int` | The OS pid of the spawned `tssrun` process |
 | `await handle.jobid` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
 | `await handle.node` | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
@@ -157,19 +183,25 @@ The full snapshot surface:
 
 ### Cross-process attach
 
-`TssrunManager` persists a JSON snapshot to `{state_dir}/{pid}.json`
-(atomic rename) every time `salloc:` parsing or wait completion updates
-the state. A separate process can re-attach with read-only semantics:
+When configured with `store=file_system_state_store(path)`, `TssrunManager`
+persists a JSON snapshot to `{path}/{uuid}.json` (atomic rename, UUID v7
+primary key) every time `salloc:` parsing or wait completion updates the
+state. A separate process can re-attach with read-only semantics:
 
 ```python
-attached = await manager.attach_pid(12345)         # by pid
-attached = await manager.attach_jobid(102362)      # by parsed jobid (scans state_dir)
-attached = await manager.attach_file("/path/to/12345.json")
+# Recommended: O(1) lookup by UUID v7 primary key (the canonical reference)
+attached = await manager.attach_uuid("01900000-0000-7000-8000-000000000000")
+
+# Best-effort fallbacks (linear scan over the state dir)
+attached = await manager.attach_pid(12345)
+attached = await manager.attach_jobid(102362)      # only after salloc: parsing
+attached = await manager.attach_file("/path/to/01900000-0000-7000-8000-000000000000.json")
 ```
 
 Attached handles support every snapshot getter (they reflect the JSON's
 last-known state) but `wait()` raises — only the original spawner owns
-the child.
+the child. Pids can be recycled by the kernel, so prefer `attach_uuid`
+for any long-lived reference.
 
 ### Live smoke test on kudpc / ECCS
 
@@ -220,8 +252,9 @@ uv run maturin develop                    # builds + installs the extension
 uv run pytest python/tests -v
 uv run ruff check python/
 
-# Regenerate .pyi stubs (for sync types only — async pyfunctions and submodule
-# pyclasses are hand-written under python/slurm_async_runner/_core/*.pyi).
+# Regenerate .pyi stubs (for sync types and #[gen_stub_pyclass] entries — async
+# pyfunctions and lock-free getters are hand-written under
+# python/slurm_async_runner/_slurm_async_runner_core/{manager,runner,tssrun}.pyi).
 # Re-run ruff format afterwards because pyo3-stub-gen output isn't ruff-formatted.
 cargo run --bin stub_gen && uv run ruff format python/
 ```
