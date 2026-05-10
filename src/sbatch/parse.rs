@@ -41,6 +41,30 @@ pub fn resolve_log_path(template: &str, jobid: u64, job_name: Option<&str>) -> P
     PathBuf::from(s)
 }
 
+/// Parse sacct's `ExitCode` column ("<exit>:<signal>") into an i32 exit code.
+///
+/// Slurm の sacct は次のような形を返す:
+/// - `"0:0"` — 正常終了
+/// - `"139:0"` — exit code 139（プロセスが直接 exit 139 を返した）
+/// - `"0:9"` — シグナル SIGKILL で終了。shell convention で 128+9=137 が exit
+/// - `"139:11"` — シグナル SIGSEGV、shell convention で 128+11=139
+///
+/// シグナル成分 (`:<signal>`) が **非ゼロ** のときは shell convention に従い
+/// `128 + signal` を返す。両成分がゼロまたは exit のみ非ゼロなら exit を返す。
+/// 形式不正は `None`。
+// Phase 2 P1 Task 3: parser landed; consumer wired in Task 4 (runner.rs).
+#[allow(dead_code)]
+pub(crate) fn parse_sacct_exit_code(field: &str) -> Option<i32> {
+    let (exit_s, signal_s) = field.split_once(':')?;
+    let exit = exit_s.parse::<i32>().ok()?;
+    let signal = signal_s.parse::<i32>().ok()?;
+    if signal != 0 {
+        Some(128 + signal)
+    } else {
+        Some(exit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +130,39 @@ Submitted batch job 67890
     fn resolve_leaves_unsupported_tokens_raw() {
         let p = resolve_log_path("%A_%a-%u-%N-%j.out", 999, Some("nm"));
         assert_eq!(p, PathBuf::from("%A_%a-%u-%N-999.out"));
+    }
+
+    // ---- parse_sacct_exit_code ----
+
+    #[test]
+    fn parses_clean_zero_exit() {
+        assert_eq!(parse_sacct_exit_code("0:0"), Some(0));
+    }
+
+    #[test]
+    fn parses_nonzero_exit_no_signal() {
+        assert_eq!(parse_sacct_exit_code("139:0"), Some(139));
+    }
+
+    #[test]
+    fn parses_signal_kill_with_zero_exit() {
+        // SIGKILL = 9 -> shell convention 128 + 9 = 137
+        assert_eq!(parse_sacct_exit_code("0:9"), Some(137));
+    }
+
+    #[test]
+    fn parses_signal_segv_with_nonzero_exit() {
+        // SIGSEGV = 11 -> shell convention 128 + 11 = 139.
+        // Slurm sometimes emits "139:11" — signal field is authoritative.
+        assert_eq!(parse_sacct_exit_code("139:11"), Some(139));
+    }
+
+    #[test]
+    fn rejects_garbled_field() {
+        assert_eq!(parse_sacct_exit_code(""), None);
+        assert_eq!(parse_sacct_exit_code("abc"), None);
+        assert_eq!(parse_sacct_exit_code(":0"), None);
+        assert_eq!(parse_sacct_exit_code("0:"), None);
+        assert_eq!(parse_sacct_exit_code("0"), None);
     }
 }
