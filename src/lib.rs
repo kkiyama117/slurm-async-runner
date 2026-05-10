@@ -1,6 +1,8 @@
 pub mod entities;
 pub mod error;
 pub mod store;
+// Crate-internal utilities — not part of the public API.
+mod util;
 
 #[cfg(feature = "pyo3")]
 pub mod py_export;
