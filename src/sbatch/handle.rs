@@ -77,11 +77,6 @@ impl SbatchLifecycle {
 
     /// Exit code if the child exited normally; `None` if killed by signal,
     /// or if `finished` is not yet recorded.
-    ///
-    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
-    /// parse the sacct `ExitCode` column, so this method returns `None`
-    /// even after a successful `refresh_with_sacct()` call. A future
-    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.finished.as_ref().and_then(|f| f.exit_code)
     }
@@ -110,11 +105,6 @@ impl SbatchJobSnapshot {
     }
     /// Exit code if the child exited normally; `None` if killed by signal,
     /// or if `finished` is not yet recorded.
-    ///
-    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
-    /// parse the sacct `ExitCode` column, so this method returns `None`
-    /// even after a successful `refresh_with_sacct()` call. A future
-    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.lifecycle.exit_code()
     }
@@ -211,11 +201,6 @@ impl SbatchJobHandle {
 
     /// Exit code if the child exited normally; `None` if killed by signal,
     /// or if `finished` is not yet recorded.
-    ///
-    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
-    /// parse the sacct `ExitCode` column, so this method returns `None`
-    /// even after a successful `refresh_with_sacct()` call. A future
-    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.0.snapshot_tx.borrow().exit_code()
     }
@@ -272,14 +257,20 @@ impl SbatchJobHandle {
         let _guard = inner.refresh_lock.lock().await;
         let view = crate::dispatcher::DynView(&*inner.dispatcher);
 
-        let map = crate::runner::query_job_states_batch_with(&view, &[snap.jobid]).await?;
-        let final_status = map.get(&snap.jobid).cloned().unwrap_or_default();
+        // Phase 2 P1: switch to the exit-code-aware query so we can populate
+        // FinishedInfo::exit_code instead of leaving it None.
+        let map = crate::runner::query_job_states_with_exit_code_with(&view, &[snap.jobid]).await?;
+        let outcome = map
+            .get(&snap.jobid)
+            .cloned()
+            .unwrap_or(crate::runner::JobOutcome {
+                status: JobStatus::default(),
+                exit_code: None,
+            });
         snap.lifecycle.finished = Some(FinishedInfo {
-            final_state: final_status.state,
-            final_reason: final_status.reason,
-            // sacct's ExitCode is not currently parsed by query_job_states_batch_with;
-            // surface as None for now. Phase 2 may extend the parser.
-            exit_code: None,
+            final_state: outcome.status.state,
+            final_reason: outcome.status.reason,
+            exit_code: outcome.exit_code,
             finished_at: chrono::Utc::now(),
         });
         inner.store.save(&snap).await?;
@@ -551,12 +542,46 @@ mod tests {
         use crate::store::InMemoryStateStore;
         let s = snap(12345);
         let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
-        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None\n"));
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None|0:0\n"));
         let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
         let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
         let after = h.refresh_with_sacct().await.unwrap();
         assert!(after.lifecycle.finished.is_some());
         assert_eq!(canned.sacct_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_with_sacct_populates_exit_code_on_completed() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // sacct now emits 4 columns (JobID|State|Reason|ExitCode)
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None|0:0\n"));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        let finished = after.lifecycle.finished.expect("finished should be Some");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn refresh_with_sacct_populates_exit_code_on_signaled() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|CANCELLED|None|0:9\n"));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        let finished = after.lifecycle.finished.expect("finished should be Some");
+        // SIGKILL = 9 -> 128 + 9 = 137
+        assert_eq!(finished.exit_code, Some(137));
     }
 
     #[tokio::test]
