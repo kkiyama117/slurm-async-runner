@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
@@ -55,8 +57,8 @@ impl<S: JobSnapshot> InMemoryStateStore<S> {
     }
     pub fn len(&self) -> usize {
         self.inner
-            .lock()
-            .expect("InMemoryStateStore poisoned")
+            .try_lock()
+            .expect("InMemoryStateStore.len contended; this should not happen in a test/dev store")
             .len()
     }
     pub fn is_empty(&self) -> bool {
@@ -67,27 +69,18 @@ impl<S: JobSnapshot> InMemoryStateStore<S> {
 #[async_trait]
 impl<S: JobSnapshot> JobStateStore<S> for InMemoryStateStore<S> {
     async fn save(&self, snap: &S) -> Result<()> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("InMemoryStateStore mutex poisoned"))?;
+        let mut g = self.inner.lock().await;
         g.insert(snap.uuid(), snap.clone());
         Ok(())
     }
 
     async fn load(&self, uuid: Uuid) -> Result<Option<S>> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("InMemoryStateStore mutex poisoned"))?;
+        let g = self.inner.lock().await;
         Ok(g.get(&uuid).cloned())
     }
 
     async fn list(&self) -> Result<Vec<S>> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("InMemoryStateStore mutex poisoned"))?;
+        let g = self.inner.lock().await;
         Ok(g.values().cloned().collect())
     }
 }

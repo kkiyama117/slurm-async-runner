@@ -45,6 +45,12 @@ class SbatchJobHandle:
     ``Some(int)`` for spawned/attached handles since sbatch always
     returns a jobid; the ``Optional[int]`` return shape mirrors the
     underlying Rust trait but the value is never ``None`` in practice.
+
+    Note (Phase 1 limitation): ``exit_code()`` returns ``None`` even
+    after a successful ``refresh_with_sacct()`` call. The sacct
+    ``ExitCode`` column is not yet parsed by the underlying Rust
+    implementation. A future release will extend the sacct parser to
+    capture exit codes.
     """
 
     @property

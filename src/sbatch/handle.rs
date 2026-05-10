@@ -75,6 +75,13 @@ impl SbatchLifecycle {
         self.finished.is_some()
     }
 
+    /// Exit code if the child exited normally; `None` if killed by signal,
+    /// or if `finished` is not yet recorded.
+    ///
+    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
+    /// parse the sacct `ExitCode` column, so this method returns `None`
+    /// even after a successful `refresh_with_sacct()` call. A future
+    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.finished.as_ref().and_then(|f| f.exit_code)
     }
@@ -101,6 +108,13 @@ impl SbatchJobSnapshot {
     pub fn is_finished(&self) -> bool {
         self.lifecycle.is_finished()
     }
+    /// Exit code if the child exited normally; `None` if killed by signal,
+    /// or if `finished` is not yet recorded.
+    ///
+    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
+    /// parse the sacct `ExitCode` column, so this method returns `None`
+    /// even after a successful `refresh_with_sacct()` call. A future
+    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.lifecycle.exit_code()
     }
@@ -195,6 +209,13 @@ impl SbatchJobHandle {
         self.0.snapshot_tx.borrow().is_finished()
     }
 
+    /// Exit code if the child exited normally; `None` if killed by signal,
+    /// or if `finished` is not yet recorded.
+    ///
+    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
+    /// parse the sacct `ExitCode` column, so this method returns `None`
+    /// even after a successful `refresh_with_sacct()` call. A future
+    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.0.snapshot_tx.borrow().exit_code()
     }

@@ -14,7 +14,7 @@ use crate::sbatch::handle::{
     LogPathSpec, SbatchAttachKey, SbatchJobHandle, SbatchJobSnapshot, SbatchLifecycle,
 };
 use crate::sbatch::parse::parse_submitted_jobid;
-use crate::store::{FileSystemStateStore, InMemoryStateStore, JobStateStore};
+use crate::store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
 
 #[derive(Clone)]
 pub struct SbatchManager {
@@ -99,7 +99,17 @@ impl SbatchManager {
             SbatchAttachKey::JobId(j) => self.store.find_by_jobid(j).await?,
             SbatchAttachKey::File(path) => {
                 let bytes = tokio::fs::read(&path).await?;
-                Some(serde_json::from_slice(&bytes)?)
+                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if let Some(k) = value.get("kind").and_then(|v| v.as_str())
+                    && k != <SbatchJobSnapshot as JobSnapshot>::kind()
+                {
+                    return Err(anyhow!(
+                        "snapshot file kind mismatch: expected '{}', got '{}'",
+                        <SbatchJobSnapshot as JobSnapshot>::kind(),
+                        k
+                    ));
+                }
+                Some(serde_json::from_value(value)?)
             }
         }
         .ok_or_else(|| anyhow!("snapshot not found"))?;
@@ -216,6 +226,25 @@ mod tests {
         let _ = mgr.spawn().await.unwrap();
         let attached = mgr.attach_jobid(77).await.unwrap();
         assert_eq!(attached.jobid(), Some(77));
+    }
+
+    #[tokio::test]
+    async fn attach_file_rejects_wrong_kind_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wrong.json");
+        // A snapshot with a different kind field — kind check fires before schema decode.
+        std::fs::write(&path, r#"{"kind":"tssrun"}"#).unwrap();
+
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::ok(1));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+        match mgr.attach_file(&path).await {
+            Ok(_) => panic!("attach_file should fail on wrong kind"),
+            Err(e) => assert!(
+                e.to_string().contains("kind mismatch"),
+                "expected 'kind mismatch' in error, got: {e}"
+            ),
+        }
     }
 
     #[tokio::test]
