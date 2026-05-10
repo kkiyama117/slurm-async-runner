@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -43,6 +44,56 @@ pub trait JobDispatcher: Send + Sync {
     /// Spawn `argv` and capture stdout. Returns `(exit_code, stdout)`;
     /// stderr is discarded. Used for `squeue` / `sacct` style queries.
     fn capture(&self, argv: &[String]) -> impl Future<Output = Result<(i32, String)>> + Send;
+}
+
+/// Dyn-compatible facade over [`JobDispatcher`] so callers can hold
+/// `Arc<dyn DynJobDispatcher>` (RPITIT prevents `Arc<dyn JobDispatcher>`
+/// directly).
+///
+/// Use [`into_dyn`] to convert any `D: JobDispatcher` into an
+/// `Arc<dyn DynJobDispatcher>`.
+pub trait DynJobDispatcher: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        argv: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<i32>> + Send + 'a>>;
+
+    fn capture<'a>(
+        &'a self,
+        argv: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<(i32, String)>> + Send + 'a>>;
+}
+
+/// Newtype adapter that wraps any [`JobDispatcher`] impl and exposes the
+/// dyn-compatible [`DynJobDispatcher`] interface.  Use [`into_dyn`] as the
+/// ergonomic constructor.
+pub struct DynDispatcherAdapter<D: JobDispatcher>(pub D);
+
+impl<D: JobDispatcher + Send + Sync> DynJobDispatcher for DynDispatcherAdapter<D> {
+    fn run<'a>(
+        &'a self,
+        argv: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<i32>> + Send + 'a>> {
+        Box::pin(<D as JobDispatcher>::run(&self.0, argv))
+    }
+
+    fn capture<'a>(
+        &'a self,
+        argv: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<(i32, String)>> + Send + 'a>> {
+        Box::pin(<D as JobDispatcher>::capture(&self.0, argv))
+    }
+}
+
+/// Wrap a [`JobDispatcher`] into an `Arc<dyn DynJobDispatcher>`.
+///
+/// ```rust,ignore
+/// let d: Arc<dyn DynJobDispatcher> = into_dyn(DryRunDispatcher);
+/// ```
+pub fn into_dyn<D: JobDispatcher + Send + Sync + 'static>(
+    d: D,
+) -> std::sync::Arc<dyn DynJobDispatcher> {
+    std::sync::Arc::new(DynDispatcherAdapter(d))
 }
 
 // --------------------------------------------------------- TokioDispatcher

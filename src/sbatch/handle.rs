@@ -6,13 +6,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use tokio::sync::{Mutex as TokioMutex, watch};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::dispatcher::DynJobDispatcher;
 use crate::entities::slurm::JobPartition;
 use crate::sbatch::parse::resolve_log_path;
+use crate::store::JobStateStore;
 use crate::{JobReason, JobState, JobStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +113,93 @@ pub enum SbatchAttachKey {
     File(PathBuf),
 }
 
+/// Cheap-to-clone handle to an in-flight or attached sbatch job. All
+/// snapshot reads are lock-free; `refresh` / `refresh_with_sacct` /
+/// `wait_terminal` serialize through `refresh_lock`.
+#[derive(Clone)]
+pub struct SbatchJobHandle(pub(crate) Arc<SbatchJobHandleInner>);
+
+pub(crate) struct SbatchJobHandleInner {
+    pub(crate) snapshot_tx: watch::Sender<SbatchJobSnapshot>,
+    pub(crate) store: Arc<dyn JobStateStore<SbatchJobSnapshot>>,
+    pub(crate) dispatcher: Arc<dyn DynJobDispatcher>,
+    pub(crate) refresh_lock: TokioMutex<()>,
+}
+
+impl SbatchJobHandle {
+    pub(crate) fn new(
+        snapshot: SbatchJobSnapshot,
+        store: Arc<dyn JobStateStore<SbatchJobSnapshot>>,
+        dispatcher: Arc<dyn DynJobDispatcher>,
+    ) -> Self {
+        let (tx, _rx) = watch::channel(snapshot);
+        Self(Arc::new(SbatchJobHandleInner {
+            snapshot_tx: tx,
+            store,
+            dispatcher,
+            refresh_lock: TokioMutex::new(()),
+        }))
+    }
+
+    // -------- Lock-free snapshot reads --------
+
+    pub fn snapshot(&self) -> SbatchJobSnapshot {
+        self.0.snapshot_tx.borrow().clone()
+    }
+
+    pub fn watch(&self) -> watch::Receiver<SbatchJobSnapshot> {
+        self.0.snapshot_tx.subscribe()
+    }
+
+    pub fn uuid(&self) -> Uuid {
+        self.0.snapshot_tx.borrow().uuid
+    }
+
+    pub fn jobid(&self) -> Option<u64> {
+        Some(self.0.snapshot_tx.borrow().jobid)
+    }
+
+    pub fn partition(&self) -> Option<JobPartition> {
+        self.0.snapshot_tx.borrow().partition.clone()
+    }
+
+    pub fn job_name(&self) -> Option<String> {
+        self.0.snapshot_tx.borrow().job_name.clone()
+    }
+
+    pub fn sent_env(&self) -> HashMap<String, String> {
+        self.0.snapshot_tx.borrow().sent_env.clone()
+    }
+
+    pub fn output_template(&self) -> Option<String> {
+        self.0.snapshot_tx.borrow().log.output_template.clone()
+    }
+
+    pub fn error_template(&self) -> Option<String> {
+        self.0.snapshot_tx.borrow().log.error_template.clone()
+    }
+
+    pub fn output_path(&self) -> Option<PathBuf> {
+        self.0.snapshot_tx.borrow().output_path()
+    }
+
+    pub fn error_path(&self) -> Option<PathBuf> {
+        self.0.snapshot_tx.borrow().error_path()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.0.snapshot_tx.borrow().is_running()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.0.snapshot_tx.borrow().is_finished()
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.0.snapshot_tx.borrow().exit_code()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +264,38 @@ mod tests {
         });
         assert!(s.is_finished());
         assert_eq!(s.exit_code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn handle_lock_free_getters_return_initial_snapshot() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(99);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        assert_eq!(h.uuid(), s.uuid);
+        assert_eq!(h.jobid(), Some(99));
+        assert_eq!(h.job_name().as_deref(), Some("g09run"));
+        assert_eq!(h.output_path(), Some(PathBuf::from("slurm-99.out")));
+        assert!(!h.is_running());
+        assert!(!h.is_finished());
+    }
+
+    #[tokio::test]
+    async fn handle_clone_shares_inner() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(1);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h1 = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let h2 = h1.clone();
+        assert_eq!(h1.uuid(), h2.uuid());
+        let _r1 = h1.watch();
+        let _r2 = h2.watch();
     }
 }
