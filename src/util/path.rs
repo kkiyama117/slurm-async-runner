@@ -9,9 +9,6 @@ use std::path::Path;
 ///
 /// Returns an error if `std::path::absolute` fails (e.g. CWD unreadable)
 /// or if the resulting path is not valid UTF-8.
-// Phase 2 P1 Task 1 introduces this helper; Task 2 migrates the three
-// existing call sites to it. The `allow(dead_code)` is removed in Task 2.
-#[allow(dead_code)]
 pub(crate) fn absolutize(p: &Path) -> Result<String> {
     let abs =
         std::path::absolute(p).with_context(|| format!("failed to absolutize {}", p.display()))?;

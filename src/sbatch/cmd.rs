@@ -6,11 +6,12 @@
 //! are still respected; CLI flags only override per the sbatch convention.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
+use crate::util::path::absolutize;
 
 #[derive(Debug, Clone)]
 pub struct SbatchCmd {
@@ -91,14 +92,6 @@ impl SbatchCmd {
         argv.extend(self.args.iter().cloned());
         Ok(argv)
     }
-}
-
-fn absolutize(p: &Path) -> Result<String> {
-    let abs =
-        std::path::absolute(p).with_context(|| format!("failed to absolutize {}", p.display()))?;
-    abs.into_os_string()
-        .into_string()
-        .map_err(|os| anyhow::anyhow!("non-UTF8 path: {os:?}"))
 }
 
 /// Render `--export=ALL,K1=V1,K2=V2,...` with deterministic key order
