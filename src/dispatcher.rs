@@ -24,6 +24,12 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
+/// Boxed future returned by [`DynJobDispatcher::run`].
+type DynRunFut<'a> = Pin<Box<dyn Future<Output = Result<i32>> + Send + 'a>>;
+
+/// Boxed future returned by [`DynJobDispatcher::capture`].
+type DynCaptureFut<'a> = Pin<Box<dyn Future<Output = Result<(i32, String)>> + Send + 'a>>;
+
 /// Abstract subprocess launcher used by the SLURM glue.
 ///
 /// `run` is for fire-and-forget work (`srun job.sh`) where only the
@@ -53,15 +59,9 @@ pub trait JobDispatcher: Send + Sync {
 /// Use [`into_dyn`] to convert any `D: JobDispatcher` into an
 /// `Arc<dyn DynJobDispatcher>`.
 pub trait DynJobDispatcher: Send + Sync {
-    fn run<'a>(
-        &'a self,
-        argv: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Result<i32>> + Send + 'a>>;
+    fn run<'a>(&'a self, argv: &'a [String]) -> DynRunFut<'a>;
 
-    fn capture<'a>(
-        &'a self,
-        argv: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Result<(i32, String)>> + Send + 'a>>;
+    fn capture<'a>(&'a self, argv: &'a [String]) -> DynCaptureFut<'a>;
 }
 
 /// Newtype adapter that wraps any [`JobDispatcher`] impl and exposes the
@@ -70,17 +70,11 @@ pub trait DynJobDispatcher: Send + Sync {
 pub struct DynDispatcherAdapter<D: JobDispatcher>(pub D);
 
 impl<D: JobDispatcher + Send + Sync> DynJobDispatcher for DynDispatcherAdapter<D> {
-    fn run<'a>(
-        &'a self,
-        argv: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Result<i32>> + Send + 'a>> {
+    fn run<'a>(&'a self, argv: &'a [String]) -> DynRunFut<'a> {
         Box::pin(<D as JobDispatcher>::run(&self.0, argv))
     }
 
-    fn capture<'a>(
-        &'a self,
-        argv: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = Result<(i32, String)>> + Send + 'a>> {
+    fn capture<'a>(&'a self, argv: &'a [String]) -> DynCaptureFut<'a> {
         Box::pin(<D as JobDispatcher>::capture(&self.0, argv))
     }
 }
