@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 2 P2)
+
+- **`SbatchCmd::dependency: Option<SlurmDependency>`** — emits `["-d", dep.to_string()]`.
+  Reuses `crate::entities::slurm::SlurmDependency` (already implements `FromStr` /
+  `Display` for `afterok:200`, `afterok:200,afterany:201`, `afterok:200?afterany:201`,
+  `singleton`, etc.). Python:
+  `PySbatchCmd(..., dependency=SlurmDependency.parse("afterok:200"))`.
+- **`SbatchCmd::mail_user: Option<MailAddress>`** — emits `["--mail-user", addr]`.
+  `MailAddress` is the `String` alias from
+  `crate::entities::slurm::sbatch_options`. Python:
+  `PySbatchCmd(..., mail_user="alice@example.com")`.
+- **`SbatchCmd::mail_types: Option<MailTypeInput>`** — emits
+  `["--mail-type", types.to_string()]` in canonical comma-separated form
+  (`BEGIN,END,FAIL,REQUEUE,ALL`). Python:
+  `PySbatchCmd(..., mail_types=MailTypeInput.parse("BEGIN,END"))`.
+- **`MailType::as_slurm_str(self) -> &'static str`** plus
+  **`impl Display for MailType`** and **`impl Display for MailTypeInput`** in
+  `entities::slurm::sbatch_options` — required for round-tripping the
+  comma-separated `--mail-type` value.
+
 ### Added (Phase 2 P1)
 
 - **sacct `ExitCode` parser.** `SbatchJobHandle::refresh_with_sacct()` now
