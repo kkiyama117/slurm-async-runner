@@ -81,6 +81,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI: cargo + Python pipeline** at `.github/workflows/test.yml`. Runs
   `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --lib`,
   `maturin develop`, `pytest`, and `ruff` on every push and PR.
+- New `crate::sbatch` module: SBATCH-based job submission with KUDPC-aware
+  polling (`qgroup -l` → `squeue` fallback, opt-in sacct via
+  `refresh_with_sacct`). See `docs/superpowers/specs/2026-05-10-sbatch-module-design.md`.
+- Generic store layer: `JobSnapshot` trait + `JobStateStore<S>` + `InMemoryStateStore<S>`
+  + `FileSystemStateStore<S>`. Both `tssrun` and `sbatch` use it; on-disk JSON
+  files now include a top-level `"kind"` discriminator.
+
+### Changed (BREAKING)
+
+- `tssrun::store::JobStateStore` is now `JobStateStore<JobHandleSnapshot>`
+  (parametrized). Callers using `Arc<dyn tssrun::store::JobStateStore>` must
+  switch to `Arc<dyn JobStateStore<JobHandleSnapshot>>` (re-exported from
+  `crate::store`).
+- On-disk JSON files written by `FileSystemStateStore` now contain a
+  top-level `"kind"` field (`"tssrun"` or `"sbatch"`). Files written by
+  older versions are still readable (lenient legacy fallback assumes the
+  store's own kind), and will gain the field on next save.
+- File path layout is unchanged (`{root}/<uuid>.json`). No manual mv needed.
 
 ### Changed
 
