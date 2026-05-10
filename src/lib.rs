@@ -40,14 +40,25 @@ pub use tssrun::cmd::TssrunCmd;
 pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
 };
-pub use crate::store::JobStateStore;
 pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};
 pub use tssrun::log::{
     FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,
 };
 pub use tssrun::manager::{AttachKey, TssrunManager};
 pub use tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
-pub use tssrun::store::{FileSystemStateStore, InMemoryStateStore};
+
+// sbatch module re-exports
+pub use sbatch::cmd::SbatchCmd;
+pub use sbatch::error::SbatchSpawnError;
+pub use sbatch::handle::{
+    FinishedInfo as SbatchFinishedInfo, LogPathSpec, SbatchAttachKey, SbatchJobHandle,
+    SbatchJobSnapshot, SbatchLifecycle,
+};
+pub use sbatch::manager::SbatchManager;
+pub use sbatch::parse::{parse_submitted_jobid, resolve_log_path};
+
+// Generic store re-exports (replaces tssrun-specific ones)
+pub use store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
 
 #[cfg(test)]
 mod tests {
