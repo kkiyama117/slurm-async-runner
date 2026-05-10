@@ -98,7 +98,7 @@ pub mod sbatch;
 pub use sbatch::cmd::SbatchCmd;
 pub use sbatch::handle::{
     SbatchJobHandle, SbatchJobSnapshot, SbatchLifecycle, SbatchAttachKey,
-    ResolvedLogPaths, FinishedInfo,
+    LogPathSpec, FinishedInfo,
 };
 pub use sbatch::manager::SbatchManager;
 pub use sbatch::error::SbatchSpawnError;
@@ -313,12 +313,13 @@ pub struct SbatchJobSnapshot {
     pub script_path: PathBuf,
     pub chdir: Option<PathBuf>,
     pub partition: Option<JobPartition>,
+    /// SLURM `-J` の値。`%x` 解決のために typed フィールドで保持
+    /// (argv からの再パースは脆い)。
+    pub job_name: Option<String>,
     pub submitted_at: DateTime<Utc>,
 
-    // ログ
-    pub output_template: Option<String>,
-    pub error_template: Option<String>,
-    pub resolved: ResolvedLogPaths,
+    // ログ (raw template のみ、解決はしない)
+    pub log: LogPathSpec,
 
     // ライフサイクル (refresh で書き換わる部分)
     pub lifecycle: SbatchLifecycle,
@@ -338,11 +339,12 @@ pub struct SbatchLifecycle {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ResolvedLogPaths {
-    /// 例: "/work/slurm-12345.out"。
-    /// client 側で展開できなかった %x/%A/%a 等は raw のまま残る。
-    pub output: Option<PathBuf>,
-    pub error: Option<PathBuf>,
+pub struct LogPathSpec {
+    /// `cmd.output` の生テンプレート。SLURM 変数 (`%j`, `%x`, `%A`, `%a`,
+    /// `%u`, `%N` など) は **すべて raw のまま** 保持。半解決された
+    /// 状態をディスクに永続化しない。
+    pub output_template: Option<String>,
+    pub error_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +362,51 @@ pub struct FinishedInfo {
 - **`left_active_listing` はツール名に依存しない命名**。今は qgroup -l + squeue がソースだが将来別ツールに切り替えても意味が壊れない。
 - **`finished_at` は観測時刻**であって SLURM の `End` フィールドではない。クロックドリフト混入回避。
 - **`finished.is_some()` なら以降の refresh は no-op で良い** (state は遷移しない前提)。
+- **`log` は raw template のみ保存**、解決はせずディスクに固定しない (詳細は 6.2)。
+- **`job_name` を typed フィールドで持つ**。`%x` 解決時に argv を再パースしない。
+
+### 6.2 ログパスの "raw template + lazy resolution" 設計
+
+`ResolvedLogPaths` (中途半端に展開された path をディスクに保存する案) を **採用しない**。理由:
+
+- `%j` / `%x` だけ展開され `%A` / `%a` / `%u` / `%N` が残る path は「これは確定 path か推定 path か」が見ただけで判別不能
+- Phase 2 で `%A` / `%a` を実装した時、過去 snapshot に書いた半解決 path との食い違いで scan/find が壊れる
+- 半解決 path を SLURM の "実際に書かれた path" として誤読する利用パスができる
+
+代替: snapshot は **テンプレートと変数値だけを保存** し、path 文字列は読み取り時に都度生成する。
+
+```rust
+impl SbatchJobSnapshot {
+    /// `output_template` を、本 snapshot 内で既知の変数のみで置換する。
+    /// 未知変数 (Phase 1 では `%A`/`%a`/`%u`/`%N` 等) は raw のまま残る。
+    /// 戻り値の path がそのまま SLURM の書き込み先と一致するとは保証しない。
+    pub fn output_path(&self) -> Option<PathBuf> {
+        self.log.output_template.as_deref()
+            .map(|t| resolve_log_path(t, self))
+    }
+    pub fn error_path(&self) -> Option<PathBuf> {
+        self.log.error_template.as_deref()
+            .map(|t| resolve_log_path(t, self))
+    }
+}
+
+// src/sbatch/parse.rs
+pub fn resolve_log_path(template: &str, snap: &SbatchJobSnapshot) -> PathBuf {
+    let mut s = template.to_string();
+    s = s.replace("%j", &snap.jobid.to_string());
+    if let Some(name) = &snap.job_name {
+        s = s.replace("%x", name);
+    }
+    // Phase 2 で %A %a %u %N を順次追加 (snapshot に対応フィールドを足してから)
+    PathBuf::from(s)
+}
+```
+
+利点:
+
+- ディスクに保存される情報は常に **「ユーザの入力そのまま」** — 解釈の余地なし
+- Phase 2 で `%A` 対応時に snapshot に `array_jobid: Option<u64>` を追加し resolver を拡張するだけで、過去 snapshot との互換も保てる (template と変数値は変わらない)
+- caller が「SLURM が実際に書いた path を知りたい」場合、resolver の戻り値を文字列マッチや glob で確認できる (raw 残しトークンが残っていれば未確定と判断可能)
 
 ---
 
@@ -415,13 +462,21 @@ pub async fn spawn(&self) -> Result<SbatchJobHandle, SbatchSpawnError> {
         .ok_or_else(|| SbatchSpawnError::JobidParseError { stdout: stdout.clone() })?;
 
     let uuid = Uuid::now_v7();
-    let resolved = ResolvedLogPaths {
-        output: self.cmd.output.as_deref()
-            .map(|t| resolve_log_path(t, jobid, self.cmd.job_name.as_deref())),
-        error: self.cmd.error.as_deref()
-            .map(|t| resolve_log_path(t, jobid, self.cmd.job_name.as_deref())),
+    let snapshot = SbatchJobSnapshot {
+        uuid, jobid,
+        argv,
+        sent_env: self.cmd.env.clone(),
+        script_path: absolutize(&self.cmd.script)?,
+        chdir: self.cmd.chdir.clone(),
+        partition: self.cmd.partition.clone(),
+        job_name: self.cmd.job_name.clone(),         // resolve_log_path で使う
+        submitted_at: Utc::now(),
+        log: LogPathSpec {                            // raw template のみ
+            output_template: self.cmd.output.clone(),
+            error_template: self.cmd.error.clone(),
+        },
+        lifecycle: Default::default(),
     };
-    let snapshot = SbatchJobSnapshot { /* ... */ lifecycle: Default::default() };
 
     self.store.save(&snapshot).await
         .map_err(|source| SbatchSpawnError::SubmittedButUnpersisted { jobid, source })?;
@@ -474,8 +529,15 @@ impl SbatchJobHandle {
     pub fn uuid(&self) -> Uuid;
     pub fn jobid(&self) -> Option<u64>;             // 常に Some (uniformity のため Option)
     pub fn partition(&self) -> Option<JobPartition>;
-    pub fn resolved_log_paths(&self) -> ResolvedLogPaths;
+    pub fn job_name(&self) -> Option<String>;
     pub fn sent_env(&self) -> HashMap<String, String>;
+    /// raw template (`%j` 等を含む)。"そのまま SLURM に渡したオリジナル"。
+    pub fn output_template(&self) -> Option<String>;
+    pub fn error_template(&self) -> Option<String>;
+    /// snapshot 内既知変数を lenient に置換した path。
+    /// 未知変数 (`%A`/`%a` 等) は raw 残し。 SLURM が実際に書く path との厳密一致は保証しない。
+    pub fn output_path(&self) -> Option<PathBuf>;
+    pub fn error_path(&self) -> Option<PathBuf>;
 
     // 共通ステータス helper (tssrun と uniform)
     pub fn is_running(&self) -> bool;
@@ -569,7 +631,7 @@ let snap = if snap.lifecycle.finished.is_none() {
 
 | 操作 | 並行性 | ロック |
 |---|---|---|
-| `snapshot()` / `watch()` / `uuid()` / `jobid()` / `partition()` / `resolved_log_paths()` / `is_running()` / `is_finished()` / `exit_code()` | 完全 lock-free | なし (watch::borrow) |
+| `snapshot()` / `watch()` / `uuid()` / `jobid()` / `partition()` / `job_name()` / `sent_env()` / `output_template()` / `error_template()` / `output_path()` / `error_path()` / `is_running()` / `is_finished()` / `exit_code()` | 完全 lock-free | なし (watch::borrow) |
 | `refresh()` / `refresh_with_sacct()` | 直列化 | `tokio::sync::Mutex<()>` |
 | `wait_terminal()` のループ | 各反復で短時間ロック取得・解放 | 同上 |
 
@@ -619,7 +681,7 @@ tssrun 側も同じパターンに揃える小さなリファクタが Phase 1 �
 | `wait()` (owner-only、子プロセス join) | ✓ | ✗ |
 | `wait_terminal(poll)` | ✗ | ✓ |
 | `refresh()` / `refresh_with_sacct()` | ✗ (tee で自動更新) | ✓ |
-| `resolved_log_paths()` | ✗ | ✓ |
+| `output_path()` / `error_path()` (template+vars 解決) | ✗ | ✓ |
 
 意味のないメソッドは生やさず、ドキュメントで「これは型限定」と明記。
 
@@ -627,26 +689,25 @@ tssrun 側も同じパターンに揃える小さなリファクタが Phase 1 �
 
 ## 10. ログパス解決
 
+snapshot にはテンプレートと変数値だけを保存し、path 文字列はディスクに固定しない。読み取り時に snapshot を入力として lenient resolver を呼ぶ (詳細は 6.2)。
+
 ```rust
 // src/sbatch/parse.rs
-pub fn resolve_log_path(
-    template: &str,
-    jobid: u64,
-    job_name: Option<&str>,
-) -> PathBuf {
+pub fn resolve_log_path(template: &str, snap: &SbatchJobSnapshot) -> PathBuf {
     let mut s = template.to_string();
-    s = s.replace("%j", &jobid.to_string());
-    if let Some(name) = job_name {
+    s = s.replace("%j", &snap.jobid.to_string());
+    if let Some(name) = &snap.job_name {
         s = s.replace("%x", name);
     }
+    // Phase 2 で snapshot にフィールドを足してから %A/%a/%u/%N を順次対応
     PathBuf::from(s)
 }
 ```
 
-- `%j` のみ確実に展開 (spawn 時 jobid 確定済み)。
-- `%x` は `cmd.job_name` が `Some` の時のみ。
-- `%A`/`%a`/`%u`/`%N` は Phase 2/3 で。
-- `resolved.output` は **「展開後の最良推定」** であり、SLURM が実際に書く path とは食い違う可能性 (raw 残しトークンを含む場合) を doc 明記。
+- `%j` は snapshot に必ずある (spawn 時 jobid 確定)。
+- `%x` は snapshot.job_name が `Some` の時のみ。
+- `%A` / `%a` / `%u` / `%N` は Phase 2/3 で。snapshot に対応フィールドを追加してから resolver を拡張する。
+- 戻り値の `PathBuf` は **「snapshot 内既知変数だけで lenient 置換した結果」** であり、未展開トークンが残った状態で返り得る。SLURM が実際に書いた path と厳密一致する保証はない (caller が `%` 残存をチェックすれば未確定と判断可能)。
 
 ---
 
@@ -674,7 +735,7 @@ pub fn resolve_log_path(
 
 | Python のパス | 実体 | 公開 |
 |---|---|---|
-| `slurm_async_runner._core.sbatch` | `py_export/sbatch.rs::inner_module` | `SbatchCmd`, `SbatchManager`, `SbatchJobHandle`, `ResolvedLogPaths`, `SbatchAttachKey`, `SbatchSpawnError` |
+| `slurm_async_runner._core.sbatch` | `py_export/sbatch.rs::inner_module` | `SbatchCmd`, `SbatchManager`, `SbatchJobHandle`, `LogPathSpec`, `SbatchAttachKey`, `SbatchSpawnError` |
 
 ```python
 import asyncio
@@ -755,7 +816,7 @@ pub enum SbatchSpawnError {
 | カテゴリ | 場所 | 何をテストするか |
 |---|---|---|
 | Unit (`#[cfg(test)] mod tests`) | `cmd.rs` | `build_argv` の各組み合わせ、絶対化、`--export` レンダリング、KUDPC 禁止オプションが含まれない |
-| Unit | `parse.rs` | `parse_submitted_jobid` (1行/複数行/警告付き/エラー)、`parse_qgroup_l` (実出力サンプル必要)、`resolve_log_path` (%j/%x/raw 残し) |
+| Unit | `parse.rs` | `parse_submitted_jobid` (1行/複数行/警告付き/エラー)、`parse_qgroup_l` (実出力サンプル必要)、`resolve_log_path` (%j 単独 / %j+%x / job_name None で %x raw 残し / %A%a%u%N raw 残し) |
 | Unit | `store.rs` | `InMemoryStateStore<SbatchJobSnapshot>` save/load/find_by_jobid。tempdir + `FileSystemStateStore<SbatchJobSnapshot>` で `{root}/sbatch/<uuid>.json` の atomic-rename |
 | Unit | `handle.rs` | mock dispatcher で refresh の状態遷移、wait_terminal の終端検出、refresh_with_sacct の sacct スキップ条件 |
 | Unit | `manager.rs` | mock dispatcher で spawn の各失敗モード (sbatch exit != 0 / jobid parse 失敗 / store.save 失敗 → `SubmittedButUnpersisted`) |
@@ -783,7 +844,7 @@ Phase 1 を以下の順序で実装することを想定:
    - `SbatchCmd` + `build_argv`
    - `parse_submitted_jobid` + `resolve_log_path`
 4. **sbatch Snapshot / Lifecycle / Store**
-   - `SbatchJobSnapshot` + `SbatchLifecycle` + `FinishedInfo` + `ResolvedLogPaths`
+   - `SbatchJobSnapshot` + `SbatchLifecycle` + `FinishedInfo` + `LogPathSpec`
    - `impl JobSnapshot for SbatchJobSnapshot` (`kind = "sbatch"`)
 5. **sbatch Handle**
    - `SbatchJobHandle` + Arc-wrapped Inner、watch::Sender、refresh_lock
@@ -809,7 +870,7 @@ Phase 1 を以下の順序で実装することを想定:
 - **`wait_terminal()` は軽量ループ**。caller が exit_code を欲しければ戻り値後に `refresh_with_sacct()` を **1 回だけ** 呼ぶ。
 - **store の `{root}/<uuid>.json` レイアウト**。tssrun と sbatch は同一ディレクトリで物理的に共存し、JSON 内の `kind` フィールド (`"tssrun"` / `"sbatch"`) で論理分離する。subdir は無い。`load(uuid)` で別 kind を引いた場合は silent に `None` を返す。
 - **`SubmittedButUnpersisted` は致命的**。SLURM 側はジョブが生きている。`scancel` を打つか、jobid を別経路で記録する責任が caller にある。
-- **`resolved_log_paths` は最良推定**。`%x` が job_name なしで指定されている場合 raw が残る → SLURM が実際に書く path と食い違う。
+- **`output_path()`/`error_path()` は最良推定**。snapshot にはテンプレートと変数値だけが保存され、解決は読み取り時に都度行う。`%A`/`%a`/`%u`/`%N` などの未対応トークンは raw 残しのまま返る → SLURM が実際に書く path と食い違う可能性。caller は戻り値に `%` が残っているかで「未確定」を判定できる。
 - **`gaussian_job_shared` の `pyo3` feature を絶対に有効化しない**。シンボル衝突で `PyInit__core` が duplicate symbol になる (既存の Pyclass Single Owner ルール参照)。
 
 ---
