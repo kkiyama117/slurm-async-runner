@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 from slurm_async_runner._slurm_async_runner_core.tssrun import (
-    Resource,
+    ResourceSpec,
     TssrunCmd,
     TssrunManager,
     file_log_sink,
@@ -42,7 +42,7 @@ def _bash_cmd(workdir: Path) -> TssrunCmd:
 def test_resource_render_via_argv() -> None:
     cmd = TssrunCmd(
         program="/bin/true",
-        rsc=Resource(processes=4, memory="2G"),
+        rsc=ResourceSpec.from_str("p=4:m=2G"),
     )
     argv = cmd.build_argv()
     assert "--rsc" in argv

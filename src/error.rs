@@ -11,8 +11,8 @@ pub enum SchemaParseError {
     UnknownKey(String),
 
     /// A TOML mapping was missing a required key.
-    #[error("Missing requred key(s): {0}")]
-    MissianRequiredKey(String),
+    #[error("Missing required key(s): {0}")]
+    MissingRequiredKey(String),
 
     /// Parse error occurred
     #[error("{key} parse error around '{value}'")]
