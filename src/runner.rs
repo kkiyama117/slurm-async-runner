@@ -88,6 +88,10 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
 ///
 /// One squeue + at most one sacct call per invocation; jobids still active
 /// in squeue do not trigger sacct (mirrors the legacy function's policy).
+///
+/// Mirrors [`query_job_states_batch_with`]'s "every input id is present in
+/// the returned map" contract: ids absent from both squeue and sacct
+/// receive `JobOutcome { status: JobStatus::default(), exit_code: None }`.
 pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
     dispatcher: &D,
     jobids: &[u64],
@@ -144,6 +148,14 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
             );
         } else if let Some(oc) = history.get(&jid) {
             out.insert(jid, oc.clone());
+        } else {
+            out.insert(
+                jid,
+                JobOutcome {
+                    status: JobStatus::default(),
+                    exit_code: None,
+                },
+            );
         }
     }
     Ok(out)
@@ -528,6 +540,7 @@ mod tests {
         let text = "12345|CANCELLED by 1001|None|0:9\n";
         let m = parse_sacct_with_exit_code(text);
         let oc = m.get(&12345).expect("jobid present");
+        assert_eq!(oc.status.state, JobState::Cancelled);
         assert_eq!(oc.exit_code, Some(137));
     }
 
@@ -606,6 +619,30 @@ mod tests {
         let oc = m.get(&12345).unwrap();
         assert_eq!(oc.status.state, JobState::Completed);
         assert_eq!(oc.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn query_with_exit_code_missing_id_defaults_to_unknown() {
+        struct D;
+        impl crate::dispatcher::JobDispatcher for D {
+            async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+                unimplemented!()
+            }
+            async fn capture(&self, _argv: &[String]) -> anyhow::Result<(i32, String)> {
+                // Both squeue and sacct return empty — id 99999 is unknown to both
+                Ok((0, String::new()))
+            }
+        }
+        let m = query_job_states_with_exit_code_with(&D, &[99999])
+            .await
+            .unwrap();
+        let oc = m
+            .get(&99999)
+            .expect("missing id must still appear in returned map");
+        assert_eq!(oc.status, JobStatus::default());
+        assert_eq!(oc.status.state, JobState::Unknown);
+        assert_eq!(oc.status.reason, JobReason::None);
+        assert_eq!(oc.exit_code, None);
     }
 
     // ---- merge_results ----
