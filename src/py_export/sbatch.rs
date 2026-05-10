@@ -43,6 +43,8 @@ impl PySbatchCmd {
         chdir = None,
         env = None,
         args = None,
+        no_requeue = false,
+        comment = None,
     ))]
     fn new(
         script: PathBuf,
@@ -56,6 +58,8 @@ impl PySbatchCmd {
         chdir: Option<PathBuf>,
         env: Option<HashMap<String, String>>,
         args: Option<Vec<String>>,
+        no_requeue: bool,
+        comment: Option<String>,
     ) -> PyResult<Self> {
         let mut cmd = SbatchCmd::new(script);
         cmd.sbatch_bin = sbatch_bin;
@@ -72,6 +76,8 @@ impl PySbatchCmd {
         cmd.chdir = chdir;
         cmd.env = env.unwrap_or_default();
         cmd.args = args.unwrap_or_default();
+        cmd.no_requeue = no_requeue;
+        cmd.comment = comment;
         Ok(Self(cmd))
     }
 
@@ -242,6 +248,44 @@ impl PySbatchJobHandle {
                 .await
                 .map_err(py_err)?;
             Ok(())
+        })
+    }
+
+    /// Read up to `n` last lines of the job's stdout (stream=0) or stderr (stream=1).
+    /// Returns an empty list if the log file does not yet exist.
+    /// Raises ValueError if `stream` is not 0 or 1.
+    fn log_lines<'py>(&self, py: Python<'py>, stream: u8, n: usize) -> PyResult<Bound<'py, PyAny>> {
+        let h = self.0.clone();
+        future_into_py(py, async move {
+            let stream = match stream {
+                0 => crate::sbatch::handle::LogStream::Stdout,
+                1 => crate::sbatch::handle::LogStream::Stderr,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "log_lines: stream must be 0 (stdout) or 1 (stderr), got {other}"
+                    )));
+                }
+            };
+            h.log_lines(stream, n).await.map_err(py_err)
+        })
+    }
+
+    /// Read the full contents of the job's stdout (stream=0) or stderr (stream=1) log.
+    /// Returns an empty string if the log file does not yet exist.
+    /// Raises ValueError if `stream` is not 0 or 1.
+    fn read_log_to_end<'py>(&self, py: Python<'py>, stream: u8) -> PyResult<Bound<'py, PyAny>> {
+        let h = self.0.clone();
+        future_into_py(py, async move {
+            let stream = match stream {
+                0 => crate::sbatch::handle::LogStream::Stdout,
+                1 => crate::sbatch::handle::LogStream::Stderr,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "read_log_to_end: stream must be 0 (stdout) or 1 (stderr), got {other}"
+                    )));
+                }
+            };
+            h.read_log_to_end(stream).await.map_err(py_err)
         })
     }
 }
