@@ -20,7 +20,10 @@ pub use crate::entities::slurm::status::{JobReason, JobState, JobStatus};
 
 // Re-export the async batch-query so callers can write
 // `use slurm_async_runner::query_job_states_batch`.
-pub use runner::{query_job_states_batch, query_job_states_batch_with};
+pub use runner::{
+    JobOutcome, query_job_states_batch, query_job_states_batch_with,
+    query_job_states_with_exit_code_with,
+};
 
 // Re-export the manager + launcher so callers can write
 // `use slurm_async_runner::{SlurmCmd, SlurmManager}`.

@@ -52,8 +52,6 @@ pub fn resolve_log_path(template: &str, jobid: u64, job_name: Option<&str>) -> P
 /// シグナル成分 (`:<signal>`) が **非ゼロ** のときは shell convention に従い
 /// `128 + signal` を返す。両成分がゼロまたは exit のみ非ゼロなら exit を返す。
 /// 形式不正は `None`。
-// Phase 2 P1 Task 3: parser landed; consumer wired in Task 4 (runner.rs).
-#[allow(dead_code)]
 pub(crate) fn parse_sacct_exit_code(field: &str) -> Option<i32> {
     let (exit_s, signal_s) = field.split_once(':')?;
     let exit = exit_s.parse::<i32>().ok()?;

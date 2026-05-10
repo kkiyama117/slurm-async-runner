@@ -80,6 +80,75 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
     Ok(merge_results(jobids, &active, &history))
 }
 
+/// Like [`query_job_states_batch_with`] but additionally captures sacct's
+/// `ExitCode` column and returns it as part of [`JobOutcome`].
+///
+/// Phase 2 P1 introduces this so `SbatchJobHandle::refresh_with_sacct` can
+/// persist the exit code into `FinishedInfo::exit_code`.
+///
+/// One squeue + at most one sacct call per invocation; jobids still active
+/// in squeue do not trigger sacct (mirrors the legacy function's policy).
+pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
+    dispatcher: &D,
+    jobids: &[u64],
+) -> Result<HashMap<u64, JobOutcome>> {
+    if jobids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let unique = dedupe_preserving_order(jobids);
+    let id_csv = csv_join(&unique);
+
+    let squeue_argv = vec![
+        "squeue".to_string(),
+        "-h".to_string(),
+        "-j".to_string(),
+        id_csv,
+        "-o".to_string(),
+        "%i %T %r".to_string(),
+    ];
+    let (_, squeue_out) = dispatcher.capture(&squeue_argv).await?;
+    let active = parse_squeue(&squeue_out);
+
+    let missing: Vec<u64> = unique
+        .iter()
+        .copied()
+        .filter(|j| !active.contains_key(j))
+        .collect();
+
+    let history: HashMap<u64, JobOutcome> = if missing.is_empty() {
+        HashMap::new()
+    } else {
+        let sacct_argv = vec![
+            "sacct".to_string(),
+            "-P".to_string(),
+            "-n".to_string(),
+            "-j".to_string(),
+            csv_join(&missing),
+            "-o".to_string(),
+            "JobID,State,Reason,ExitCode".to_string(),
+        ];
+        let (_, sacct_out) = dispatcher.capture(&sacct_argv).await?;
+        parse_sacct_with_exit_code(&sacct_out)
+    };
+
+    let mut out: HashMap<u64, JobOutcome> = HashMap::with_capacity(jobids.len());
+    for jid in jobids.iter().copied() {
+        if let Some(status) = active.get(&jid) {
+            out.insert(
+                jid,
+                JobOutcome {
+                    status: status.clone(),
+                    exit_code: None,
+                },
+            );
+        } else if let Some(oc) = history.get(&jid) {
+            out.insert(jid, oc.clone());
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- helpers
 
 fn dedupe_preserving_order(ids: &[u64]) -> Vec<u64> {
@@ -158,6 +227,60 @@ pub(crate) fn parse_sacct(text: &str) -> HashMap<u64, JobStatus> {
             JobStatus {
                 state: JobState::parse(state_str),
                 reason: JobReason::parse(reason_str),
+            },
+        );
+    }
+    out
+}
+
+/// Outcome of a sacct query for one jobid: status plus optional exit code.
+///
+/// Phase 2 P1 introduces this richer return type so `refresh_with_sacct`
+/// can persist `FinishedInfo::exit_code`. The legacy
+/// `query_job_states_batch_with` keeps its `HashMap<u64, JobStatus>`
+/// signature for backward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOutcome {
+    pub status: JobStatus,
+    pub exit_code: Option<i32>,
+}
+
+/// Parse `JobID|State|Reason|ExitCode` rows from `sacct -P -n`.
+///
+/// Behaves like [`parse_sacct`] for the first three fields, plus extracts
+/// the optional fourth `ExitCode` column via
+/// [`crate::sbatch::parse::parse_sacct_exit_code`].
+///
+/// Step rows (`12345.batch`, `12345.0`) are filtered. If the fourth field
+/// is missing or unparseable, `JobOutcome::exit_code` is `None`.
+pub(crate) fn parse_sacct_with_exit_code(text: &str) -> HashMap<u64, JobOutcome> {
+    use crate::sbatch::parse::parse_sacct_exit_code;
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(4, '|');
+        let Some(jid_str) = parts.next() else {
+            continue;
+        };
+        let Some(state_str) = parts.next() else {
+            continue;
+        };
+        let reason_str = parts.next().unwrap_or("");
+        let exit_field = parts.next();
+        if jid_str.contains('.') {
+            continue;
+        }
+        let Ok(jid) = jid_str.parse::<u64>() else {
+            continue;
+        };
+        let exit_code = exit_field.and_then(parse_sacct_exit_code);
+        out.insert(
+            jid,
+            JobOutcome {
+                status: JobStatus {
+                    state: JobState::parse(state_str),
+                    reason: JobReason::parse(reason_str),
+                },
+                exit_code,
             },
         );
     }
@@ -387,6 +510,102 @@ mod tests {
         let m = parse_sacct(text);
         assert_eq!(m.len(), 1);
         assert!(m.contains_key(&100));
+    }
+
+    // ---- parse_sacct_with_exit_code ----
+
+    #[test]
+    fn parse_sacct_with_exit_code_three_fields_completed() {
+        let text = "12345|COMPLETED|None|0:0\n";
+        let m = parse_sacct_with_exit_code(text);
+        let oc = m.get(&12345).expect("jobid present");
+        assert_eq!(oc.status.state, JobState::Completed);
+        assert_eq!(oc.exit_code, Some(0));
+    }
+
+    #[test]
+    fn parse_sacct_with_exit_code_signaled() {
+        let text = "12345|CANCELLED by 1001|None|0:9\n";
+        let m = parse_sacct_with_exit_code(text);
+        let oc = m.get(&12345).expect("jobid present");
+        assert_eq!(oc.exit_code, Some(137));
+    }
+
+    #[test]
+    fn parse_sacct_with_exit_code_filters_step_rows() {
+        let text = "12345|COMPLETED|None|0:0\n12345.batch|COMPLETED|None|0:0\n";
+        let m = parse_sacct_with_exit_code(text);
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key(&12345));
+    }
+
+    #[test]
+    fn parse_sacct_with_exit_code_handles_missing_exit_field() {
+        let text = "12345|COMPLETED|None\n";
+        let m = parse_sacct_with_exit_code(text);
+        let oc = m.get(&12345).expect("jobid present");
+        assert_eq!(oc.exit_code, None);
+        assert_eq!(oc.status.state, JobState::Completed);
+    }
+
+    // ---- query_job_states_with_exit_code_with ----
+
+    #[tokio::test]
+    async fn query_with_exit_code_squeue_only_reports_no_exit_code() {
+        struct D;
+        impl crate::dispatcher::JobDispatcher for D {
+            async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+                unimplemented!()
+            }
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+                let bin = argv[0].as_str();
+                let out = if bin == "squeue" {
+                    "12345 RUNNING None\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok((0, out))
+            }
+        }
+        let m = query_job_states_with_exit_code_with(&D, &[12345])
+            .await
+            .unwrap();
+        let oc = m.get(&12345).unwrap();
+        assert_eq!(oc.status.state, JobState::Running);
+        assert_eq!(oc.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn query_with_exit_code_sacct_supplies_exit_code() {
+        struct D;
+        impl crate::dispatcher::JobDispatcher for D {
+            async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+                unimplemented!()
+            }
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+                let bin = argv[0].as_str();
+                let out = if bin == "squeue" {
+                    String::new()
+                } else if bin == "sacct" {
+                    let format_idx = argv.iter().position(|a| a == "-o").unwrap();
+                    assert!(
+                        argv[format_idx + 1].contains("ExitCode"),
+                        "sacct argv must include ExitCode column, got: {:?}",
+                        argv
+                    );
+                    "12345|COMPLETED|None|0:0\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok((0, out))
+            }
+        }
+        let m = query_job_states_with_exit_code_with(&D, &[12345])
+            .await
+            .unwrap();
+        let oc = m.get(&12345).unwrap();
+        assert_eq!(oc.status.state, JobState::Completed);
+        assert_eq!(oc.exit_code, Some(0));
     }
 
     // ---- merge_results ----
