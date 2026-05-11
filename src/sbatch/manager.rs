@@ -722,4 +722,50 @@ mod tests {
         assert_eq!(finished.final_state, crate::JobState::Completed);
         assert_eq!(finished.exit_code, Some(0));
     }
+
+    #[tokio::test]
+    async fn run_returns_job_failed_when_sacct_reports_failed_state() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        // qgroup empty so wait_terminal flips left_active_listing and
+        // refresh_with_sacct invokes sacct, which reports FAILED exit 2.
+        let dispatcher = into_dyn(RunCannedDispatcher::new(
+            "Submitted batch job 9090\n",
+            "",
+            "9090|FAILED|NonZeroExit|2:0\n",
+        ));
+        let mgr = SbatchManager::new(cmd)
+            .with_dispatcher(dispatcher)
+            .with_poll_interval(std::time::Duration::from_millis(1));
+
+        match mgr.run().await {
+            Err(SbatchRunError::JobFailed { state, exit_code }) => {
+                assert_eq!(state, crate::JobState::Failed);
+                assert_eq!(exit_code, Some(2));
+            }
+            other => panic!("expected JobFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_returns_job_failed_when_cancelled_by_signal() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        // qgroup empty so sacct path runs; sacct reports CANCELLED with
+        // signal 9 -> exit_code 137 (128 + 9).
+        let dispatcher = into_dyn(RunCannedDispatcher::new(
+            "Submitted batch job 7777\n",
+            "",
+            "7777|CANCELLED|None|0:9\n",
+        ));
+        let mgr = SbatchManager::new(cmd)
+            .with_dispatcher(dispatcher)
+            .with_poll_interval(std::time::Duration::from_millis(1));
+
+        match mgr.run().await {
+            Err(SbatchRunError::JobFailed { state, exit_code }) => {
+                assert_eq!(state, crate::JobState::Cancelled);
+                assert_eq!(exit_code, Some(137));
+            }
+            other => panic!("expected JobFailed for cancelled, got {other:?}"),
+        }
+    }
 }
