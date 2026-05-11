@@ -7,6 +7,7 @@ pub mod array_spec;
 pub mod config;
 pub mod dependency;
 pub mod resource_spec;
+pub mod signal;
 pub mod time_limit;
 
 use pyo3::prelude::*;
@@ -23,6 +24,9 @@ pub(crate) mod inner_module {
         PyDependencyClause, PyDependencyJobRef, PyDependencyJoin, PyDependencyType,
         PySlurmDependency,
     };
+
+    #[pymodule_export]
+    use super::signal::PySlurmSignalSpec;
 
     #[pymodule_export]
     use super::array_spec::{PyArrayIndex, PySlurmArraySpec};

@@ -10,9 +10,12 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use crate::entities::slurm::{JobTimeLimit, MailTypeInput, ResourceSpec, SlurmDependency};
+use crate::entities::slurm::{
+    JobTimeLimit, MailTypeInput, ResourceSpec, SlurmDependency, SlurmSignalSpec,
+};
 use crate::py_export::entities::slurm::sbatch_options::config::PyMailTypeInput;
 use crate::py_export::entities::slurm::sbatch_options::dependency::PySlurmDependency;
+use crate::py_export::entities::slurm::sbatch_options::signal::PySlurmSignalSpec;
 use crate::sbatch::cmd::SbatchCmd;
 use crate::sbatch::error::SbatchSpawnError;
 use crate::sbatch::handle::SbatchJobHandle;
@@ -50,6 +53,7 @@ impl PySbatchCmd {
         dependency = None,
         mail_user = None,
         mail_types = None,
+        signal = None,
     ))]
     fn new(
         script: PathBuf,
@@ -68,6 +72,7 @@ impl PySbatchCmd {
         dependency: Option<PySlurmDependency>,
         mail_user: Option<String>,
         mail_types: Option<PyMailTypeInput>,
+        signal: Option<PySlurmSignalSpec>,
     ) -> PyResult<Self> {
         let mut cmd = SbatchCmd::new(script);
         cmd.sbatch_bin = sbatch_bin;
@@ -89,6 +94,7 @@ impl PySbatchCmd {
         cmd.dependency = dependency.map(<PySlurmDependency as Into<SlurmDependency>>::into);
         cmd.mail_user = mail_user;
         cmd.mail_types = mail_types.map(<PyMailTypeInput as Into<MailTypeInput>>::into);
+        cmd.signal = signal.map(<PySlurmSignalSpec as Into<SlurmSignalSpec>>::into);
         Ok(Self(cmd))
     }
 

@@ -140,3 +140,16 @@ def test_sbatch_cmd_build_argv_rejects_comma_in_value(tmp_path):
     cmd = SbatchCmd(str(job), env={"FOO": "a,b"})
     with pytest.raises(RuntimeError, match="FOO"):
         cmd.build_argv()
+
+
+def test_sbatch_cmd_signal_kwarg(tmp_path):
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmSignalSpec,
+    )
+
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho hi\n")
+    cmd = SbatchCmd(str(job), signal=SlurmSignalSpec.parse("USR1@60"))
+    argv = cmd.build_argv()
+    i = argv.index("--signal")
+    assert argv[i + 1] == "USR1@60"
