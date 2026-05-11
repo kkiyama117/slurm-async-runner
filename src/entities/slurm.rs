@@ -20,6 +20,7 @@ pub mod status;
 pub use sbatch_options::{
     ArrayIndex, DependencyClause, DependencyJobRef, DependencyJoin, DependencyType, JobPartition,
     JobRSC, JobTimeLimit, MailAddress, MailType, MailTypeInput, Memory, MemoryUnit, ResourceSpec,
-    ResourceSpecCPU, ResourceSpecGPU, SlurmArraySpec, SlurmDependency, SlurmJobConfig,
+    ResourceSpecCPU, ResourceSpecGPU, SignalIdent, SlurmArraySpec, SlurmDependency, SlurmJobConfig,
+    SlurmSignalSpec,
 };
 pub use status::{JobReason, JobState, JobStatus};
