@@ -76,7 +76,10 @@ impl SbatchManager {
             .await
             .map_err(SbatchSpawnError::Other)?;
         if exit_code != 0 {
-            return Err(SbatchSpawnError::SubmitFailed { exit_code, stdout });
+            return Err(SbatchSpawnError::SubmitFailed {
+                exit_code,
+                output: stdout,
+            });
         }
         let jobid =
             parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
@@ -152,7 +155,10 @@ impl SbatchManager {
             .await
             .map_err(SbatchSpawnError::Other)?;
         if exit_code != 0 {
-            return Err(SbatchSpawnError::SubmitFailed { exit_code, stdout });
+            return Err(SbatchSpawnError::SubmitFailed {
+                exit_code,
+                output: stdout,
+            });
         }
         let master_jobid =
             parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
@@ -382,7 +388,10 @@ impl SbatchManager {
             .await
             .map_err(SbatchCancelError::Other)?;
         if exit_code != 0 {
-            return Err(SbatchCancelError::Scancel { exit_code, stdout });
+            return Err(SbatchCancelError::Scancel {
+                exit_code,
+                output: stdout,
+            });
         }
         Ok(())
     }
@@ -702,9 +711,9 @@ mod tests {
         let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
 
         match mgr.cancel(99).await {
-            Err(SbatchCancelError::Scancel { exit_code, stdout }) => {
+            Err(SbatchCancelError::Scancel { exit_code, output }) => {
                 assert_eq!(exit_code, 1);
-                assert!(stdout.contains("Invalid job id"));
+                assert!(output.contains("Invalid job id"));
             }
             other => panic!("expected Scancel error, got {other:?}"),
         }

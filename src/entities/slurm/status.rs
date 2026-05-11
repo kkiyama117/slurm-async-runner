@@ -198,6 +198,17 @@ impl JobState {
     }
 }
 
+/// Renders the canonical SLURM long-form token (UPPERCASE, e.g.
+/// `"PENDING"`, `"OUT_OF_MEMORY"`). Matches [`JobState::as_token`], so
+/// `state.to_string() == state.as_token()`. Used in user-facing
+/// messages (errors, logs) for consistency with `sacct` / `squeue`
+/// output.
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_token())
+    }
+}
+
 impl Serialize for JobState {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(self.as_token())
@@ -499,6 +510,13 @@ mod tests {
     fn job_state_as_token_round_trips() {
         for s in all_states() {
             assert_eq!(JobState::parse(s.as_token()), s, "round-trip for {s:?}");
+        }
+    }
+
+    #[test]
+    fn job_state_display_matches_as_token() {
+        for s in all_states() {
+            assert_eq!(s.to_string(), s.as_token(), "Display mismatch for {s:?}");
         }
     }
 

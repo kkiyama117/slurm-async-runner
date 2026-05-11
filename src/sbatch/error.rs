@@ -3,8 +3,11 @@
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum SbatchSpawnError {
-    #[error("sbatch invocation failed (exit={exit_code}): {stdout}")]
-    SubmitFailed { exit_code: i32, stdout: String },
+    /// `output` is the captured combined stdout/stderr from the
+    /// `sbatch` invocation. The dispatcher `capture` API merges both
+    /// streams, so this field can contain stderr lines as well.
+    #[error("sbatch invocation failed (exit={exit_code}): {output}")]
+    SubmitFailed { exit_code: i32, output: String },
 
     #[error("sbatch stdout did not contain a parseable jobid: {stdout}")]
     JobidParseError { stdout: String },
@@ -62,7 +65,7 @@ pub enum SbatchRunError {
     #[error("sacct returned but finished info was not populated for jobid={jobid}")]
     MissingFinished { jobid: u64 },
 
-    #[error("job ended in non-success terminal state: {state:?}, exit_code={exit_code:?}")]
+    #[error("job ended in non-success terminal state: {state}, exit_code={exit_code:?}")]
     JobFailed {
         state: crate::JobState,
         exit_code: Option<i32>,
@@ -79,8 +82,11 @@ pub enum SbatchRunError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum SbatchCancelError {
-    #[error("scancel failed (exit={exit_code}): {stdout}")]
-    Scancel { exit_code: i32, stdout: String },
+    /// `output` is the captured combined stdout/stderr from the
+    /// `scancel` invocation. The dispatcher `capture` API merges both
+    /// streams, so this field can contain stderr lines as well.
+    #[error("scancel failed (exit={exit_code}): {output}")]
+    Scancel { exit_code: i32, output: String },
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -165,7 +171,9 @@ mod tests {
             exit_code: Some(2),
         };
         let msg = e.to_string();
-        assert!(msg.contains("Failed"), "state should appear, got: {msg}");
+        // SLURM canonical token via `JobState::Display` (matches `sacct` /
+        // `squeue` output).
+        assert!(msg.contains("FAILED"), "state should appear, got: {msg}");
         assert!(msg.contains('2'), "exit code should appear, got: {msg}");
     }
 
@@ -173,17 +181,17 @@ mod tests {
     fn run_error_from_spawn_error_preserves_variant() {
         let inner = SbatchSpawnError::SubmitFailed {
             exit_code: 1,
-            stdout: "boom".into(),
+            output: "boom".into(),
         };
         let e: SbatchRunError = inner.into();
         assert!(matches!(e, SbatchRunError::Spawn(_)));
     }
 
     #[test]
-    fn cancel_error_scancel_carries_exit_and_stdout() {
+    fn cancel_error_scancel_carries_exit_and_output() {
         let e = SbatchCancelError::Scancel {
             exit_code: 1,
-            stdout: "scancel: error: invalid job id specified".into(),
+            output: "scancel: error: invalid job id specified".into(),
         };
         let msg = e.to_string();
         assert!(msg.contains("scancel"));

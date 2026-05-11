@@ -127,6 +127,15 @@ impl PyFinishedInfo {
         self.0.final_state.as_token().to_string()
     }
 
+    /// SLURM reason string (e.g. ``"None"``, ``"NonZeroExitCode"``,
+    /// ``"TimeLimit"``, ``"OutOfMemory"``). Mirrors the ``%r`` column
+    /// from ``sacct``. Unknown reasons are returned verbatim as the
+    /// raw scheduler string.
+    #[getter]
+    fn final_reason(&self) -> String {
+        self.0.final_reason.as_str().to_string()
+    }
+
     #[getter]
     fn exit_code(&self) -> Option<i32> {
         self.0.exit_code
@@ -139,8 +148,9 @@ impl PyFinishedInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "FinishedInfo(state={}, exit_code={:?}, finished_at={})",
+            "FinishedInfo(state={}, reason={}, exit_code={:?}, finished_at={})",
             self.0.final_state.as_token(),
+            self.0.final_reason.as_str(),
             self.0.exit_code,
             self.0.finished_at.to_rfc3339()
         )
@@ -312,8 +322,8 @@ impl PySbatchManager {
         let mgr = self.0.clone();
         future_into_py(py, async move {
             mgr.cancel(jobid).await.map_err(|e| match e {
-                SbatchCancelError::Scancel { exit_code, stdout } => {
-                    PyRuntimeError::new_err(format!("scancel failed (exit={exit_code}): {stdout}"))
+                SbatchCancelError::Scancel { exit_code, output } => {
+                    PyRuntimeError::new_err(format!("scancel failed (exit={exit_code}): {output}"))
                 }
                 SbatchCancelError::Other(err) => PyRuntimeError::new_err(err.to_string()),
             })?;
