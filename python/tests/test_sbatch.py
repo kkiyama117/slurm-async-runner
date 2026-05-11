@@ -243,13 +243,121 @@ def test_run_rejects_array_spec_with_value_error(tmp_path: Path):
         asyncio.run(go())
 
 
-def test_cancel_smoke_skipped_pending_scancel_bin_override():
-    """Placeholder marker for the cancel-via-fake-scancel test.
+@pytest.mark.skipif(not _have_bash(), reason="bash required")
+def test_run_with_jobid_callback_captures_jobid_before_terminal(tmp_path: Path):
+    """``run_with_jobid_callback`` fires the callback synchronously the
+    moment sbatch returns a jobid, before ``wait_terminal`` polls. This
+    is the spec §6.1 timeout-with-cancel hook: caller can stash the
+    jobid in a closure cell and call ``cancel(jobid)`` if a wrapping
+    ``asyncio.wait_for`` fires."""
+    fake_sbatch = tmp_path / "fake_sbatch"
+    fake_sbatch.write_text(
+        '#!/usr/bin/env bash\necho "Submitted batch job 13579"\nexit 0\n'
+    )
+    fake_sbatch.chmod(0o755)
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho ok\n")
+    job.chmod(0o755)
 
-    Until ``SbatchManager`` exposes a ``scancel_bin`` override mirroring
-    ``sbatch_bin``, this Python test cannot inject a controllable scancel
-    binary. The Rust unit tests in ``src/sbatch/manager.rs`` cover the
-    success + non-zero-exit branches via the dispatcher seam.
-    Tracked as Phase 3 follow-up.
-    """
-    pytest.skip("scancel_bin override not yet implemented; see Phase 3")
+    cmd = SbatchCmd(str(job), sbatch_bin=str(fake_sbatch))
+    state_dir = tmp_path / "state"
+    mgr = SbatchManager(cmd, state_dir=str(state_dir))
+
+    captured: list[int] = []
+
+    async def go():
+        # The callback receives the jobid the moment spawn returns.
+        # `mgr.run_with_jobid_callback` then continues into
+        # wait_terminal / refresh_with_sacct just like `run()`, but
+        # the test cluster has no squeue/sacct, so it will fail at
+        # the polling stage. That failure is irrelevant here — we only
+        # care that the callback fired with the right jobid first.
+        try:
+            await mgr.run_with_jobid_callback(captured.append)
+        except RuntimeError:
+            pass
+
+    asyncio.run(go())
+    assert captured == [13579], f"unexpected callback invocations: {captured!r}"
+
+
+def test_run_with_jobid_callback_skips_callback_on_array_rejection(tmp_path: Path):
+    """Array submissions must reject BEFORE spawn, so the callback
+    must NOT fire."""
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmArraySpec,
+    )
+
+    job = tmp_path / "j.sh"
+    job.write_text("#!/usr/bin/env bash\n:\n")
+    job.chmod(0o755)
+
+    cmd = SbatchCmd(str(job), array_spec=SlurmArraySpec.parse("0-2"))
+    mgr = SbatchManager(cmd)
+
+    captured: list[int] = []
+
+    async def go():
+        await mgr.run_with_jobid_callback(captured.append)
+
+    with pytest.raises(ValueError, match="array"):
+        asyncio.run(go())
+
+    assert captured == [], "callback must NOT fire when array rejection short-circuits"
+
+
+@pytest.mark.skipif(not _have_bash(), reason="bash required")
+def test_cancel_uses_scancel_bin_override(tmp_path: Path):
+    """`SbatchManager(cmd, scancel_bin=<path>)` routes cancel() to the
+    given binary instead of the system ``scancel``. The fake script
+    records its argv so we can verify both the binary path and the
+    jobid argument were passed through."""
+    record = tmp_path / "cancel_argv.txt"
+    fake_scancel = tmp_path / "fake_scancel"
+    fake_scancel.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{rec}"\nexit 0\n'.format(
+            rec=record
+        )
+    )
+    fake_scancel.chmod(0o755)
+
+    job = tmp_path / "j.sh"
+    job.write_text("#!/usr/bin/env bash\n:\n")
+    job.chmod(0o755)
+
+    cmd = SbatchCmd(str(job))
+    mgr = SbatchManager(cmd, scancel_bin=str(fake_scancel))
+
+    async def go():
+        await mgr.cancel(424242)
+
+    asyncio.run(go())
+
+    args = record.read_text().splitlines()
+    assert args == ["424242"], f"unexpected fake_scancel argv: {args!r}"
+
+
+@pytest.mark.skipif(not _have_bash(), reason="bash required")
+def test_cancel_raises_runtime_error_on_nonzero_exit(tmp_path: Path):
+    """Non-zero scancel exit must surface as ``RuntimeError`` carrying
+    the captured stdout. Exercises the ``SbatchCancelError::Scancel``
+    branch of the pyo3 mapping."""
+    fake_scancel = tmp_path / "fake_scancel"
+    fake_scancel.write_text(
+        '#!/usr/bin/env bash\necho "scancel: error: Invalid job id specified" >&2\n'
+        'echo "scancel: error: Invalid job id specified"\nexit 1\n'
+    )
+    fake_scancel.chmod(0o755)
+
+    job = tmp_path / "j.sh"
+    job.write_text("#!/usr/bin/env bash\n:\n")
+    job.chmod(0o755)
+
+    cmd = SbatchCmd(str(job))
+    mgr = SbatchManager(cmd, scancel_bin=str(fake_scancel))
+
+    async def go():
+        await mgr.cancel(99)
+
+    with pytest.raises(RuntimeError, match="scancel"):
+        asyncio.run(go())

@@ -347,6 +347,10 @@ impl SbatchJobHandle {
         }
 
         let inner = &*self.0;
+        // Re-acquire refresh_lock here to serialize the sacct call itself.
+        // The inner `refresh()` above already took and released the lock
+        // for the qgroup/squeue probes; this second acquisition guards the
+        // heavier sacct invocation and the finished-info write.
         let _guard = inner.refresh_lock.lock().await;
         let view = crate::dispatcher::DynView(&*inner.dispatcher);
 
@@ -584,20 +588,10 @@ mod tests {
         }
     }
 
-    /// Newtype that wraps an `Arc<CannedDispatcher>` so it can be passed
-    /// to `into_dyn` (which requires `D: JobDispatcher + Send + Sync + 'static`)
-    /// while leaving the original Arc available for assertion.
-    struct MoveDispatcher(std::sync::Arc<CannedDispatcher>);
-
-    impl crate::dispatcher::JobDispatcher for MoveDispatcher {
-        async fn run(&self, argv: &[String]) -> anyhow::Result<i32> {
-            self.0.run(argv).await
-        }
-
-        async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
-            self.0.capture(argv).await
-        }
-    }
+    // Shared Arc-wrapper for `Arc<D>` → `dyn JobDispatcher` coercion
+    // lives in `crate::sbatch::test_util` so handle.rs and manager.rs
+    // both consume the same generic helper.
+    use crate::sbatch::test_util::ArcDispatcher as MoveDispatcher;
 
     #[tokio::test]
     async fn refresh_uses_qgroup_when_jobid_present() {

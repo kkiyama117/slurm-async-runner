@@ -160,11 +160,14 @@ pub struct PySbatchManager(pub SbatchManager);
 #[pymethods]
 impl PySbatchManager {
     #[new]
-    #[pyo3(signature = (cmd, *, state_dir = None))]
-    fn new(cmd: PySbatchCmd, state_dir: Option<PathBuf>) -> Self {
+    #[pyo3(signature = (cmd, *, state_dir = None, scancel_bin = None))]
+    fn new(cmd: PySbatchCmd, state_dir: Option<PathBuf>, scancel_bin: Option<String>) -> Self {
         let mut mgr = SbatchManager::new(cmd.0);
         if let Some(d) = state_dir {
             mgr = mgr.with_state_dir(d);
+        }
+        if let Some(bin) = scancel_bin {
+            mgr = mgr.with_scancel_bin(bin);
         }
         Self(mgr)
     }
@@ -258,6 +261,49 @@ impl PySbatchManager {
                 }
                 other => PyRuntimeError::new_err(other.to_string()),
             })?;
+            Ok(PyFinishedInfo(finished))
+        })
+    }
+
+    /// Same as ``run()`` but invokes ``on_spawn(jobid)`` synchronously the
+    /// moment sbatch returns a parseable jobid. Designed for callers that
+    /// wrap the resulting awaitable in ``asyncio.wait_for(...)`` and need
+    /// the jobid to call ``cancel(jobid)`` if the timeout fires.
+    ///
+    /// The callback runs on the asyncio loop's thread (with the GIL held)
+    /// — keep it cheap (a list append / dict set is the intended use).
+    /// Exceptions raised by ``on_spawn`` propagate as ``RuntimeError`` and
+    /// abort the run.
+    ///
+    /// Raises ``ValueError`` for array submissions (same contract as
+    /// ``run()``); the callback is NOT invoked in that case.
+    fn run_with_jobid_callback<'py>(
+        &self,
+        py: Python<'py>,
+        on_spawn: pyo3::Py<pyo3::PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mgr = self.0.clone();
+        future_into_py(py, async move {
+            let cb_err: std::sync::Arc<std::sync::Mutex<Option<PyErr>>> = std::sync::Arc::default();
+            let cb_err_w = cb_err.clone();
+            let finished = mgr
+                .run_with(move |jid| {
+                    Python::attach(|py| {
+                        if let Err(e) = on_spawn.call1(py, (jid,)) {
+                            *cb_err_w.lock().unwrap() = Some(e);
+                        }
+                    });
+                })
+                .await
+                .map_err(|e| match e {
+                    SbatchRunError::ArrayNotSupported => {
+                        pyo3::exceptions::PyValueError::new_err(e.to_string())
+                    }
+                    other => PyRuntimeError::new_err(other.to_string()),
+                })?;
+            if let Some(e) = cb_err.lock().unwrap().take() {
+                return Err(e);
+            }
             Ok(PyFinishedInfo(finished))
         })
     }

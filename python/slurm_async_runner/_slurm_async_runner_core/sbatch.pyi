@@ -135,6 +135,7 @@ class SbatchManager:
         cmd: SbatchCmd,
         *,
         state_dir: builtins.str | os.PathLike[builtins.str] | None = None,
+        scancel_bin: builtins.str | None = None,
     ) -> None: ...
     def spawn(self) -> Awaitable[SbatchJobHandle]: ...
     def attach_uuid(self, uuid: builtins.str) -> Awaitable[SbatchJobHandle]: ...
@@ -155,6 +156,29 @@ class SbatchManager:
         Raises ``ValueError`` if ``cmd.array_spec`` is set — use ``spawn_array``
         for array submissions. Raises ``RuntimeError`` for spawn / wait / sacct
         failures or non-success terminal states.
+
+        Note: wrapping with ``asyncio.wait_for(mgr.run(), timeout=...)``
+        drops the future and strands the jobid. Use
+        ``run_with_jobid_callback`` instead if you need to call
+        ``cancel(jobid)`` after a timeout.
+        """
+        ...
+
+    def run_with_jobid_callback(
+        self,
+        on_spawn: "builtins.object",
+    ) -> Awaitable[FinishedInfo]:
+        """Same as ``run()`` but invokes ``on_spawn(jobid)`` synchronously
+        the moment sbatch returns a parseable jobid.
+
+        Use this when wrapping the resulting awaitable in
+        ``asyncio.wait_for(..., timeout=...)`` so you can recover the
+        jobid for ``cancel(jobid)`` if the timeout fires.
+
+        Same error contract as ``run()``: ``ValueError`` for array
+        submissions (callback is NOT invoked in that case),
+        ``RuntimeError`` for spawn / wait / sacct failures.
+        Exceptions raised by ``on_spawn`` surface as ``RuntimeError``.
         """
         ...
 

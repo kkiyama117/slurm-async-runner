@@ -20,9 +20,8 @@ else:
 # Phase 3 P5: the per-backend call shape now matches the Protocol — both
 # `SbatchJobHandle` and `TssrunJobHandle` expose `uuid` / `jobid` as
 # sync `@property` getters and `is_running` / `is_finished` /
-# `exit_code` as sync methods. The async-shape equivalents on tssrun
-# (`uuid_async` etc.) are kept for callers that wired against the
-# pre-P5 contract but are intentionally NOT mirrored in the Protocol.
+# `exit_code` as sync methods. The async-shape escape hatches that
+# briefly existed during P5 (`uuid_async` etc.) have been removed.
 # ────────────────────────────────────────────────────────────────────
 
 

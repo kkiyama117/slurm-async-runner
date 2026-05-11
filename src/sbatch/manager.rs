@@ -22,6 +22,7 @@ pub struct SbatchManager {
     store: Arc<dyn JobStateStore<SbatchJobSnapshot>>,
     dispatcher: Arc<dyn DynJobDispatcher>,
     poll_interval: std::time::Duration,
+    scancel_bin: String,
 }
 
 impl SbatchManager {
@@ -31,6 +32,7 @@ impl SbatchManager {
             store: Arc::new(InMemoryStateStore::<SbatchJobSnapshot>::new()),
             dispatcher: into_dyn(TokioDispatcher),
             poll_interval: std::time::Duration::from_secs(30),
+            scancel_bin: "scancel".to_string(),
         }
     }
 
@@ -54,6 +56,15 @@ impl SbatchManager {
     /// Tests typically use 1–10 ms.
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
+        self
+    }
+
+    /// Override the `scancel` binary used by [`Self::cancel`]. Defaults to
+    /// `"scancel"` (resolved via `$PATH`). Tests and integration smokes
+    /// can pass a fake-scancel script path to exercise the cancel flow
+    /// without a real SLURM cluster.
+    pub fn with_scancel_bin(mut self, bin: impl Into<String>) -> Self {
+        self.scancel_bin = bin.into();
         self
     }
 
@@ -122,10 +133,14 @@ impl SbatchManager {
     ) -> Result<Vec<SbatchJobHandle>, SbatchSpawnError> {
         use crate::sbatch::parse::expand_array_indices;
         let task_indices = expand_array_indices(&array_spec);
-        assert!(
-            !task_indices.is_empty(),
-            "SlurmArraySpec FromStr guarantees non-empty indices"
-        );
+        if task_indices.is_empty() {
+            // FromStr already rejects empty specs; this guards against direct
+            // struct construction that bypasses parsing.
+            return Err(SbatchSpawnError::Other(anyhow::anyhow!(
+                "spawn_array: SlurmArraySpec yielded zero task indices \
+                 (constructed via FromStr should be non-empty)"
+            )));
+        }
 
         let mut cmd = self.cmd.clone();
         cmd.array_spec = Some(array_spec);
@@ -272,22 +287,65 @@ impl SbatchManager {
     /// `FinishedInfo`. See spec §6 for the full design rationale.
     ///
     /// **Not for array submissions.** Use `spawn_array` for those —
-    /// run() returns `Err(SbatchRunError::ArrayNotSupported)` when
+    /// `run()` returns `Err(SbatchRunError::ArrayNotSupported)` when
     /// `cmd.array_spec.is_some()`.
     ///
-    /// Timeout: caller wraps with `tokio::time::timeout(dur, mgr.run())`.
-    /// On timeout, the caller is responsible for calling `mgr.cancel(jobid)`
-    /// if they want to stop the SLURM-side job; the timeout itself only
-    /// drops the future.
+    /// Timeout: caller wraps with `tokio::time::timeout(dur, mgr.run())`,
+    /// but the dropped future strands the jobid. To recover the jobid for
+    /// `cancel(jobid)` after a timeout, use [`Self::run_with`] and capture
+    /// the jobid in the `on_spawn` callback.
     pub async fn run(
         &self,
     ) -> Result<crate::sbatch::handle::FinishedInfo, crate::sbatch::error::SbatchRunError> {
+        self.run_with(|_| {}).await
+    }
+
+    /// Same as [`Self::run`] but invokes `on_spawn(jobid)` **synchronously**
+    /// the moment sbatch returns a parseable jobid. Designed for callers
+    /// that need timeout-with-cancel ergonomics — capture the jobid in a
+    /// shared cell before wrapping in `tokio::time::timeout`, then call
+    /// `mgr.cancel(jobid)` if the timeout fires.
+    ///
+    /// `on_spawn` runs on the same task as `run_with` itself; it is NOT a
+    /// tokio spawn. Keep it cheap — a single `oneshot::Sender::send` or
+    /// `Mutex::lock().*=Some(...)` is the intended use.
+    ///
+    /// Example (spec §6.1 timeout pattern, now jobid-recoverable):
+    ///
+    /// ```ignore
+    /// use std::sync::{Arc, Mutex};
+    /// use std::time::Duration;
+    ///
+    /// let jobid_cell: Arc<Mutex<Option<u64>>> = Arc::default();
+    /// let cell = jobid_cell.clone();
+    /// match tokio::time::timeout(
+    ///     Duration::from_secs(60),
+    ///     mgr.run_with(move |j| *cell.lock().unwrap() = Some(j)),
+    /// ).await {
+    ///     Ok(Ok(info)) => /* happy path */ {},
+    ///     Ok(Err(e)) => return Err(e),
+    ///     Err(_elapsed) => {
+    ///         if let Some(jid) = *jobid_cell.lock().unwrap() {
+    ///             let _ = mgr.cancel(jid).await;
+    ///         }
+    ///         // else: spawn hadn't completed yet — nothing to cancel.
+    ///     }
+    /// }
+    /// ```
+    pub async fn run_with<F>(
+        &self,
+        on_spawn: F,
+    ) -> Result<crate::sbatch::handle::FinishedInfo, crate::sbatch::error::SbatchRunError>
+    where
+        F: FnOnce(u64),
+    {
         use crate::sbatch::error::SbatchRunError;
         if self.cmd.array_spec.is_some() {
             return Err(SbatchRunError::ArrayNotSupported);
         }
         let handle = self.spawn().await?;
         let jobid = handle.snapshot().jobid;
+        on_spawn(jobid);
         handle
             .wait_terminal(self.poll_interval)
             .await
@@ -312,8 +370,12 @@ impl SbatchManager {
     /// Send `scancel <jobid>`. Idempotent at the SLURM side — sending
     /// scancel to a terminal job returns exit 0. Returns
     /// `SbatchCancelError::Scancel` if scancel itself reports a non-zero exit.
+    ///
+    /// The binary name comes from [`Self::with_scancel_bin`] (default
+    /// `"scancel"`), so tests and integration smokes can substitute a
+    /// fake-scancel script.
     pub async fn cancel(&self, jobid: u64) -> Result<(), SbatchCancelError> {
-        let argv = vec!["scancel".to_string(), jobid.to_string()];
+        let argv = vec![self.scancel_bin.clone(), jobid.to_string()];
         let (exit_code, stdout) = self
             .dispatcher
             .capture(&argv)
@@ -595,23 +657,13 @@ mod tests {
         }
     }
 
-    /// Reuse pattern from handle.rs: Arc-wrapped dispatcher so the test
-    /// keeps a handle to inspect `seen()` after the manager calls capture.
-    struct MoveRecording(std::sync::Arc<RecordingDispatcher>);
-    impl JobDispatcher for MoveRecording {
-        async fn run(&self, argv: &[String]) -> Result<i32> {
-            self.0.run(argv).await
-        }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
-            self.0.capture(argv).await
-        }
-    }
+    use crate::sbatch::test_util::ArcDispatcher;
 
     #[tokio::test]
     async fn cancel_invokes_scancel_with_jobid() {
         let cmd = SbatchCmd::new("/w/job.sh");
         let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![(0, String::new())]));
-        let dispatcher = into_dyn(MoveRecording(recorder.clone()));
+        let dispatcher = into_dyn(ArcDispatcher(recorder.clone()));
         let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
 
         mgr.cancel(12345).await.expect("cancel should succeed");
@@ -623,13 +675,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_uses_scancel_bin_override_when_set() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![(0, String::new())]));
+        let dispatcher = into_dyn(ArcDispatcher(recorder.clone()));
+        let mgr = SbatchManager::new(cmd)
+            .with_dispatcher(dispatcher)
+            .with_scancel_bin("/tmp/fake-scancel");
+
+        mgr.cancel(99).await.expect("cancel should succeed");
+
+        let seen = recorder.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0][0], "/tmp/fake-scancel");
+        assert_eq!(seen[0][1], "99");
+    }
+
+    #[tokio::test]
     async fn cancel_returns_scancel_error_on_nonzero_exit() {
         let cmd = SbatchCmd::new("/w/job.sh");
         let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![(
             1,
             "scancel: error: Invalid job id".to_string(),
         )]));
-        let dispatcher = into_dyn(MoveRecording(recorder));
+        let dispatcher = into_dyn(ArcDispatcher(recorder));
         let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
 
         match mgr.cancel(99).await {
@@ -652,7 +721,7 @@ mod tests {
 
         // Recorder must remain unused — guard fires before spawn touches sbatch.
         let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![]));
-        let dispatcher = into_dyn(MoveRecording(recorder.clone()));
+        let dispatcher = into_dyn(ArcDispatcher(recorder.clone()));
         let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
 
         match mgr.run().await {
@@ -744,6 +813,61 @@ mod tests {
             }
             other => panic!("expected JobFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_with_invokes_callback_with_jobid_before_terminal() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(RunCannedDispatcher::new(
+            "Submitted batch job 5151\n",
+            "",
+            "5151|COMPLETED|None|0:0\n",
+        ));
+        let mgr = SbatchManager::new(cmd)
+            .with_dispatcher(dispatcher)
+            .with_poll_interval(std::time::Duration::from_millis(1));
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+        let captured_clone = captured.clone();
+
+        let finished = mgr
+            .run_with(move |jid| *captured_clone.lock().unwrap() = Some(jid))
+            .await
+            .expect("run_with should succeed");
+
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(5151),
+            "on_spawn must have fired with the submitted jobid before terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_callback_not_invoked_when_array_spec_rejected() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.array_spec = Some("0-2".parse::<SlurmArraySpec>().unwrap());
+
+        let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![]));
+        let dispatcher = into_dyn(ArcDispatcher(recorder));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        let fired = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let fired_clone = fired.clone();
+
+        match mgr
+            .run_with(move |_| *fired_clone.lock().unwrap() = true)
+            .await
+        {
+            Err(SbatchRunError::ArrayNotSupported) => {}
+            other => panic!("expected ArrayNotSupported, got {other:?}"),
+        }
+        assert!(
+            !*fired.lock().unwrap(),
+            "callback must NOT fire when array rejection short-circuits before spawn"
+        );
     }
 
     #[tokio::test]

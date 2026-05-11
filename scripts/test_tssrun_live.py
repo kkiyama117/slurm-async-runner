@@ -168,8 +168,7 @@ async def _exercise_backend(
 
     handle = await manager.spawn()
     pid = await handle.pid
-    # Phase 3 P5: ``uuid`` is sync. ``uuid_async`` preserves the legacy
-    # await-style getter for callers that haven't migrated yet.
+    # ``uuid`` is a sync getter (lock-free read off the local watch::Receiver).
     uuid = handle.uuid
     assert pid > 0, f"[{label}] expected pid > 0, got {pid}"
     # uuid is the canonical hyphenated form, e.g.

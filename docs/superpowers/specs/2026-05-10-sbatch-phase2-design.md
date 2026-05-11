@@ -572,6 +572,8 @@ impl SbatchManager {
 }
 ```
 
+**Post-Phase-2 follow-up (recorded after implementation)**: PR #6 review M2 が「`tokio::time::timeout(dur, mgr.run())` で drop された future からは caller が jobid を取得できず、`mgr.cancel(jobid)` を呼べない」点を指摘した。spec §6.1 の意図 (caller-managed timeout + 別途 cancel) を充足するため、実装側で `run_with<F: FnOnce(u64)>(on_spawn: F)` callback variant を追加 (spawn 直後に on_spawn(jobid) を同期呼出)。既存 `run()` は `run_with(|_| {})` への薄い委譲となる。Python では `PySbatchManager.run_with_jobid_callback(on_spawn)` として露出。Spec 本文の API スケッチは記録時点のスナップショットとして残し、現状の実装シェイプは `src/sbatch/manager.rs` を正とする。
+
 ### 6.2 `SbatchRunError`
 
 ```rust
