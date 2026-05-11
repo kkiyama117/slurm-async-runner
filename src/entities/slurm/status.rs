@@ -142,8 +142,10 @@ impl JobState {
             // KUDPC qgroup -l pending token
             "QUE" => Self::Pending,
 
-            // KUDPC qgroup -l completed token
-            "COMPLETED" | "CD" | "CMP" => Self::Completed,
+            // KUDPC qgroup -l completed tokens. `FINI` is a one-way
+            // alias: parse maps it to Completed but `as_token` returns
+            // the SLURM canonical `COMPLETED`.
+            "COMPLETED" | "CD" | "CMP" | "FINI" => Self::Completed,
 
             "BOOT_FAIL" | "BF" => Self::BootFail,
             "CANCELLED" | "CA" => Self::Cancelled,
@@ -484,6 +486,18 @@ mod tests {
     #[test]
     fn job_state_parse_trailing_context() {
         assert_eq!(JobState::parse("CANCELLED by 1234"), JobState::Cancelled);
+    }
+
+    /// KUDPC `qgroup -l` emits `FINI` for finished jobs. Must map to
+    /// `Completed` (which is `is_terminal()`) so `wait_terminal` exits.
+    /// `as_token` still returns the SLURM canonical `COMPLETED` — `FINI`
+    /// is a one-way input alias only.
+    #[test]
+    fn job_state_parse_kudpc_fini_token_maps_to_completed() {
+        let st = JobState::parse("FINI");
+        assert_eq!(st, JobState::Completed);
+        assert!(st.is_terminal(), "FINI must be treated as terminal");
+        assert_eq!(st.as_token(), "COMPLETED");
     }
 
     #[test]

@@ -301,39 +301,49 @@ pub(crate) fn parse_sacct_with_exit_code(text: &str) -> HashMap<u64, JobOutcome>
 
 /// Parse `qgroup -l` output into a `{jobid: JobStatus}` map.
 ///
-/// Expected layout (KUDPC):
+/// Expected layout (KUDPC; the pipe-separated form is the current shape
+/// observed in production):
 /// ```text
-/// QUEUE     USER     JOBID          STATUS  PROC  CORE    MEM    ELAPSE(    limit)
-/// gr19999b  b59999   12345          RUN        4     1  4570M  00:00:07( 01:00:00)
+///  QUEUE    USER     JOBID    | STAT  SUBMIT_AT        | RSC:core | PROC CORE    MEM       ELAPSE
+///  gr10641a b39027   7519503  | FINI  2026-05-12 01:29 |        1 |    1    1  1070M     00:01:00
 /// ```
 ///
+/// Earlier KUDPC layouts emitted the same columns without `|` separators
+/// (`QUEUE USER JOBID STATUS …`); both forms are accepted because the
+/// parser ignores standalone `|` tokens.
+///
 /// Behaviour:
-/// - Whitespace-split each line; take field index 2 as JOBID and 3 as STATUS.
-/// - Lines without at least 4 fields are skipped (header, blanks).
-/// - Lines whose JOBID field is not a valid u64 are skipped.
+/// - Whitespace-split each line and drop `|` tokens (KUDPC column dividers).
+/// - First numeric token is taken as JOBID; the next non-`|` token after it
+///   is taken as STATUS.
+/// - Lines without a parseable JOBID are skipped (header rows, blanks, the
+///   per-queue and per-user summary rows where the JOBID column is absent).
 /// - State strings are forwarded to `JobState::parse` (handles "RUN", "QUE",
-///   "CMP", and SLURM long forms thanks to forward-compat fallbacks).
+///   "CMP", "FINI", and SLURM long forms thanks to forward-compat fallbacks).
 /// - Reason is set to `JobReason::None` (qgroup -l does not surface reasons).
 pub fn parse_qgroup_l(stdout: &str) -> HashMap<u64, JobStatus> {
     let mut out = HashMap::new();
     for line in stdout.lines() {
-        let mut fields = line.split_whitespace();
-        // Skip the QUEUE and USER columns; KUDPC's `qgroup -l` always
-        // outputs them as the first two columns. If that layout changes,
-        // adjust both this skip count AND the field indices below.
-        let _queue = fields.next();
-        let _user = fields.next();
-        let jobid_str = match fields.next() {
-            Some(s) => s,
-            None => continue,
+        // Drop standalone `|` column dividers (current KUDPC layout);
+        // the older pipe-less layout passes through unchanged.
+        let mut tokens = line.split_whitespace().filter(|t| *t != "|");
+        let _queue = tokens.next();
+        let _user = tokens.next();
+        let Some(jobid_str) = tokens.next() else {
+            continue;
         };
-        let state_str = match fields.next() {
-            Some(s) => s,
-            None => continue,
+        let Some(state_str) = tokens.next() else {
+            continue;
         };
         let Ok(jobid) = jobid_str.parse::<u64>() else {
             continue;
         };
+        // SLURM/KUDPC jobids are positive; a literal `0` here means the
+        // line is a summary row (`QUEUE SYS | RUN PEND OTHER …`) whose
+        // third token happens to be a count, not a real jobid.
+        if jobid == 0 {
+            continue;
+        }
         out.insert(
             jobid,
             JobStatus {
@@ -939,6 +949,50 @@ gr19999b u 5555 CMP 1
 ";
         let map = super::parse_qgroup_l(out);
         assert_eq!(map.get(&5555).map(|s| s.state), Some(JobState::Completed));
+    }
+
+    /// Current KUDPC `qgroup -l` output uses `|` as column dividers and
+    /// emits `FINI` as the "completed" status token. Regression guard for
+    /// the bug where `wait_terminal` timed out at 180 s even though the
+    /// job had finished, because the previous parser took field index 3
+    /// (`"|"`) as STATUS and `FINI` had no mapping in `JobState::parse`.
+    #[test]
+    fn parse_qgroup_l_handles_kudpc_pipe_separated_fini_row() {
+        let out = "\
+ QUEUE    SYS |   RUN  PEND OTHER | ALLOC ( MIN/ STD/ MAX)
+----------------------------------------------------------------
+ gr10641a  A  |     0     0     1 |     0 (   0/ 112/ 112)
+
+ QUEUE    USER     |   RUN(ALLOC)  PEND(REQUEST) OTHER(REQUEST)
+----------------------------------------------------------------
+ gr10641a b39027   |     0(    0)     0(     0)     1(     1)
+
+ QUEUE    USER     JOBID    | STAT  SUBMIT_AT        | RSC:core | PROC CORE    MEM       ELAPSE
+------------------------------------------------------------------------------------------------
+ gr10641a b39027   7519503  | FINI  2026-05-12 01:29 |        1 |    1    1  1070M     00:01:00
+";
+        let map = super::parse_qgroup_l(out);
+        // Only the detail row carries a real jobid; the two summary
+        // sections must be skipped.
+        assert_eq!(map.len(), 1, "expected 1 detail row, got: {map:?}");
+        assert_eq!(
+            map.get(&7519503).map(|s| s.state),
+            Some(JobState::Completed),
+            "FINI must map to Completed so wait_terminal can exit"
+        );
+    }
+
+    /// The pending-side equivalent of the KUDPC pipe layout — `QUE`
+    /// should still resolve to `Pending`, confirming the new token
+    /// stream filter works for non-terminal states too.
+    #[test]
+    fn parse_qgroup_l_handles_kudpc_pipe_separated_que_row() {
+        let out = "\
+ gr10641a b39027   7519600  | QUE   2026-05-12 02:00 |        1 |    1    1  1070M     00:00:00
+";
+        let map = super::parse_qgroup_l(out);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&7519600).map(|s| s.state), Some(JobState::Pending));
     }
 
     // ---- parse_squeue_array_task ----
