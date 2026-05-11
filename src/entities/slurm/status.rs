@@ -150,7 +150,10 @@ impl JobState {
             "BOOT_FAIL" | "BF" => Self::BootFail,
             "CANCELLED" | "CA" => Self::Cancelled,
             "DEADLINE" | "DL" => Self::Deadline,
-            "FAILED" | "F" => Self::Failed,
+            // KUDPC qgroup -l failed token. `FAIL` is a one-way alias:
+            // parse maps it to Failed but `as_token` returns the SLURM
+            // canonical `FAILED`. Symmetric with `FINI` → `Completed`.
+            "FAILED" | "F" | "FAIL" => Self::Failed,
             "NODE_FAIL" | "NF" => Self::NodeFail,
             "OUT_OF_MEMORY" | "OOM" => Self::OutOfMemory,
             "PREEMPTED" | "PR" => Self::Preempted,
@@ -498,6 +501,19 @@ mod tests {
         assert_eq!(st, JobState::Completed);
         assert!(st.is_terminal(), "FINI must be treated as terminal");
         assert_eq!(st.as_token(), "COMPLETED");
+    }
+
+    /// KUDPC `qgroup -l` emits `FAIL` for jobs whose script exited
+    /// non-zero. Must map to `Failed` (terminal) so `wait_terminal`
+    /// exits and `refresh_with_sacct` proceeds to resolve the actual
+    /// exit code. `as_token` returns the SLURM canonical `FAILED` —
+    /// `FAIL` is a one-way input alias only. Symmetric with `FINI`.
+    #[test]
+    fn job_state_parse_kudpc_fail_token_maps_to_failed() {
+        let st = JobState::parse("FAIL");
+        assert_eq!(st, JobState::Failed);
+        assert!(st.is_terminal(), "FAIL must be treated as terminal");
+        assert_eq!(st.as_token(), "FAILED");
     }
 
     #[test]

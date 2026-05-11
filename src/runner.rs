@@ -995,6 +995,27 @@ gr19999b u 5555 CMP 1
         assert_eq!(map.get(&7519600).map(|s| s.state), Some(JobState::Pending));
     }
 
+    /// KUDPC qgroup -l emits two side-by-side detail rows when both a
+    /// finished and a failed job are still in the listing — confirms the
+    /// FINI/FAIL token pair resolves to terminal states so
+    /// `wait_terminal` exits for both outcomes.
+    #[test]
+    fn parse_qgroup_l_handles_kudpc_pipe_separated_fini_and_fail_rows() {
+        let out = "\
+ QUEUE    USER     JOBID    | STAT  SUBMIT_AT        | RSC:core | PROC CORE    MEM       ELAPSE
+------------------------------------------------------------------------------------------------
+ gr10641a b39027   7519510  | FINI  2026-05-12 01:48 |        1 |    1    1  1070M     00:01:00
+ gr10641a b39027   7519511  | FAIL  2026-05-12 01:49 |        1 |    1    1  1070M     00:01:00
+";
+        let map = super::parse_qgroup_l(out);
+        assert_eq!(map.len(), 2, "expected 2 detail rows, got: {map:?}");
+        assert_eq!(
+            map.get(&7519510).map(|s| s.state),
+            Some(JobState::Completed),
+        );
+        assert_eq!(map.get(&7519511).map(|s| s.state), Some(JobState::Failed));
+    }
+
     // ---- parse_squeue_array_task ----
 
     #[test]
