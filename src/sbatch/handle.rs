@@ -196,6 +196,14 @@ impl SbatchJobHandle {
         Some(self.0.snapshot_tx.borrow().jobid)
     }
 
+    pub fn array_jobid(&self) -> Option<u64> {
+        self.snapshot().array_jobid
+    }
+
+    pub fn array_task_id(&self) -> Option<u32> {
+        self.snapshot().array_task_id
+    }
+
     pub fn partition(&self) -> Option<JobPartition> {
         self.0.snapshot_tx.borrow().partition.clone()
     }
