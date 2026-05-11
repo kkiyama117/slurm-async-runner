@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, final
 if TYPE_CHECKING:
     from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
         MailTypeInput,
+        SlurmArraySpec,
         SlurmDependency,
         SlurmSignalSpec,
     )
@@ -46,6 +47,7 @@ class SbatchCmd:
         mail_user: builtins.str | None = None,
         mail_types: "MailTypeInput | None" = None,
         signal: "SlurmSignalSpec | None" = None,
+        array_spec: "SlurmArraySpec | None" = None,
     ) -> None: ...
 
 @final
@@ -64,6 +66,10 @@ class SbatchJobHandle:
     def uuid(self) -> builtins.str: ...
     @property
     def jobid(self) -> builtins.int | None: ...
+    @property
+    def array_jobid(self) -> builtins.int | None: ...
+    @property
+    def array_task_id(self) -> builtins.int | None: ...
     @property
     def partition(self) -> builtins.str | None: ...
     @property
@@ -119,3 +125,9 @@ class SbatchManager:
         self,
         path: builtins.str | os.PathLike[builtins.str],
     ) -> Awaitable[SbatchJobHandle]: ...
+    def spawn_array(
+        self, array_spec: "SlurmArraySpec"
+    ) -> Awaitable[builtins.list[SbatchJobHandle]]: ...
+    def attach_array_jobid(
+        self, master_jobid: builtins.int
+    ) -> Awaitable[builtins.list[SbatchJobHandle]]: ...
