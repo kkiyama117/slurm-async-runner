@@ -36,6 +36,17 @@ pub trait JobStateStore<S: JobSnapshot>: Send + Sync {
             .into_iter()
             .find(|s| s.jobid() == Some(jobid)))
     }
+
+    /// Find every snapshot whose `jobid` matches. For single jobs the result
+    /// has 0 or 1 entries; for array submissions it has one entry per task.
+    async fn find_all_by_jobid(&self, jobid: u64) -> Result<Vec<S>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| s.jobid() == Some(jobid))
+            .collect())
+    }
 }
 
 #[derive(Clone)]
