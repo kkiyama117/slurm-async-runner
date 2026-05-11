@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 2 P4)
+
+- **`crate::entities::slurm::SlurmSignalSpec`** + **`SignalIdent`** — new
+  entity modeling SLURM's `--signal=[R:]<sig_num|sig_name>[@<sig_time>]` BNF.
+  `FromStr` accepts: `"USR1"`, `"15"`, `"USR1@60"`, `"R:USR1"`,
+  `"R:SIGTERM@30"`, `"R:9@5"`. Rejects: empty, lowercase `r:`,
+  signal number outside `1..=64`, seconds zero, seconds above `u16::MAX`,
+  empty signal, signal names with non-uppercase/non-digit/non-underscore
+  characters. `Display` round-trips with `FromStr`. `serde::Serialize` /
+  `Deserialize` via the string form.
+- **`SbatchCmd::signal: Option<SlurmSignalSpec>`** — emits
+  `["--signal", spec.to_string()]` between `--mail-type` and `--no-requeue`.
+  Python:
+  `PySbatchCmd(..., signal=SlurmSignalSpec.parse("USR1@60"))`.
+- **`PySlurmSignalSpec`** pyo3 wrapper at
+  `slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options.SlurmSignalSpec`
+  exposes `parse(s)` static method, `__str__`, and getters
+  `allow_resignal`, `signal` (rendered Display form), `seconds_before_end`.
+
 ### Added (Phase 2 P3)
 
 - **`SbatchSpawnError::InvalidExportKey { key }`** and
