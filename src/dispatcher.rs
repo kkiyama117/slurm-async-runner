@@ -10,7 +10,11 @@
 //!
 //! - [`TokioDispatcher`] — production. Uses `tokio::process::Command`,
 //!   pipes both stdout and stderr, and (for `run`) echoes them after
-//!   the child exits.
+//!   the child exits. For `capture`, stderr is appended after stdout
+//!   with a `\n[stderr]\n` marker so failure diagnostics (`sbatch: error:
+//!   …`) reach the caller's error message. Line-based parsers
+//!   (`parse_submitted_jobid`, squeue / sacct / qgroup parsers) are
+//!   unaffected because they ignore lines that don't match their prefix.
 //! - [`DryRunDispatcher`] — testing / dry-run. Prints the argv that
 //!   *would* have been spawned and returns success without touching
 //!   the OS.
@@ -47,8 +51,19 @@ pub trait JobDispatcher: Send + Sync {
     /// child was signal-killed).
     fn run(&self, argv: &[String]) -> impl Future<Output = Result<i32>> + Send;
 
-    /// Spawn `argv` and capture stdout. Returns `(exit_code, stdout)`;
-    /// stderr is discarded. Used for `squeue` / `sacct` style queries.
+    /// Spawn `argv` and capture its output. Returns `(exit_code, output)`.
+    ///
+    /// Production implementations (e.g. [`TokioDispatcher`]) merge stderr
+    /// into the returned `output`: if stderr is non-empty, the second
+    /// tuple element is `"{stdout}\n[stderr]\n{stderr}"`; otherwise it is
+    /// just `stdout`. This contract exists so that command failures
+    /// (e.g. `sbatch: error: invalid partition`) surface in
+    /// [`crate::sbatch::error::SbatchSpawnError::SubmitFailed::output`]
+    /// rather than being silently dropped.
+    ///
+    /// Used for `sbatch`, `scancel`, `squeue`, `sacct`, and `qgroup` style
+    /// queries. Their line-based parsers ignore the `[stderr]` marker line
+    /// and any subsequent stderr lines that don't match the expected prefix.
     fn capture(&self, argv: &[String]) -> impl Future<Output = Result<(i32, String)>> + Send;
 }
 
@@ -157,8 +172,16 @@ impl JobDispatcher for TokioDispatcher {
             .await
             .with_context(|| format!("failed to spawn `{program}`"))?;
         let code = output.status.code().unwrap_or(0);
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        Ok((code, stdout))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = if stderr.trim().is_empty() {
+            stdout.into_owned()
+        } else if stdout.is_empty() {
+            format!("[stderr]\n{stderr}")
+        } else {
+            format!("{stdout}\n[stderr]\n{stderr}")
+        };
+        Ok((code, combined))
     }
 }
 
@@ -299,6 +322,55 @@ mod tests {
             .unwrap();
         assert_eq!(code, 0);
         assert_eq!(out.trim(), "hello world");
+    }
+
+    /// Failure-mode diagnostic contract: when a child writes to stderr
+    /// (e.g. `sbatch: error: invalid partition`), `capture` must surface
+    /// it via the returned `output` string. Regression guard for the bug
+    /// where `RuntimeError: sbatch invocation failed (exit=1):` reached
+    /// Python with an empty message.
+    #[tokio::test]
+    async fn tokio_capture_merges_stderr_after_stdout() {
+        let d = TokioDispatcher;
+        let (code, out) = d
+            .capture(&[
+                "sh".into(),
+                "-c".into(),
+                "echo on-stdout; echo on-stderr 1>&2; exit 1".into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            out.contains("on-stdout"),
+            "stdout content must be preserved, got: {out:?}"
+        );
+        assert!(
+            out.contains("on-stderr"),
+            "stderr content must be appended for diagnostics, got: {out:?}"
+        );
+        assert!(
+            out.contains("[stderr]"),
+            "stderr section must be marked, got: {out:?}"
+        );
+    }
+
+    /// stdout-only commands must not gain a spurious `[stderr]` marker.
+    /// Pins the success path so existing line-based parsers
+    /// (`parse_submitted_jobid` etc.) stay unaffected.
+    #[tokio::test]
+    async fn tokio_capture_stderr_empty_leaves_stdout_unchanged() {
+        let d = TokioDispatcher;
+        let (code, out) = d
+            .capture(&["sh".into(), "-c".into(), "echo only-stdout".into()])
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "only-stdout");
+        assert!(
+            !out.contains("[stderr]"),
+            "no stderr marker when stderr empty, got: {out:?}"
+        );
     }
 
     #[tokio::test]
