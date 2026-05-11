@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::entities::slurm::{
-    JobPartition, JobTimeLimit, MailAddress, MailTypeInput, ResourceSpec, SlurmDependency,
-    SlurmSignalSpec,
+    JobPartition, JobTimeLimit, MailAddress, MailTypeInput, ResourceSpec, SlurmArraySpec,
+    SlurmDependency, SlurmSignalSpec,
 };
 use crate::sbatch::error::SbatchSpawnError;
 use crate::util::path::absolutize;
@@ -28,6 +28,14 @@ pub struct SbatchCmd {
     pub output: Option<String>,
     pub error: Option<String>,
     pub chdir: Option<PathBuf>,
+
+    /// `--array` (`-a`) spec. When `Some`, emitted as `["-a", spec.to_string()]`
+    /// (e.g. `["-a", "0-7%2"]`). Use [`crate::sbatch::manager::SbatchManager::spawn_array`]
+    /// to submit array jobs; direct `spawn()` with `array_spec.is_some()` is
+    /// permitted (single sbatch invocation, one snapshot for the master
+    /// jobid), but the caller will only receive ONE handle pointing at the
+    /// master snapshot rather than per-task handles.
+    pub array_spec: Option<SlurmArraySpec>,
 
     /// `--dependency` (`-d`) spec. When `Some`, emitted as `["-d", dep.to_string()]`
     /// (e.g. `["-d", "afterok:200,afterany:201"]`).
@@ -70,6 +78,7 @@ impl SbatchCmd {
             output: None,
             error: None,
             chdir: None,
+            array_spec: None,
             dependency: None,
             mail_user: None,
             mail_types: None,
@@ -116,6 +125,10 @@ impl SbatchCmd {
         if let Some(c) = &self.chdir {
             argv.push("--chdir".to_string());
             argv.push(absolutize(c)?);
+        }
+        if let Some(a) = &self.array_spec {
+            argv.push("-a".to_string());
+            argv.push(a.to_string());
         }
         if !self.env.is_empty() {
             argv.push(format!("--export={}", render_export(&self.env)?));
@@ -528,6 +541,59 @@ mod tests {
             argv.iter()
                 .any(|a| a == "--export=ALL,FOO=bar,OMP_NUM_THREADS=8"),
             "expected canonical --export form, got argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn array_spec_emits_dash_a_with_display_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.array_spec = Some("0-3".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv.iter().position(|a| a == "-a").expect("-a present");
+        assert_eq!(argv[i + 1], "0-3");
+    }
+
+    #[test]
+    fn array_spec_with_max_concurrent_renders_percent_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.array_spec = Some("0-7%2".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv.iter().position(|a| a == "-a").expect("-a present");
+        assert_eq!(argv[i + 1], "0-7%2");
+    }
+
+    #[test]
+    fn array_spec_with_step_renders_colon_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.array_spec = Some("0-15:4".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv.iter().position(|a| a == "-a").expect("-a present");
+        assert_eq!(argv[i + 1], "0-15:4");
+    }
+
+    #[test]
+    fn array_spec_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "-a"));
+    }
+
+    #[test]
+    fn array_spec_emits_after_chdir_and_before_export() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.chdir = Some(PathBuf::from("/work"));
+        cmd.array_spec = Some("0-3".parse().unwrap());
+        cmd.env.insert("FOO".to_string(), "bar".to_string());
+        let argv = cmd.build_argv().unwrap();
+        let chdir_idx = argv.iter().position(|a| a == "--chdir").unwrap();
+        let array_idx = argv.iter().position(|a| a == "-a").unwrap();
+        let export_idx = argv
+            .iter()
+            .position(|a| a.starts_with("--export="))
+            .unwrap();
+        assert!(
+            chdir_idx < array_idx && array_idx < export_idx,
+            "expected chdir < -a < --export, got argv={argv:?}"
         );
     }
 }
