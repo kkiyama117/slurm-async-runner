@@ -65,11 +65,9 @@ def test_manager_spawn_then_wait_then_jobid() -> None:
             assert (await h.pid) > 0
             code = await h.wait()
             assert code == 0
-            # Phase 3 P5: ``jobid`` is sync. ``jobid_async`` preserves the
-            # pre-P5 await-style contract; exercise both shapes here so a
-            # future tssrun-only async-shape regression surfaces.
+            # ``jobid`` and ``uuid`` are sync; ``node`` / ``sent_env``
+            # remain async-wrapped.
             assert h.jobid == 555
-            assert (await h.jobid_async) == 555
             assert (await h.node) == "node-py"
 
     asyncio.run(run())

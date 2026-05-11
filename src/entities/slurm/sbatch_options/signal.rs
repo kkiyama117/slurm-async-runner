@@ -47,6 +47,16 @@ impl std::fmt::Display for SlurmSignalSpec {
     }
 }
 
+/// Parse a Slurm `--signal` identifier — `<sig_num>` (1..=64) or
+/// `<sig_name>` matching `^[A-Z][A-Z0-9_]*$`.
+///
+/// **Lexical-only validation.** We do NOT verify that `<sig_name>` is a
+/// real POSIX/Linux signal token (e.g. `SIGTERM`, `USR1`); any uppercase
+/// alpha-numeric identifier is accepted at this layer. Semantic
+/// validation — whether the kernel knows the signal — is deferred to
+/// SLURM at submit time, which will reject unknown names with a
+/// `sbatch: error: --signal: invalid signal specification` line that
+/// surfaces via [`crate::sbatch::error::SbatchSpawnError::SubmitFailed`].
 fn parse_signal_ident(s: &str) -> Result<SignalIdent, SchemaParseError> {
     let err = || SchemaParseError::ParseError {
         key: "signal/identifier".to_string(),
@@ -63,7 +73,7 @@ fn parse_signal_ident(s: &str) -> Result<SignalIdent, SchemaParseError> {
         }
         return Ok(SignalIdent::Number(n));
     }
-    // Name form: ^[A-Z][A-Z0-9_]*$
+    // Name form: ^[A-Z][A-Z0-9_]*$ — lexical shape only, no signal-table lookup.
     let mut chars = s.chars();
     let first = chars.next().ok_or_else(err)?;
     if !first.is_ascii_uppercase() {

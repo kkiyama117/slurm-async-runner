@@ -203,40 +203,19 @@ impl PyTssrunJobHandle {
     /// SLURM job id once observed. ``None`` until the child emits the
     /// ``salloc:`` banner.
     ///
-    /// Phase 3 P5: sync getter (was async-wrapped). Reads are lock-free
-    /// off the local ``watch::Receiver`` — there is no tokio runtime work
-    /// to wait on, so the async wrapper was bogus overhead. See
-    /// ``jobid_async`` for the legacy async-style getter.
+    /// Reads are lock-free off the local ``watch::Receiver``.
     #[getter]
     fn jobid(&self) -> Option<u64> {
         self.rx.borrow().jobid
-    }
-
-    /// Async-style equivalent of ``jobid``. Kept for callers that wired
-    /// an ``await`` against the pre-Phase 3 P5 contract.
-    #[getter]
-    fn jobid_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let jobid = self.rx.borrow().jobid;
-        future_into_py(py, async move { Ok(jobid) })
     }
 
     /// UUID v7 primary key for this job. Returned as the canonical
     /// hyphenated string (e.g. ``"0190cc1c-7a48-7c0e-a0a0-1234567890ab"``)
     /// so it can be passed straight back to ``attach_uuid`` or used as a
     /// dict key without needing to depend on Python's ``uuid`` module.
-    ///
-    /// Phase 3 P5: sync getter (was async-wrapped). See ``uuid_async``
-    /// for the legacy async-style getter.
     #[getter]
     fn uuid(&self) -> String {
         self.rx.borrow().uuid.to_string()
-    }
-
-    /// Async-style equivalent of ``uuid``.
-    #[getter]
-    fn uuid_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let uuid = self.rx.borrow().uuid.to_string();
-        future_into_py(py, async move { Ok(uuid) })
     }
 
     #[getter]
@@ -262,48 +241,21 @@ impl PyTssrunJobHandle {
 
     /// True while the child has not yet recorded a terminal ``finished``
     /// state in the local snapshot.
-    ///
-    /// Phase 3 P5: sync method (was async-wrapped). See
-    /// ``is_running_async`` for the legacy async-style method.
     fn is_running(&self) -> bool {
         self.rx.borrow().finished.is_none()
     }
 
-    /// Async-style equivalent of ``is_running``.
-    fn is_running_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let running = self.rx.borrow().finished.is_none();
-        future_into_py(py, async move { Ok(running) })
-    }
-
-    /// Inverse of ``is_running``. Phase 3 P4: exposed for parity with
+    /// Inverse of ``is_running``. Exposed for parity with
     /// ``SbatchJobHandle.is_finished`` and to satisfy the
     /// ``slurm_async_runner.JobHandleCommon`` runtime Protocol.
-    ///
-    /// Phase 3 P5: sync method (was async-wrapped). See
-    /// ``is_finished_async`` for the legacy async-style method.
     fn is_finished(&self) -> bool {
         self.rx.borrow().finished.is_some()
     }
 
-    /// Async-style equivalent of ``is_finished``.
-    fn is_finished_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let finished = self.rx.borrow().finished.is_some();
-        future_into_py(py, async move { Ok(finished) })
-    }
-
     /// Exit code if the child exited normally; ``None`` if killed by
     /// signal or if the finished record has not yet been populated.
-    ///
-    /// Phase 3 P5: sync method (was async-wrapped). See
-    /// ``exit_code_async`` for the legacy async-style method.
     fn exit_code(&self) -> Option<i32> {
         self.rx.borrow().finished.as_ref().and_then(|f| f.exit_code)
-    }
-
-    /// Async-style equivalent of ``exit_code``.
-    fn exit_code_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let code = self.rx.borrow().finished.as_ref().and_then(|f| f.exit_code);
-        future_into_py(py, async move { Ok(code) })
     }
 
     /// Wait for the child to exit. Returns:
