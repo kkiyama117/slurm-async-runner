@@ -231,6 +231,32 @@ impl SbatchManager {
     ) -> Result<SbatchJobHandle, SbatchAttachError> {
         self.attach(SbatchAttachKey::File(p.into())).await
     }
+
+    /// Attach to all per-task snapshots of an array job by its master jobid.
+    ///
+    /// Returns handles sorted by `array_task_id` ascending. Empty result
+    /// (`Ok(vec![])`) means "no array-task snapshots stored under this
+    /// master jobid"; single-job snapshots (with `array_task_id == None`)
+    /// are filtered out even if they share the master jobid.
+    pub async fn attach_array_jobid(
+        &self,
+        master_jobid: u64,
+    ) -> Result<Vec<SbatchJobHandle>, SbatchAttachError> {
+        let snaps = self
+            .store
+            .find_all_by_jobid(master_jobid)
+            .await
+            .map_err(SbatchAttachError::Io)?;
+        let mut filtered: Vec<SbatchJobSnapshot> = snaps
+            .into_iter()
+            .filter(|s| s.array_task_id.is_some())
+            .collect();
+        filtered.sort_by_key(|s| s.array_task_id);
+        Ok(filtered
+            .into_iter()
+            .map(|snap| SbatchJobHandle::new(snap, self.store.clone(), self.dispatcher.clone()))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +444,55 @@ mod tests {
             err,
             SbatchSpawnError::SubmitFailed { exit_code: 1, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn attach_array_jobid_returns_all_tasks_sorted() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::ok(60000));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        let spec: SlurmArraySpec = "0-2".parse().unwrap();
+        let _spawned = mgr.spawn_array(spec).await.unwrap();
+
+        let attached = mgr.attach_array_jobid(60000).await.unwrap();
+        assert_eq!(attached.len(), 3);
+        assert_eq!(attached[0].snapshot().array_task_id, Some(0));
+        assert_eq!(attached[1].snapshot().array_task_id, Some(1));
+        assert_eq!(attached[2].snapshot().array_task_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn attach_array_jobid_empty_when_no_match() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::ok(1));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+        let attached = mgr.attach_array_jobid(99999).await.unwrap();
+        assert!(attached.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_jobid_returns_multiple_match_for_array_master() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::ok(70000));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        let spec: SlurmArraySpec = "0-1".parse().unwrap();
+        let _ = mgr.spawn_array(spec).await.unwrap();
+
+        let Err(err) = mgr.attach_jobid(70000).await else {
+            panic!("attach_jobid on array master should error")
+        };
+        match err {
+            SbatchAttachError::MultipleMatch { jobid, count } => {
+                assert_eq!(jobid, 70000);
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected MultipleMatch, got {other:?}"),
+        }
     }
 }
