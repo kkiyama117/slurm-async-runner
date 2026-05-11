@@ -104,14 +104,14 @@ impl SbatchJobSnapshot {
         self.log
             .output_template
             .as_deref()
-            .map(|t| resolve_log_path(t, self.jobid, self.job_name.as_deref()))
+            .map(|t| resolve_log_path(t, self.jobid, self.array_task_id, self.job_name.as_deref()))
     }
 
     pub fn error_path(&self) -> Option<PathBuf> {
         self.log
             .error_template
             .as_deref()
-            .map(|t| resolve_log_path(t, self.jobid, self.job_name.as_deref()))
+            .map(|t| resolve_log_path(t, self.jobid, self.array_task_id, self.job_name.as_deref()))
     }
 
     pub fn is_running(&self) -> bool {
