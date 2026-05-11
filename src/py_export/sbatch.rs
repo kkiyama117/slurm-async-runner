@@ -355,11 +355,6 @@ impl PySbatchJobHandle {
     }
 
     #[getter]
-    fn array_jobid(&self) -> Option<u64> {
-        self.0.array_jobid()
-    }
-
-    #[getter]
     fn array_task_id(&self) -> Option<u32> {
         self.0.array_task_id()
     }
