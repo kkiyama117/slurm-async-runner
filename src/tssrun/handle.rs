@@ -1,19 +1,19 @@
-//! [`JobHandleSnapshot`] (Serde) and [`JobHandle`] (in-process state) plus
+//! [`TssrunJobSnapshot`] (Serde) and [`TssrunJobHandle`] (in-process state) plus
 //! the free function [`read_live_env_for_pid`] for callers that only have
 //! a pid but need to inspect the child's `/proc/<pid>/environ`.
 //!
 //! ## Snapshot vs. owner split
 //!
-//! [`JobHandle`] keeps two pieces of state:
+//! [`TssrunJobHandle`] keeps two pieces of state:
 //!
 //! - A [`tokio::sync::watch`] channel whose value is the current
-//!   [`JobHandleSnapshot`]. Cloned via [`JobHandle::watch`] for any reader
+//!   [`TssrunJobSnapshot`]. Cloned via [`TssrunJobHandle::watch`] for any reader
 //!   that wants lock-free polling — including the pyo3 binding.
 //! - Three `Option<JoinHandle<…>>` fields (wait + tee_stdout + tee_stderr)
-//!   that are `.take()`-d exactly once during [`JobHandle::wait`]. After
+//!   that are `.take()`-d exactly once during [`TssrunJobHandle::wait`]. After
 //!   wait completes, the handle is "drained" and can no longer wait again.
 //!
-//! Attached handles ([`JobHandle::attach_snapshot`]) skip the join handles
+//! Attached handles ([`TssrunJobHandle::attach_snapshot`]) skip the join handles
 //! and only carry the receiver — `wait()` on them returns
 //! `Err("not owner of the child / already waited")`.
 //!
@@ -78,7 +78,7 @@ pub struct FinishedInfo {
 /// SLURM emits the `salloc:` banner. Persisted snapshots are stored as
 /// `{state_dir}/{uuid}.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JobHandleSnapshot {
+pub struct TssrunJobSnapshot {
     pub uuid: Uuid,
     pub pid: u32,
     pub argv: Vec<String>,
@@ -91,7 +91,7 @@ pub struct JobHandleSnapshot {
     pub finished: Option<FinishedInfo>,
 }
 
-impl JobHandleSnapshot {
+impl TssrunJobSnapshot {
     /// True while the child process is still alive (no `finished` recorded).
     pub fn is_running(&self) -> bool {
         self.finished.is_none()
@@ -110,17 +110,17 @@ impl JobHandleSnapshot {
 }
 
 /// In-process handle to a spawned `tssrun` child plus the tee/wait tasks
-/// that keep its [`JobHandleSnapshot`] up to date.
-pub struct JobHandle {
-    snapshot_rx: watch::Receiver<JobHandleSnapshot>,
-    snapshot_tx: watch::Sender<JobHandleSnapshot>,
+/// that keep its [`TssrunJobSnapshot`] up to date.
+pub struct TssrunJobHandle {
+    snapshot_rx: watch::Receiver<TssrunJobSnapshot>,
+    snapshot_tx: watch::Sender<TssrunJobSnapshot>,
     wait_handle: Option<JoinHandle<Result<Option<i32>>>>,
     tee_stdout_handle: Option<JoinHandle<()>>,
     tee_stderr_handle: Option<JoinHandle<()>>,
-    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+    store: Option<Arc<dyn JobStateStore<TssrunJobSnapshot>>>,
 }
 
-impl JobHandle {
+impl TssrunJobHandle {
     /// Build a handle from a freshly spawned child. Spawns the tee tasks
     /// for stdout/stderr and the wait task for `child.wait()`.
     ///
@@ -130,9 +130,9 @@ impl JobHandle {
     /// not abort an otherwise-healthy job.
     pub async fn from_spawn(
         mut spawned: SpawnedChild,
-        init: JobHandleSnapshot,
+        init: TssrunJobSnapshot,
         log_sink: Arc<dyn JobLogSink>,
-        store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+        store: Option<Arc<dyn JobStateStore<TssrunJobSnapshot>>>,
     ) -> Result<Self> {
         let (tx, rx) = watch::channel(init);
 
@@ -211,8 +211,8 @@ impl JobHandle {
 
     /// Build a read-only handle from a previously persisted snapshot.
     pub fn attach_snapshot(
-        snap: JobHandleSnapshot,
-        store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+        snap: TssrunJobSnapshot,
+        store: Option<Arc<dyn JobStateStore<TssrunJobSnapshot>>>,
     ) -> Self {
         let (tx, rx) = watch::channel(snap);
         Self {
@@ -229,11 +229,11 @@ impl JobHandle {
     /// without taking exclusive ownership of the handle. This is what the
     /// pyo3 wrapper uses to keep `pid` / `jobid` / `is_running` polls cheap
     /// and lock-free against an in-flight `wait()` (issue H1).
-    pub fn watch(&self) -> watch::Receiver<JobHandleSnapshot> {
+    pub fn watch(&self) -> watch::Receiver<TssrunJobSnapshot> {
         self.snapshot_rx.clone()
     }
 
-    pub fn snapshot(&self) -> JobHandleSnapshot {
+    pub fn snapshot(&self) -> TssrunJobSnapshot {
         self.snapshot_rx.borrow().clone()
     }
     pub fn uuid(&self) -> Uuid {
@@ -289,8 +289,16 @@ impl JobHandle {
         h.await?
     }
 
-    /// Re-read the persisted snapshot from the store and broadcast it.
-    pub async fn refresh(&self) -> Result<()> {
+    /// Re-read the persisted snapshot from the store, broadcast it to all
+    /// `watch::Receiver` subscribers, and return it.
+    ///
+    /// Phase 3 P2: return type changed from `Result<()>` to
+    /// `Result<TssrunJobSnapshot>` so this method matches the
+    /// [`crate::SbatchJobHandle::refresh`] shape and the upcoming
+    /// `JobHandleCommon` trait. Existing callers that wrote
+    /// `let _ = handle.refresh().await?;` continue to compile because Rust
+    /// does not warn on a discarded `Ok(T)`.
+    pub async fn refresh(&self) -> Result<TssrunJobSnapshot> {
         let store = self
             .store
             .as_ref()
@@ -300,8 +308,31 @@ impl JobHandle {
             .load(uuid)
             .await?
             .ok_or_else(|| anyhow!("uuid {uuid} not found in store"))?;
-        let _ = self.snapshot_tx.send(snap);
-        Ok(())
+        let _ = self.snapshot_tx.send(snap.clone());
+        Ok(snap)
+    }
+
+    /// Block (asynchronously) until [`TssrunJobSnapshot::is_finished`] is true.
+    /// Polls via [`Self::refresh`] every `poll_interval`. The returned snapshot
+    /// is the first refreshed snapshot that satisfies `is_finished()`.
+    ///
+    /// Mirrors [`crate::SbatchJobHandle::wait_terminal`] but takes `&self`
+    /// (not `self`) — tssrun handles are designed for post-wait reuse and
+    /// have no `Drop`-warn pattern that would justify consuming `self`.
+    ///
+    /// Returns immediately when the current snapshot is already terminal
+    /// (no sleep / no first refresh on stale state).
+    pub async fn wait_terminal(
+        &self,
+        poll_interval: std::time::Duration,
+    ) -> Result<TssrunJobSnapshot> {
+        loop {
+            let snap = self.refresh().await?;
+            if snap.is_finished() {
+                return Ok(snap);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Read `/proc/<pid>/environ` (Linux only). Returns `Ok(None)` on
@@ -312,7 +343,7 @@ impl JobHandle {
 }
 
 /// Read `/proc/<pid>/environ` for an arbitrary pid without holding a
-/// `JobHandle`. Used by the pyo3 wrapper to bypass the handle mutex.
+/// `TssrunJobHandle`. Used by the pyo3 wrapper to bypass the handle mutex.
 ///
 /// This is best-effort introspection: it returns `Ok(None)` whenever
 /// `/proc/<pid>/environ` is unobservable for any of the following reasons,
@@ -378,8 +409,8 @@ fn parse_environ(bytes: &[u8]) -> HashMap<String, String> {
 async fn tee_stdout(
     stdout: ChildStdout,
     sink: Arc<dyn JobLogSink>,
-    tx: watch::Sender<JobHandleSnapshot>,
-    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+    tx: watch::Sender<TssrunJobSnapshot>,
+    store: Option<Arc<dyn JobStateStore<TssrunJobSnapshot>>>,
 ) {
     tee_lines(stdout, LogStream::Stdout, sink, tx, store).await;
 }
@@ -387,8 +418,8 @@ async fn tee_stdout(
 async fn tee_stderr(
     stderr: ChildStderr,
     sink: Arc<dyn JobLogSink>,
-    tx: watch::Sender<JobHandleSnapshot>,
-    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+    tx: watch::Sender<TssrunJobSnapshot>,
+    store: Option<Arc<dyn JobStateStore<TssrunJobSnapshot>>>,
 ) {
     tee_lines(stderr, LogStream::Stderr, sink, tx, store).await;
 }
@@ -397,8 +428,8 @@ async fn tee_lines<R>(
     stream: R,
     stream_kind: LogStream,
     sink: Arc<dyn JobLogSink>,
-    tx: watch::Sender<JobHandleSnapshot>,
-    store: Option<Arc<dyn JobStateStore<JobHandleSnapshot>>>,
+    tx: watch::Sender<TssrunJobSnapshot>,
+    store: Option<Arc<dyn JobStateStore<TssrunJobSnapshot>>>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -455,14 +486,71 @@ fn now_unix() -> i64 {
 /// store outage must not crash the job, just leave the persisted view
 /// slightly stale until the next mutation.
 async fn persist_warn(
-    store: &dyn JobStateStore<JobHandleSnapshot>,
-    snap: &JobHandleSnapshot,
+    store: &dyn JobStateStore<TssrunJobSnapshot>,
+    snap: &TssrunJobSnapshot,
     when: &str,
 ) {
     if let Err(e) = store.save(snap).await {
         tracing::warn!(error = %e, when, uuid = %snap.uuid, "store.save failed");
     }
 }
+
+/// Phase 3 P3: cross-backend trait implementation. All methods delegate
+/// to the existing inherent `TssrunJobHandle` API. After Phase 3 P2 the
+/// method shapes already match `JobHandleCommon`, so this is pure forwarding.
+#[async_trait::async_trait]
+impl crate::handle::JobHandleCommon for TssrunJobHandle {
+    type Snapshot = TssrunJobSnapshot;
+
+    fn uuid(&self) -> Uuid {
+        Self::uuid(self)
+    }
+    fn jobid(&self) -> Option<u64> {
+        Self::jobid(self)
+    }
+    fn is_running(&self) -> bool {
+        Self::is_running(self)
+    }
+    fn is_finished(&self) -> bool {
+        Self::is_finished(self)
+    }
+    fn exit_code(&self) -> Option<i32> {
+        Self::exit_code(self)
+    }
+
+    fn snapshot(&self) -> TssrunJobSnapshot {
+        Self::snapshot(self)
+    }
+    fn watch(&self) -> watch::Receiver<TssrunJobSnapshot> {
+        Self::watch(self)
+    }
+
+    async fn refresh(&self) -> Result<TssrunJobSnapshot> {
+        Self::refresh(self).await
+    }
+
+    async fn wait_terminal(&self, poll_interval: std::time::Duration) -> Result<TssrunJobSnapshot> {
+        Self::wait_terminal(self, poll_interval).await
+    }
+}
+
+/// Deprecated alias for [`TssrunJobSnapshot`]. Phase 3 P1 renamed the
+/// canonical struct to be naming-symmetric with [`crate::SbatchJobSnapshot`].
+/// Remove in the next major.
+#[deprecated(
+    since = "0.1.0",
+    note = "use TssrunJobSnapshot — Phase 3 P1 rename for naming symmetry with SbatchJobSnapshot"
+)]
+pub type JobHandleSnapshot = TssrunJobSnapshot;
+
+/// Deprecated alias for [`TssrunJobHandle`]. Phase 3 P1 renamed the
+/// canonical struct to be naming-symmetric with [`crate::SbatchJobHandle`].
+/// Remove in the next major.
+#[deprecated(
+    since = "0.1.0",
+    note = "use TssrunJobHandle — Phase 3 P1 rename for naming symmetry with SbatchJobHandle"
+)]
+pub type JobHandle = TssrunJobHandle;
 
 #[cfg(test)]
 mod tests {
@@ -474,8 +562,8 @@ mod tests {
     use crate::tssrun::log::InMemoryLogSink;
     use std::sync::Arc;
 
-    fn snap_running() -> JobHandleSnapshot {
-        JobHandleSnapshot {
+    fn snap_running() -> TssrunJobSnapshot {
+        TssrunJobSnapshot {
             uuid: Uuid::now_v7(),
             pid: 31415,
             argv: vec!["tssrun".into(), "/work/job.sh".into()],
@@ -496,7 +584,7 @@ mod tests {
     fn snapshot_round_trip_running() {
         let s = snap_running();
         let json = serde_json::to_string(&s).unwrap();
-        let back: JobHandleSnapshot = serde_json::from_str(&json).unwrap();
+        let back: TssrunJobSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
     }
 
@@ -509,7 +597,7 @@ mod tests {
             finished_at_unix: 1746349200,
         });
         let json = serde_json::to_string(&s).unwrap();
-        let back: JobHandleSnapshot = serde_json::from_str(&json).unwrap();
+        let back: TssrunJobSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
     }
 
@@ -534,7 +622,7 @@ echo done"#
         let sink_for_handle: Arc<dyn crate::tssrun::log::JobLogSink> =
             Arc::clone(&typed_sink) as Arc<dyn crate::tssrun::log::JobLogSink>;
 
-        let init = JobHandleSnapshot {
+        let init = TssrunJobSnapshot {
             uuid: Uuid::now_v7(),
             pid: spawned.pid,
             argv: argv.clone(),
@@ -546,7 +634,7 @@ echo done"#
             node: None,
             finished: None,
         };
-        let mut handle = JobHandle::from_spawn(spawned, init, sink_for_handle, None)
+        let mut handle = TssrunJobHandle::from_spawn(spawned, init, sink_for_handle, None)
             .await
             .unwrap();
 
@@ -565,7 +653,7 @@ echo done"#
     #[tokio::test]
     async fn attached_handle_wait_errors_with_not_owner() {
         let snap = snap_running();
-        let mut h = JobHandle::attach_snapshot(snap, None);
+        let mut h = TssrunJobHandle::attach_snapshot(snap, None);
         let err = h.wait().await.unwrap_err().to_string();
         assert!(err.contains("not owner"), "unexpected: {err}");
     }
@@ -583,7 +671,7 @@ echo done"#
             .await
             .unwrap();
 
-        let init = JobHandleSnapshot {
+        let init = TssrunJobSnapshot {
             uuid: Uuid::now_v7(),
             pid: spawned.pid,
             argv,
@@ -597,7 +685,7 @@ echo done"#
         };
         let sink: Arc<dyn crate::tssrun::log::JobLogSink> =
             Arc::new(crate::tssrun::log::NullLogSink);
-        let mut handle = JobHandle::from_spawn(spawned, init, sink, None)
+        let mut handle = TssrunJobHandle::from_spawn(spawned, init, sink, None)
             .await
             .unwrap();
         let code = handle.wait().await.unwrap();
@@ -623,7 +711,7 @@ echo done"#
             .spawn(&argv, &env, None)
             .await
             .unwrap();
-        let init = JobHandleSnapshot {
+        let init = TssrunJobSnapshot {
             uuid: Uuid::now_v7(),
             pid: spawned.pid,
             argv,
@@ -637,7 +725,7 @@ echo done"#
         };
         let sink: std::sync::Arc<dyn crate::tssrun::log::JobLogSink> =
             std::sync::Arc::new(crate::tssrun::log::NullLogSink);
-        let mut h = JobHandle::from_spawn(spawned, init, sink, None)
+        let mut h = TssrunJobHandle::from_spawn(spawned, init, sink, None)
             .await
             .unwrap();
 
@@ -695,5 +783,98 @@ echo done"#
         assert!(!s.is_running());
         assert!(s.is_finished());
         assert_eq!(s.exit_code(), None);
+    }
+
+    #[test]
+    fn tssrun_job_snapshot_alias_for_jobhandlesnapshot_resolves() {
+        // Deprecated alias must continue to compile after the Phase 3 P1 rename.
+        let snap = snap_running();
+        #[allow(deprecated)]
+        let _: super::JobHandleSnapshot = snap.clone();
+    }
+
+    #[test]
+    fn tssrun_job_handle_alias_for_jobhandle_resolves() {
+        // Type-level assertion that both the new name and the deprecated
+        // alias refer to the same Send + Sync type.
+        fn _assert_send_sync<T: Send + Sync>() {}
+        _assert_send_sync::<TssrunJobHandle>();
+        #[allow(deprecated)]
+        _assert_send_sync::<super::JobHandle>();
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_snapshot_from_store() {
+        // Phase 3 P2: refresh() returns the freshly-loaded snapshot so
+        // callers don't need a follow-up snapshot() borrow.
+        let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
+            Arc::new(crate::store::InMemoryStateStore::<TssrunJobSnapshot>::new());
+        let snap = snap_running();
+        store.save(&snap).await.unwrap();
+
+        let h = TssrunJobHandle::attach_snapshot(snap.clone(), Some(store));
+        let got = h.refresh().await.unwrap();
+
+        assert_eq!(got.uuid, snap.uuid);
+        assert_eq!(got, snap);
+        assert_eq!(
+            h.snapshot(),
+            snap,
+            "broadcast must update the watch channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_returns_immediately_when_already_finished() {
+        let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
+            Arc::new(crate::store::InMemoryStateStore::<TssrunJobSnapshot>::new());
+        let mut snap = snap_running();
+        snap.finished = Some(FinishedInfo {
+            exit_code: Some(0),
+            finished_at_unix: 1,
+        });
+        store.save(&snap).await.unwrap();
+
+        let h = TssrunJobHandle::attach_snapshot(snap.clone(), Some(store));
+        let got = h
+            .wait_terminal(std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert!(got.is_finished());
+        assert_eq!(got.exit_code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_returns_when_store_flips_to_finished() {
+        let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
+            Arc::new(crate::store::InMemoryStateStore::<TssrunJobSnapshot>::new());
+        let snap = snap_running();
+        store.save(&snap).await.unwrap();
+
+        let h = TssrunJobHandle::attach_snapshot(snap.clone(), Some(store.clone()));
+
+        let store2 = store.clone();
+        let snap2 = snap.clone();
+        let flipper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let updated = TssrunJobSnapshot {
+                finished: Some(FinishedInfo {
+                    exit_code: Some(7),
+                    finished_at_unix: 2,
+                }),
+                ..snap2
+            };
+            store2.save(&updated).await.unwrap();
+        });
+
+        let got = h
+            .wait_terminal(std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
+        flipper.await.unwrap();
+
+        assert!(got.is_finished());
+        assert_eq!(got.exit_code(), Some(7));
     }
 }

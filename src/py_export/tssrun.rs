@@ -18,7 +18,7 @@ use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimi
 use crate::tssrun::cmd::TssrunCmd;
 
 use crate::store::JobStateStore;
-use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
+use crate::tssrun::handle::{TssrunJobHandle, TssrunJobSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
 use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore};
@@ -119,7 +119,7 @@ fn file_log_sink<'py>(
 
 // ---------- JobStateStore ----------
 
-/// Opaque Python handle to an [`Arc<dyn JobStateStore<JobHandleSnapshot>>`]. Construct via
+/// Opaque Python handle to an [`Arc<dyn JobStateStore<TssrunJobSnapshot>>`]. Construct via
 /// the `in_memory_state_store` / `file_system_state_store` factories and
 /// pass the result to ``TssrunManager(cmd, store=...)``.
 ///
@@ -134,7 +134,7 @@ fn file_log_sink<'py>(
     frozen
 )]
 #[derive(Clone)]
-pub struct PyJobStateStore(pub Arc<dyn JobStateStore<JobHandleSnapshot>>);
+pub struct PyJobStateStore(pub Arc<dyn JobStateStore<TssrunJobSnapshot>>);
 
 /// Build an in-process, in-memory state store.
 ///
@@ -160,30 +160,30 @@ fn file_system_state_store(dir: PathBuf) -> PyJobStateStore {
     PyJobStateStore(Arc::new(FileSystemStateStore::new(dir)))
 }
 
-// ---------- JobHandle ----------
+// ---------- TssrunJobHandle ----------
 
-/// Python view onto a [`JobHandle`].
+/// Python view onto a [`TssrunJobHandle`].
 ///
 /// Holds two pieces of state with **deliberately different sharing**:
 ///
 /// - `rx`: a cloned `watch::Receiver` over the snapshot. Snapshot getters
 ///   (`pid`, `jobid`, `node`, `sent_env`, `is_running`, `exit_code`) read
-///   from this receiver synchronously — no JobHandle mutex, so they are
+///   from this receiver synchronously — no TssrunJobHandle mutex, so they are
 ///   not blocked by an in-flight `wait()` (issue H1 in the original
 ///   review).
-/// - `inner`: a `Mutex<JobHandle>` that exists solely so `wait()` can
+/// - `inner`: a `Mutex<TssrunJobHandle>` that exists solely so `wait()` can
 ///   `.take()` the join handle once. Snapshot getters never touch it.
 #[pyclass(
     name = "TssrunJobHandle",
     module = "slurm_async_runner._slurm_async_runner_core.tssrun"
 )]
 pub struct PyTssrunJobHandle {
-    rx: watch::Receiver<JobHandleSnapshot>,
-    inner: Arc<tokio::sync::Mutex<JobHandle>>,
+    rx: watch::Receiver<TssrunJobSnapshot>,
+    inner: Arc<tokio::sync::Mutex<TssrunJobHandle>>,
 }
 
 impl PyTssrunJobHandle {
-    fn from_handle(handle: JobHandle) -> Self {
+    fn from_handle(handle: TssrunJobHandle) -> Self {
         let rx = handle.watch();
         Self {
             rx,
@@ -200,8 +200,22 @@ impl PyTssrunJobHandle {
         future_into_py(py, async move { Ok(pid) })
     }
 
+    /// SLURM job id once observed. ``None`` until the child emits the
+    /// ``salloc:`` banner.
+    ///
+    /// Phase 3 P5: sync getter (was async-wrapped). Reads are lock-free
+    /// off the local ``watch::Receiver`` — there is no tokio runtime work
+    /// to wait on, so the async wrapper was bogus overhead. See
+    /// ``jobid_async`` for the legacy async-style getter.
     #[getter]
-    fn jobid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn jobid(&self) -> Option<u64> {
+        self.rx.borrow().jobid
+    }
+
+    /// Async-style equivalent of ``jobid``. Kept for callers that wired
+    /// an ``await`` against the pre-Phase 3 P5 contract.
+    #[getter]
+    fn jobid_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let jobid = self.rx.borrow().jobid;
         future_into_py(py, async move { Ok(jobid) })
     }
@@ -210,8 +224,17 @@ impl PyTssrunJobHandle {
     /// hyphenated string (e.g. ``"0190cc1c-7a48-7c0e-a0a0-1234567890ab"``)
     /// so it can be passed straight back to ``attach_uuid`` or used as a
     /// dict key without needing to depend on Python's ``uuid`` module.
+    ///
+    /// Phase 3 P5: sync getter (was async-wrapped). See ``uuid_async``
+    /// for the legacy async-style getter.
     #[getter]
-    fn uuid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn uuid(&self) -> String {
+        self.rx.borrow().uuid.to_string()
+    }
+
+    /// Async-style equivalent of ``uuid``.
+    #[getter]
+    fn uuid_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let uuid = self.rx.borrow().uuid.to_string();
         future_into_py(py, async move { Ok(uuid) })
     }
@@ -237,12 +260,48 @@ impl PyTssrunJobHandle {
         })
     }
 
-    fn is_running<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// True while the child has not yet recorded a terminal ``finished``
+    /// state in the local snapshot.
+    ///
+    /// Phase 3 P5: sync method (was async-wrapped). See
+    /// ``is_running_async`` for the legacy async-style method.
+    fn is_running(&self) -> bool {
+        self.rx.borrow().finished.is_none()
+    }
+
+    /// Async-style equivalent of ``is_running``.
+    fn is_running_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let running = self.rx.borrow().finished.is_none();
         future_into_py(py, async move { Ok(running) })
     }
 
-    fn exit_code<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Inverse of ``is_running``. Phase 3 P4: exposed for parity with
+    /// ``SbatchJobHandle.is_finished`` and to satisfy the
+    /// ``slurm_async_runner.JobHandleCommon`` runtime Protocol.
+    ///
+    /// Phase 3 P5: sync method (was async-wrapped). See
+    /// ``is_finished_async`` for the legacy async-style method.
+    fn is_finished(&self) -> bool {
+        self.rx.borrow().finished.is_some()
+    }
+
+    /// Async-style equivalent of ``is_finished``.
+    fn is_finished_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let finished = self.rx.borrow().finished.is_some();
+        future_into_py(py, async move { Ok(finished) })
+    }
+
+    /// Exit code if the child exited normally; ``None`` if killed by
+    /// signal or if the finished record has not yet been populated.
+    ///
+    /// Phase 3 P5: sync method (was async-wrapped). See
+    /// ``exit_code_async`` for the legacy async-style method.
+    fn exit_code(&self) -> Option<i32> {
+        self.rx.borrow().finished.as_ref().and_then(|f| f.exit_code)
+    }
+
+    /// Async-style equivalent of ``exit_code``.
+    fn exit_code_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let code = self.rx.borrow().finished.as_ref().and_then(|f| f.exit_code);
         future_into_py(py, async move { Ok(code) })
     }
@@ -277,6 +336,10 @@ impl PyTssrunJobHandle {
     /// wait tasks make, so a cross-process update is not visible until
     /// ``refresh()`` pulls it in. Raises ``RuntimeError`` when no store
     /// is wired or when the store has no record for this handle's uuid.
+    ///
+    /// Returns ``None`` to Python — matches the
+    /// ``PySbatchJobHandle.refresh`` contract. Read the freshly-broadcast
+    /// snapshot via the existing getters (``pid`` / ``jobid`` / etc.).
     fn refresh<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -285,7 +348,35 @@ impl PyTssrunJobHandle {
                 .await
                 .refresh()
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Block until the snapshot reports ``is_finished``.
+    ///
+    /// Polls the store via ``refresh`` every ``poll_interval_secs`` seconds.
+    /// Mirrors ``PySbatchJobHandle.wait_terminal``. Returns ``None`` to
+    /// Python — read the terminal snapshot through the existing getters
+    /// (``exit_code`` / ``is_finished``) once this future resolves.
+    ///
+    /// Raises ``RuntimeError`` if no store is wired on this handle or the
+    /// store loses the record for this handle's uuid.
+    #[pyo3(signature = (poll_interval_secs))]
+    fn wait_terminal<'py>(
+        &self,
+        py: Python<'py>,
+        poll_interval_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .wait_terminal(std::time::Duration::from_secs_f64(poll_interval_secs))
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
         })
     }
 }

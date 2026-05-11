@@ -394,6 +394,49 @@ impl SbatchJobHandle {
     }
 }
 
+/// Phase 3 P3: cross-backend trait implementation. All methods delegate
+/// to the existing inherent `SbatchJobHandle` API — there is no behavior
+/// change, just a uniform contract that callers can hold via
+/// `H: JobHandleCommon`.
+#[async_trait::async_trait]
+impl crate::handle::JobHandleCommon for SbatchJobHandle {
+    type Snapshot = SbatchJobSnapshot;
+
+    fn uuid(&self) -> Uuid {
+        Self::uuid(self)
+    }
+    fn jobid(&self) -> Option<u64> {
+        Self::jobid(self)
+    }
+    fn is_running(&self) -> bool {
+        Self::is_running(self)
+    }
+    fn is_finished(&self) -> bool {
+        Self::is_finished(self)
+    }
+    fn exit_code(&self) -> Option<i32> {
+        Self::exit_code(self)
+    }
+
+    fn snapshot(&self) -> SbatchJobSnapshot {
+        Self::snapshot(self)
+    }
+    fn watch(&self) -> watch::Receiver<SbatchJobSnapshot> {
+        Self::watch(self)
+    }
+
+    async fn refresh(&self) -> anyhow::Result<SbatchJobSnapshot> {
+        Self::refresh(self).await
+    }
+
+    async fn wait_terminal(
+        &self,
+        poll_interval: std::time::Duration,
+    ) -> anyhow::Result<SbatchJobSnapshot> {
+        Self::wait_terminal(self, poll_interval).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@ pub mod py_export;
 pub use py_export::stub_info;
 
 pub mod dispatcher;
+pub mod handle;
 pub mod manager;
 pub mod runner;
 pub mod sbatch;
@@ -45,7 +46,10 @@ pub use tssrun::cmd::TssrunCmd;
 pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
 };
-pub use tssrun::handle::{FinishedInfo, JobHandle, JobHandleSnapshot, LogLocations};
+pub use tssrun::handle::{FinishedInfo, LogLocations, TssrunJobHandle, TssrunJobSnapshot};
+// Deprecated re-exports (Phase 3 P1 rename); remove next major.
+#[allow(deprecated)]
+pub use tssrun::handle::{JobHandle, JobHandleSnapshot};
 pub use tssrun::log::{
     FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,
 };
@@ -65,6 +69,14 @@ pub use sbatch::parse::{parse_submitted_jobid, resolve_log_path};
 
 // Generic store re-exports (replaces tssrun-specific ones)
 pub use store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
+
+// Phase 3 P3: cross-backend handle trait.
+// Phase 3 P4: dyn-safe companion + type-erasure adapter. The
+// `handle::into_dyn` free function is intentionally NOT re-exported at
+// the crate root because `dispatcher::into_dyn` already lives there;
+// callers should write `slurm_async_runner::handle::into_dyn(h)` or
+// `use slurm_async_runner::handle::into_dyn as into_dyn_handle;`.
+pub use handle::{DynHandleAdapter, DynJobHandleCommon, JobHandleCommon};
 
 #[cfg(test)]
 mod tests {
