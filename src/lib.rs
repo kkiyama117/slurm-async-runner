@@ -10,6 +10,7 @@ pub mod py_export;
 pub use py_export::stub_info;
 
 pub mod dispatcher;
+pub mod handle;
 pub mod manager;
 pub mod runner;
 pub mod sbatch;
@@ -68,6 +69,9 @@ pub use sbatch::parse::{parse_submitted_jobid, resolve_log_path};
 
 // Generic store re-exports (replaces tssrun-specific ones)
 pub use store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
+
+// Phase 3 P3: cross-backend handle trait.
+pub use handle::JobHandleCommon;
 
 #[cfg(test)]
 mod tests {

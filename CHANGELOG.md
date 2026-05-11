@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 3 P3 — `JobHandleCommon` cross-backend trait
+
+- New module `crate::handle` exposing the `JobHandleCommon` trait — the Phase 2 §7.1 naming convergence (5 sync getters + `snapshot` / `watch` + async `refresh` / `wait_terminal`) is now a mechanically-checkable contract on the public crate API.
+- `SbatchJobHandle` and `TssrunJobHandle` both implement `JobHandleCommon`, each binding its own `Snapshot` associated type — no boxing, no JSON flattening on the hot path.
+- The trait is **not** dyn-safe by design (associated type). Phase 3 P4 will introduce the type-erased `DynJobHandleCommon` companion + `into_dyn` constructor for callers that need `dyn` dispatch.
+- New integration test `tests/job_handle_common.rs` exercises a single generic contract (`assert_common_contract<H: JobHandleCommon>`) against both backends — adding a future backend means adding one fixture + one line to the contract test.
+- Crate-root re-export: `pub use handle::JobHandleCommon;` so downstream callers can write `use slurm_async_runner::JobHandleCommon;`.
+
 ### Phase 3 P2 — tssrun handle async parity with sbatch
 
 - **`TssrunJobHandle::refresh()`** now returns `anyhow::Result<TssrunJobSnapshot>` instead of `anyhow::Result<()>`. Existing callers using `let _ = handle.refresh().await?;` continue to compile (Rust does not warn on a discarded `Ok(T)`).

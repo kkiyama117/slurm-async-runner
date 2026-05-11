@@ -495,6 +495,45 @@ async fn persist_warn(
     }
 }
 
+/// Phase 3 P3: cross-backend trait implementation. All methods delegate
+/// to the existing inherent `TssrunJobHandle` API. After Phase 3 P2 the
+/// method shapes already match `JobHandleCommon`, so this is pure forwarding.
+#[async_trait::async_trait]
+impl crate::handle::JobHandleCommon for TssrunJobHandle {
+    type Snapshot = TssrunJobSnapshot;
+
+    fn uuid(&self) -> Uuid {
+        Self::uuid(self)
+    }
+    fn jobid(&self) -> Option<u64> {
+        Self::jobid(self)
+    }
+    fn is_running(&self) -> bool {
+        Self::is_running(self)
+    }
+    fn is_finished(&self) -> bool {
+        Self::is_finished(self)
+    }
+    fn exit_code(&self) -> Option<i32> {
+        Self::exit_code(self)
+    }
+
+    fn snapshot(&self) -> TssrunJobSnapshot {
+        Self::snapshot(self)
+    }
+    fn watch(&self) -> watch::Receiver<TssrunJobSnapshot> {
+        Self::watch(self)
+    }
+
+    async fn refresh(&self) -> Result<TssrunJobSnapshot> {
+        Self::refresh(self).await
+    }
+
+    async fn wait_terminal(&self, poll_interval: std::time::Duration) -> Result<TssrunJobSnapshot> {
+        Self::wait_terminal(self, poll_interval).await
+    }
+}
+
 /// Deprecated alias for [`TssrunJobSnapshot`]. Phase 3 P1 renamed the
 /// canonical struct to be naming-symmetric with [`crate::SbatchJobSnapshot`].
 /// Remove in the next major.
