@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 3 P2 — tssrun handle async parity with sbatch
+
+- **`TssrunJobHandle::refresh()`** now returns `anyhow::Result<TssrunJobSnapshot>` instead of `anyhow::Result<()>`. Existing callers using `let _ = handle.refresh().await?;` continue to compile (Rust does not warn on a discarded `Ok(T)`).
+- **`TssrunJobHandle::wait_terminal(poll_interval)`** added, mirroring `SbatchJobHandle::wait_terminal`. Takes `&self` (not `self`) — tssrun handle ergonomics keep allowing post-wait reuse, and there is no `Drop`-warn pattern that would justify consuming `self`.
+- **Python**: `PyTssrunJobHandle.wait_terminal(poll_interval_secs)` exposed via pyo3, returning `Awaitable[None]`. The Python `refresh` contract is unchanged (still returns `None` — read the broadcast snapshot via the existing getters).
+- Why: Phase 3 P3 will add `impl JobHandleCommon for TssrunJobHandle`; this P2 is the additive method-shape change so P3 is purely the trait wiring.
+
 ### Phase 3 P1 — tssrun naming symmetry
 
 - **Breaking (with alias)**: `tssrun::JobHandle` and `tssrun::JobHandleSnapshot` are renamed to `TssrunJobHandle` and `TssrunJobSnapshot` for naming symmetry with `SbatchJobHandle` / `SbatchJobSnapshot`. Deprecated `pub type` aliases preserve compilation; downstream callers can migrate at their leisure.

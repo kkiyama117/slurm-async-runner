@@ -289,8 +289,16 @@ impl TssrunJobHandle {
         h.await?
     }
 
-    /// Re-read the persisted snapshot from the store and broadcast it.
-    pub async fn refresh(&self) -> Result<()> {
+    /// Re-read the persisted snapshot from the store, broadcast it to all
+    /// `watch::Receiver` subscribers, and return it.
+    ///
+    /// Phase 3 P2: return type changed from `Result<()>` to
+    /// `Result<TssrunJobSnapshot>` so this method matches the
+    /// [`crate::SbatchJobHandle::refresh`] shape and the upcoming
+    /// `JobHandleCommon` trait. Existing callers that wrote
+    /// `let _ = handle.refresh().await?;` continue to compile because Rust
+    /// does not warn on a discarded `Ok(T)`.
+    pub async fn refresh(&self) -> Result<TssrunJobSnapshot> {
         let store = self
             .store
             .as_ref()
@@ -300,8 +308,31 @@ impl TssrunJobHandle {
             .load(uuid)
             .await?
             .ok_or_else(|| anyhow!("uuid {uuid} not found in store"))?;
-        let _ = self.snapshot_tx.send(snap);
-        Ok(())
+        let _ = self.snapshot_tx.send(snap.clone());
+        Ok(snap)
+    }
+
+    /// Block (asynchronously) until [`TssrunJobSnapshot::is_finished`] is true.
+    /// Polls via [`Self::refresh`] every `poll_interval`. The returned snapshot
+    /// is the first refreshed snapshot that satisfies `is_finished()`.
+    ///
+    /// Mirrors [`crate::SbatchJobHandle::wait_terminal`] but takes `&self`
+    /// (not `self`) — tssrun handles are designed for post-wait reuse and
+    /// have no `Drop`-warn pattern that would justify consuming `self`.
+    ///
+    /// Returns immediately when the current snapshot is already terminal
+    /// (no sleep / no first refresh on stale state).
+    pub async fn wait_terminal(
+        &self,
+        poll_interval: std::time::Duration,
+    ) -> Result<TssrunJobSnapshot> {
+        loop {
+            let snap = self.refresh().await?;
+            if snap.is_finished() {
+                return Ok(snap);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Read `/proc/<pid>/environ` (Linux only). Returns `Ok(None)` on
@@ -731,5 +762,80 @@ echo done"#
         _assert_send_sync::<TssrunJobHandle>();
         #[allow(deprecated)]
         _assert_send_sync::<super::JobHandle>();
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_snapshot_from_store() {
+        // Phase 3 P2: refresh() returns the freshly-loaded snapshot so
+        // callers don't need a follow-up snapshot() borrow.
+        let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
+            Arc::new(crate::store::InMemoryStateStore::<TssrunJobSnapshot>::new());
+        let snap = snap_running();
+        store.save(&snap).await.unwrap();
+
+        let h = TssrunJobHandle::attach_snapshot(snap.clone(), Some(store));
+        let got = h.refresh().await.unwrap();
+
+        assert_eq!(got.uuid, snap.uuid);
+        assert_eq!(got, snap);
+        assert_eq!(
+            h.snapshot(),
+            snap,
+            "broadcast must update the watch channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_returns_immediately_when_already_finished() {
+        let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
+            Arc::new(crate::store::InMemoryStateStore::<TssrunJobSnapshot>::new());
+        let mut snap = snap_running();
+        snap.finished = Some(FinishedInfo {
+            exit_code: Some(0),
+            finished_at_unix: 1,
+        });
+        store.save(&snap).await.unwrap();
+
+        let h = TssrunJobHandle::attach_snapshot(snap.clone(), Some(store));
+        let got = h
+            .wait_terminal(std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert!(got.is_finished());
+        assert_eq!(got.exit_code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_returns_when_store_flips_to_finished() {
+        let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
+            Arc::new(crate::store::InMemoryStateStore::<TssrunJobSnapshot>::new());
+        let snap = snap_running();
+        store.save(&snap).await.unwrap();
+
+        let h = TssrunJobHandle::attach_snapshot(snap.clone(), Some(store.clone()));
+
+        let store2 = store.clone();
+        let snap2 = snap.clone();
+        let flipper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let updated = TssrunJobSnapshot {
+                finished: Some(FinishedInfo {
+                    exit_code: Some(7),
+                    finished_at_unix: 2,
+                }),
+                ..snap2
+            };
+            store2.save(&updated).await.unwrap();
+        });
+
+        let got = h
+            .wait_terminal(std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
+        flipper.await.unwrap();
+
+        assert!(got.is_finished());
+        assert_eq!(got.exit_code(), Some(7));
     }
 }

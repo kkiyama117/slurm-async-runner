@@ -298,3 +298,35 @@ def test_handle_refresh_picks_up_cross_manager_mutations() -> None:
             assert (await h_attach.exit_code()) == 0
 
     asyncio.run(run())
+
+
+def test_handle_wait_terminal_returns_when_store_records_finished() -> None:
+    """Phase 3 P2: ``wait_terminal`` polls the store via ``refresh`` until
+    the snapshot is terminal, then returns ``None`` (read exit_code via the
+    getter). Mirrors ``SbatchJobHandle.wait_terminal``."""
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = in_memory_state_store()
+            spawner = TssrunManager(_bash_cmd(Path(td)), store=store)
+            attacher = TssrunManager(_bash_cmd(Path(td)), store=store)
+
+            h_spawn = await spawner.spawn()
+            uuid = await h_spawn.uuid
+            h_attach = await attacher.attach_uuid(uuid)
+
+            # Drive the spawner to completion in the background; the
+            # attached handle calls wait_terminal which polls the store.
+            # ``h_spawn.wait()`` returns a pyo3 Future (not a coroutine),
+            # so wrap it in an async helper before handing to create_task.
+            async def _drive_to_exit() -> None:
+                await h_spawn.wait()
+
+            spawn_task = asyncio.create_task(_drive_to_exit())
+            await h_attach.wait_terminal(0.005)
+            await spawn_task
+
+            assert await h_attach.is_running() is False
+            assert (await h_attach.exit_code()) == 0
+
+    asyncio.run(run())

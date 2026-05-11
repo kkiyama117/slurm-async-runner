@@ -105,6 +105,11 @@ class TssrunJobHandle:
     # Re-load the snapshot from the configured store and broadcast it to
     # local subscribers. Raises ``RuntimeError`` if no store is wired.
     def refresh(self) -> Awaitable[None]: ...
+    # Block until the snapshot reports ``is_finished``. Polls via
+    # ``refresh`` every ``poll_interval_secs`` seconds. Returns ``None`` —
+    # read the terminal exit_code via the ``exit_code`` getter once the
+    # future resolves. Mirrors ``SbatchJobHandle.wait_terminal``.
+    def wait_terminal(self, poll_interval_secs: builtins.float) -> Awaitable[None]: ...
 
 @final
 class TssrunManager:

@@ -277,6 +277,10 @@ impl PyTssrunJobHandle {
     /// wait tasks make, so a cross-process update is not visible until
     /// ``refresh()`` pulls it in. Raises ``RuntimeError`` when no store
     /// is wired or when the store has no record for this handle's uuid.
+    ///
+    /// Returns ``None`` to Python — matches the
+    /// ``PySbatchJobHandle.refresh`` contract. Read the freshly-broadcast
+    /// snapshot via the existing getters (``pid`` / ``jobid`` / etc.).
     fn refresh<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -285,7 +289,35 @@ impl PyTssrunJobHandle {
                 .await
                 .refresh()
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Block until the snapshot reports ``is_finished``.
+    ///
+    /// Polls the store via ``refresh`` every ``poll_interval_secs`` seconds.
+    /// Mirrors ``PySbatchJobHandle.wait_terminal``. Returns ``None`` to
+    /// Python — read the terminal snapshot through the existing getters
+    /// (``exit_code`` / ``is_finished``) once this future resolves.
+    ///
+    /// Raises ``RuntimeError`` if no store is wired on this handle or the
+    /// store loses the record for this handle's uuid.
+    #[pyo3(signature = (poll_interval_secs))]
+    fn wait_terminal<'py>(
+        &self,
+        py: Python<'py>,
+        poll_interval_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .wait_terminal(std::time::Duration::from_secs_f64(poll_interval_secs))
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
         })
     }
 }
