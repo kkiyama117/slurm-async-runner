@@ -65,7 +65,9 @@ def test_manager_spawn_then_wait_then_jobid() -> None:
             assert (await h.pid) > 0
             code = await h.wait()
             assert code == 0
-            assert (await h.jobid) == 555
+            # ``jobid`` and ``uuid`` are sync; ``node`` / ``sent_env``
+            # remain async-wrapped.
+            assert h.jobid == 555
             assert (await h.node) == "node-py"
 
     asyncio.run(run())
@@ -119,14 +121,15 @@ def test_h1_snapshot_getters_do_not_block_on_inflight_wait() -> None:
 
                 # Each of these must return within a fraction of a second.
                 # If the old single-mutex design comes back, they would
-                # block until wait_fut completes.
+                # block until wait_fut completes. After Phase 3 P5,
+                # ``jobid`` and ``is_running`` are sync — they read
+                # straight off the lock-free ``watch::Receiver`` without
+                # an event-loop hop. ``pid`` is still async (not in the
+                # JobHandleCommon Protocol) so it keeps the legacy
+                # await-style shape.
                 pid = await asyncio.wait_for(asyncio.ensure_future(h.pid), timeout=0.2)
-                running = await asyncio.wait_for(
-                    asyncio.ensure_future(h.is_running()), timeout=0.2
-                )
-                jobid = await asyncio.wait_for(
-                    asyncio.ensure_future(h.jobid), timeout=0.2
-                )
+                running = h.is_running()
+                jobid = h.jobid
 
                 assert pid > 0
                 assert running is True
@@ -134,8 +137,8 @@ def test_h1_snapshot_getters_do_not_block_on_inflight_wait() -> None:
             finally:
                 code = await wait_fut
             assert code == 0
-            assert (await h.jobid) == 777
-            assert (await h.is_running()) is False
+            assert h.jobid == 777
+            assert h.is_running() is False
 
     asyncio.run(run())
 
@@ -148,7 +151,7 @@ def test_manager_attach_file_round_trip() -> None:
             )
             h = await manager.spawn()
             pid = await h.pid
-            uuid = await h.uuid
+            uuid = h.uuid
             await h.wait()
             # State directory layout: {state_dir}/{uuid}.json — pid is no
             # longer the filename key after the UUID v7 migration.
@@ -156,8 +159,8 @@ def test_manager_attach_file_round_trip() -> None:
             assert path.exists()
             attached = await manager.attach_file(str(path))
             assert (await attached.pid) == pid
-            assert (await attached.uuid) == uuid
-            assert (await attached.jobid) == 555
+            assert attached.uuid == uuid
+            assert attached.jobid == 555
 
     asyncio.run(run())
 
@@ -170,15 +173,15 @@ def test_manager_attach_uuid_round_trip() -> None:
             )
             h = await manager.spawn()
             pid = await h.pid
-            uuid = await h.uuid
+            uuid = h.uuid
             await h.wait()
             # uuid is the canonical hyphenated string, e.g.
             # "0190cc1c-7a48-7c0e-a0a0-1234567890ab" — 36 chars.
             assert len(uuid) == 36 and uuid.count("-") == 4
             attached = await manager.attach_uuid(uuid)
-            assert (await attached.uuid) == uuid
+            assert attached.uuid == uuid
             assert (await attached.pid) == pid
-            assert (await attached.jobid) == 555
+            assert attached.jobid == 555
 
     asyncio.run(run())
 
@@ -212,11 +215,11 @@ def test_manager_default_store_is_in_memory_and_supports_attach_uuid() -> None:
             # Note: no store= argument — we are exercising the default.
             manager = TssrunManager(_bash_cmd(Path(td)))
             h = await manager.spawn()
-            uuid = await h.uuid
+            uuid = h.uuid
             await h.wait()
             attached = await manager.attach_uuid(uuid)
-            assert (await attached.uuid) == uuid
-            assert (await attached.jobid) == 555
+            assert attached.uuid == uuid
+            assert attached.jobid == 555
 
     asyncio.run(run())
 
@@ -232,12 +235,12 @@ def test_manager_explicit_in_memory_store_is_shared_across_managers() -> None:
             attacher = TssrunManager(_bash_cmd(Path(td)), store=store)
 
             h = await spawner.spawn()
-            uuid = await h.uuid
+            uuid = h.uuid
             await h.wait()
 
             attached = await attacher.attach_uuid(uuid)
-            assert (await attached.uuid) == uuid
-            assert (await attached.jobid) == 555
+            assert attached.uuid == uuid
+            assert attached.jobid == 555
 
     asyncio.run(run())
 
@@ -282,11 +285,11 @@ def test_handle_refresh_picks_up_cross_manager_mutations() -> None:
             attacher = TssrunManager(_bash_cmd(Path(td)), store=store)
 
             h_spawn = await spawner.spawn()
-            uuid = await h_spawn.uuid
+            uuid = h_spawn.uuid
             # Attach BEFORE waiting — the attached handle's local snapshot
             # captures the pre-exit state (no ``finished`` yet).
             h_attach = await attacher.attach_uuid(uuid)
-            assert await h_attach.is_running() is True
+            assert h_attach.is_running() is True
 
             # Drive the spawner to completion; this updates the store.
             await h_spawn.wait()
@@ -294,7 +297,39 @@ def test_handle_refresh_picks_up_cross_manager_mutations() -> None:
             # The attached handle's local snapshot is still stale until we
             # explicitly refresh from the store.
             await h_attach.refresh()
-            assert await h_attach.is_running() is False
-            assert (await h_attach.exit_code()) == 0
+            assert h_attach.is_running() is False
+            assert h_attach.exit_code() == 0
+
+    asyncio.run(run())
+
+
+def test_handle_wait_terminal_returns_when_store_records_finished() -> None:
+    """Phase 3 P2: ``wait_terminal`` polls the store via ``refresh`` until
+    the snapshot is terminal, then returns ``None`` (read exit_code via the
+    getter). Mirrors ``SbatchJobHandle.wait_terminal``."""
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = in_memory_state_store()
+            spawner = TssrunManager(_bash_cmd(Path(td)), store=store)
+            attacher = TssrunManager(_bash_cmd(Path(td)), store=store)
+
+            h_spawn = await spawner.spawn()
+            uuid = h_spawn.uuid
+            h_attach = await attacher.attach_uuid(uuid)
+
+            # Drive the spawner to completion in the background; the
+            # attached handle calls wait_terminal which polls the store.
+            # ``h_spawn.wait()`` returns a pyo3 Future (not a coroutine),
+            # so wrap it in an async helper before handing to create_task.
+            async def _drive_to_exit() -> None:
+                await h_spawn.wait()
+
+            spawn_task = asyncio.create_task(_drive_to_exit())
+            await h_attach.wait_terminal(0.005)
+            await spawn_task
+
+            assert h_attach.is_running() is False
+            assert h_attach.exit_code() == 0
 
     asyncio.run(run())

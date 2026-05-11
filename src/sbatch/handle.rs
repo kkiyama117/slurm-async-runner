@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use thiserror::Error;
 use tokio::sync::{Mutex as TokioMutex, watch};
 
 use chrono::{DateTime, Utc};
@@ -24,6 +25,22 @@ use crate::{JobReason, JobState, JobStatus};
 pub struct SbatchJobSnapshot {
     pub uuid: Uuid,
     pub jobid: u64,
+
+    /// Master jobid of the array submission (the `<N>` from `Submitted batch
+    /// job <N>` when `--array=...` was passed). `None` for single (non-array)
+    /// jobs. For array tasks this is redundant with [`Self::jobid`] (both
+    /// hold the master); the explicit field makes attach paths able to
+    /// distinguish array tasks from singles without inspecting
+    /// `array_task_id`.
+    #[serde(default)]
+    pub array_jobid: Option<u64>,
+
+    /// Per-task index within the array (e.g. `0`, `1`, `4` for `-a 0-1,4`).
+    /// `None` for single (non-array) jobs. Array task identity is
+    /// `(array_jobid, array_task_id)` — SLURM also prints this as
+    /// `<master>_<idx>` in `squeue -t`.
+    #[serde(default)]
+    pub array_task_id: Option<u32>,
 
     pub argv: Vec<String>,
     pub sent_env: HashMap<String, String>,
@@ -77,11 +94,6 @@ impl SbatchLifecycle {
 
     /// Exit code if the child exited normally; `None` if killed by signal,
     /// or if `finished` is not yet recorded.
-    ///
-    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
-    /// parse the sacct `ExitCode` column, so this method returns `None`
-    /// even after a successful `refresh_with_sacct()` call. A future
-    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.finished.as_ref().and_then(|f| f.exit_code)
     }
@@ -92,14 +104,14 @@ impl SbatchJobSnapshot {
         self.log
             .output_template
             .as_deref()
-            .map(|t| resolve_log_path(t, self.jobid, self.job_name.as_deref()))
+            .map(|t| resolve_log_path(t, self.jobid, self.array_task_id, self.job_name.as_deref()))
     }
 
     pub fn error_path(&self) -> Option<PathBuf> {
         self.log
             .error_template
             .as_deref()
-            .map(|t| resolve_log_path(t, self.jobid, self.job_name.as_deref()))
+            .map(|t| resolve_log_path(t, self.jobid, self.array_task_id, self.job_name.as_deref()))
     }
 
     pub fn is_running(&self) -> bool {
@@ -110,14 +122,25 @@ impl SbatchJobSnapshot {
     }
     /// Exit code if the child exited normally; `None` if killed by signal,
     /// or if `finished` is not yet recorded.
-    ///
-    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
-    /// parse the sacct `ExitCode` column, so this method returns `None`
-    /// even after a successful `refresh_with_sacct()` call. A future
-    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.lifecycle.exit_code()
     }
+}
+
+/// Which job log stream to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// Errors that can occur while reading a job's log file.
+#[derive(Debug, Error)]
+pub enum LogReadError {
+    #[error("log path not resolved on snapshot (template missing)")]
+    PathNotResolved,
+    #[error("io error reading log: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +196,14 @@ impl SbatchJobHandle {
         Some(self.0.snapshot_tx.borrow().jobid)
     }
 
+    pub fn array_jobid(&self) -> Option<u64> {
+        self.snapshot().array_jobid
+    }
+
+    pub fn array_task_id(&self) -> Option<u32> {
+        self.snapshot().array_task_id
+    }
+
     pub fn partition(&self) -> Option<JobPartition> {
         self.0.snapshot_tx.borrow().partition.clone()
     }
@@ -211,13 +242,60 @@ impl SbatchJobHandle {
 
     /// Exit code if the child exited normally; `None` if killed by signal,
     /// or if `finished` is not yet recorded.
-    ///
-    /// **Phase 1 limitation:** `refresh_with_sacct()` does NOT currently
-    /// parse the sacct `ExitCode` column, so this method returns `None`
-    /// even after a successful `refresh_with_sacct()` call. A future
-    /// release will extend `parse_sacct` to capture exit codes.
     pub fn exit_code(&self) -> Option<i32> {
         self.0.snapshot_tx.borrow().exit_code()
+    }
+
+    // -------- Log read API (Phase 2 P1) --------
+
+    /// Read the last `n` lines of the job's stdout/stderr log file.
+    ///
+    /// Returns an empty `Vec` if the log file does not yet exist (job
+    /// pending or just submitted). Returns `LogReadError::PathNotResolved`
+    /// if the snapshot does not carry the corresponding log template.
+    /// Other I/O errors are propagated as `LogReadError::Io`.
+    ///
+    /// Phase 2 P1 implements this with a full read of the file followed
+    /// by line splitting; for very large logs (> ~10MB) consider Phase 3
+    /// optimization with reverse seek.
+    pub async fn log_lines(
+        &self,
+        stream: LogStream,
+        n: usize,
+    ) -> Result<Vec<String>, LogReadError> {
+        let snap = self.0.snapshot_tx.borrow().clone();
+        let path = match stream {
+            LogStream::Stdout => snap.output_path(),
+            LogStream::Stderr => snap.error_path(),
+        };
+        let path = path.ok_or(LogReadError::PathNotResolved)?;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                let start = lines.len().saturating_sub(n);
+                Ok(lines[start..].to_vec())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(LogReadError::Io(e)),
+        }
+    }
+
+    /// Read the full contents of the job's stdout/stderr log file.
+    ///
+    /// Returns an empty string if the log file does not yet exist.
+    /// Same error semantics as [`SbatchJobHandle::log_lines`] otherwise.
+    pub async fn read_log_to_end(&self, stream: LogStream) -> Result<String, LogReadError> {
+        let snap = self.0.snapshot_tx.borrow().clone();
+        let path = match stream {
+            LogStream::Stdout => snap.output_path(),
+            LogStream::Stderr => snap.error_path(),
+        };
+        let path = path.ok_or(LogReadError::PathNotResolved)?;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => Ok(content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(LogReadError::Io(e)),
+        }
     }
 
     /// Lightweight polling: `qgroup -l` → `squeue` fallback. **Never** calls
@@ -269,17 +347,27 @@ impl SbatchJobHandle {
         }
 
         let inner = &*self.0;
+        // Re-acquire refresh_lock here to serialize the sacct call itself.
+        // The inner `refresh()` above already took and released the lock
+        // for the qgroup/squeue probes; this second acquisition guards the
+        // heavier sacct invocation and the finished-info write.
         let _guard = inner.refresh_lock.lock().await;
         let view = crate::dispatcher::DynView(&*inner.dispatcher);
 
-        let map = crate::runner::query_job_states_batch_with(&view, &[snap.jobid]).await?;
-        let final_status = map.get(&snap.jobid).cloned().unwrap_or_default();
+        // Phase 2 P1: switch to the exit-code-aware query so we can populate
+        // FinishedInfo::exit_code instead of leaving it None.
+        let map = crate::runner::query_job_states_with_exit_code_with(&view, &[snap.jobid]).await?;
+        let outcome = map
+            .get(&snap.jobid)
+            .cloned()
+            .unwrap_or(crate::runner::JobOutcome {
+                status: JobStatus::default(),
+                exit_code: None,
+            });
         snap.lifecycle.finished = Some(FinishedInfo {
-            final_state: final_status.state,
-            final_reason: final_status.reason,
-            // sacct's ExitCode is not currently parsed by query_job_states_batch_with;
-            // surface as None for now. Phase 2 may extend the parser.
-            exit_code: None,
+            final_state: outcome.status.state,
+            final_reason: outcome.status.reason,
+            exit_code: outcome.exit_code,
             finished_at: chrono::Utc::now(),
         });
         inner.store.save(&snap).await?;
@@ -310,6 +398,49 @@ impl SbatchJobHandle {
     }
 }
 
+/// Phase 3 P3: cross-backend trait implementation. All methods delegate
+/// to the existing inherent `SbatchJobHandle` API — there is no behavior
+/// change, just a uniform contract that callers can hold via
+/// `H: JobHandleCommon`.
+#[async_trait::async_trait]
+impl crate::handle::JobHandleCommon for SbatchJobHandle {
+    type Snapshot = SbatchJobSnapshot;
+
+    fn uuid(&self) -> Uuid {
+        Self::uuid(self)
+    }
+    fn jobid(&self) -> Option<u64> {
+        Self::jobid(self)
+    }
+    fn is_running(&self) -> bool {
+        Self::is_running(self)
+    }
+    fn is_finished(&self) -> bool {
+        Self::is_finished(self)
+    }
+    fn exit_code(&self) -> Option<i32> {
+        Self::exit_code(self)
+    }
+
+    fn snapshot(&self) -> SbatchJobSnapshot {
+        Self::snapshot(self)
+    }
+    fn watch(&self) -> watch::Receiver<SbatchJobSnapshot> {
+        Self::watch(self)
+    }
+
+    async fn refresh(&self) -> anyhow::Result<SbatchJobSnapshot> {
+        Self::refresh(self).await
+    }
+
+    async fn wait_terminal(
+        &self,
+        poll_interval: std::time::Duration,
+    ) -> anyhow::Result<SbatchJobSnapshot> {
+        Self::wait_terminal(self, poll_interval).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +449,8 @@ mod tests {
         SbatchJobSnapshot {
             uuid: Uuid::now_v7(),
             jobid,
+            array_jobid: None,
+            array_task_id: None,
             argv: vec!["sbatch".into(), "/w/job.sh".into()],
             sent_env: HashMap::from([("FOO".into(), "bar".into())]),
             script_path: PathBuf::from("/w/job.sh"),
@@ -455,20 +588,10 @@ mod tests {
         }
     }
 
-    /// Newtype that wraps an `Arc<CannedDispatcher>` so it can be passed
-    /// to `into_dyn` (which requires `D: JobDispatcher + Send + Sync + 'static`)
-    /// while leaving the original Arc available for assertion.
-    struct MoveDispatcher(std::sync::Arc<CannedDispatcher>);
-
-    impl crate::dispatcher::JobDispatcher for MoveDispatcher {
-        async fn run(&self, argv: &[String]) -> anyhow::Result<i32> {
-            self.0.run(argv).await
-        }
-
-        async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
-            self.0.capture(argv).await
-        }
-    }
+    // Shared Arc-wrapper for `Arc<D>` → `dyn JobDispatcher` coercion
+    // lives in `crate::sbatch::test_util` so handle.rs and manager.rs
+    // both consume the same generic helper.
+    use crate::sbatch::test_util::ArcDispatcher as MoveDispatcher;
 
     #[tokio::test]
     async fn refresh_uses_qgroup_when_jobid_present() {
@@ -551,12 +674,46 @@ mod tests {
         use crate::store::InMemoryStateStore;
         let s = snap(12345);
         let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
-        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None\n"));
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None|0:0\n"));
         let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
         let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
         let after = h.refresh_with_sacct().await.unwrap();
         assert!(after.lifecycle.finished.is_some());
         assert_eq!(canned.sacct_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_with_sacct_populates_exit_code_on_completed() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // sacct now emits 4 columns (JobID|State|Reason|ExitCode)
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None|0:0\n"));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        let finished = after.lifecycle.finished.expect("finished should be Some");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn refresh_with_sacct_populates_exit_code_on_signaled() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|CANCELLED|None|0:9\n"));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        let finished = after.lifecycle.finished.expect("finished should be Some");
+        // SIGKILL = 9 -> 128 + 9 = 137
+        assert_eq!(finished.exit_code, Some(137));
     }
 
     #[tokio::test]
@@ -600,5 +757,90 @@ mod tests {
             0,
             "wait_terminal must NEVER call sacct"
         );
+    }
+
+    // ---- log_lines / read_log_to_end ----
+
+    use std::io::Write as _;
+
+    fn snap_with_log_path(jobid: u64, stdout_path: &str, stderr_path: &str) -> SbatchJobSnapshot {
+        let mut s = snap(jobid);
+        s.log = LogPathSpec {
+            output_template: Some(stdout_path.to_string()),
+            error_template: Some(stderr_path.to_string()),
+        };
+        s
+    }
+
+    #[tokio::test]
+    async fn log_lines_returns_empty_when_file_missing() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+        let s = snap_with_log_path(
+            12345,
+            "/nonexistent/stdout-%j.out",
+            "/nonexistent/stderr-%j.err",
+        );
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+        let lines = h.log_lines(LogStream::Stdout, 5).await.unwrap();
+        assert_eq!(lines, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn log_lines_returns_path_not_resolved_when_no_template() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+        let mut s = snap(12345);
+        s.log = LogPathSpec::default();
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+        let err = h.log_lines(LogStream::Stdout, 5).await.unwrap_err();
+        assert!(matches!(err, LogReadError::PathNotResolved));
+    }
+
+    #[tokio::test]
+    async fn log_lines_returns_last_n_lines() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout-12345.out");
+        let mut f = std::fs::File::create(&stdout_path).unwrap();
+        for i in 0..20 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        drop(f);
+
+        let s = snap_with_log_path(12345, stdout_path.to_str().unwrap(), "ignored.err");
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+
+        let lines = h.log_lines(LogStream::Stdout, 5).await.unwrap();
+        assert_eq!(
+            lines,
+            vec!["line 15", "line 16", "line 17", "line 18", "line 19"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_log_to_end_returns_full_content() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout-12345.out");
+        std::fs::write(&stdout_path, "hello\nworld\n").unwrap();
+
+        let s = snap_with_log_path(12345, stdout_path.to_str().unwrap(), "ignored.err");
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h = SbatchJobHandle::new(s, store, dispatcher);
+
+        let content = h.read_log_to_end(LogStream::Stdout).await.unwrap();
+        assert_eq!(content, "hello\nworld\n");
     }
 }

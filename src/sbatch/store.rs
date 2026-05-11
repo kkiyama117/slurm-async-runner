@@ -29,6 +29,8 @@ mod tests {
         SbatchJobSnapshot {
             uuid: Uuid::now_v7(),
             jobid,
+            array_jobid: None,
+            array_task_id: None,
             argv: vec!["sbatch".into()],
             sent_env: HashMap::new(),
             script_path: PathBuf::from("/w/job.sh"),
@@ -55,16 +57,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn array_task_fields_roundtrip_via_fs_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
+        let mut s = snap(12345);
+        s.array_jobid = Some(12345);
+        s.array_task_id = Some(7);
+        store.save(&s).await.unwrap();
+        let loaded = store.load(s.uuid).await.unwrap().unwrap();
+        assert_eq!(loaded.array_jobid, Some(12345));
+        assert_eq!(loaded.array_task_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn array_task_fields_default_to_none_for_legacy_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
+        let s = snap(42);
+        store.save(&s).await.unwrap();
+        let loaded = store.load(s.uuid).await.unwrap().unwrap();
+        assert_eq!(loaded.array_jobid, None);
+        assert_eq!(loaded.array_task_id, None);
+    }
+
+    #[tokio::test]
     async fn sbatch_and_tssrun_coexist_in_same_dir() {
-        use crate::tssrun::handle::JobHandleSnapshot;
+        use crate::tssrun::handle::TssrunJobSnapshot;
         let tmp = tempfile::tempdir().unwrap();
         let sb_store: FileSystemStateStore<SbatchJobSnapshot> =
             FileSystemStateStore::new(tmp.path());
-        let ts_store: FileSystemStateStore<JobHandleSnapshot> =
+        let ts_store: FileSystemStateStore<TssrunJobSnapshot> =
             FileSystemStateStore::new(tmp.path());
         sb_store.save(&snap(1)).await.unwrap();
         ts_store
-            .save(&JobHandleSnapshot {
+            .save(&TssrunJobSnapshot {
                 uuid: Uuid::now_v7(),
                 pid: 1,
                 argv: vec![],

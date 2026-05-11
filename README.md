@@ -129,7 +129,8 @@ async def main():
     )
 
     handle = await manager.spawn()
-    print("uuid", await handle.uuid, "pid", await handle.pid, "jobid", await handle.jobid)
+    # uuid / jobid are sync `@property` getters (Phase 3 P5); pid is still async.
+    print("uuid", handle.uuid, "pid", await handle.pid, "jobid", handle.jobid)
     code = await handle.wait()  # int on normal exit, None on signal kill
     print("exit", code)
 
@@ -148,17 +149,18 @@ asyncio.run(main())
 
 ### Handle API contract
 
-`TssrunJobHandle` returns awaitables for all reads, but the **snapshot
-getters are lock-free against an in-flight `wait()`** — you can poll
-liveness while the wait is pending without blocking it:
+`TssrunJobHandle` exposes a mix of **sync snapshot getters** and async
+operations. All snapshot reads are lock-free against an in-flight
+`wait()` / `refresh()` / `wait_terminal()` — you can poll liveness
+while a wait is pending without blocking it:
 
 ```python
 handle = await manager.spawn()
 wait_fut = asyncio.ensure_future(handle.wait())
 
 while not wait_fut.done():
-    if await handle.is_running():
-        print("jobid", await handle.jobid, "node", await handle.node)
+    if handle.is_running():                      # sync (Phase 3 P5)
+        print("jobid", handle.jobid, "node", await handle.node)
     await asyncio.sleep(1)
 
 code = await wait_fut
@@ -166,20 +168,37 @@ code = await wait_fut
 
 The full snapshot surface:
 
-| Reader (lock-free) | Returns | Notes |
-|---|---|---|
-| `await handle.uuid` | `str` | UUID v7 primary key (canonical hyphenated string). Pass straight back to `attach_uuid` |
-| `await handle.pid` | `int` | The OS pid of the spawned `tssrun` process |
-| `await handle.jobid` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
-| `await handle.node` | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
-| `await handle.sent_env` | `dict[str, str]` | Env explicitly passed via `TssrunCmd.env` |
-| `await handle.live_env()` | `dict[str, str] \| None` | Reads `/proc/<pid>/environ` on Linux; `None` off-Linux or after exit |
-| `await handle.is_running()` | `bool` | `True` until the wait task records `finished` |
-| `await handle.exit_code()` | `int \| None` | Available after exit; `None` for signal kill |
+| Reader (lock-free) | Shape | Returns | Notes |
+|---|---|---|---|
+| `handle.uuid` | sync `@property` | `str` | UUID v7 primary key (canonical hyphenated string). Pass straight back to `attach_uuid` |
+| `await handle.pid` | async | `int` | The OS pid of the spawned `tssrun` process |
+| `handle.jobid` | sync `@property` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
+| `await handle.node` | async | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
+| `await handle.sent_env` | async | `dict[str, str]` | Env explicitly passed via `TssrunCmd.env` |
+| `await handle.live_env()` | async | `dict[str, str] \| None` | Reads `/proc/<pid>/environ` on Linux; `None` off-Linux or after exit |
+| `handle.is_running()` | sync | `bool` | `True` until the wait task records `finished` |
+| `handle.is_finished()` | sync | `bool` | Inverse of `is_running()` |
+| `handle.exit_code()` | sync | `int \| None` | Available after exit; `None` for signal kill |
+
+> **Phase 3 P5 — breaking on the unreleased Phase 3 branch.** `uuid` /
+> `jobid` / `is_running` / `is_finished` / `exit_code` used to be
+> awaitables on `TssrunJobHandle`. They are now sync to match
+> `SbatchJobHandle` and the new `JobHandleCommon` Protocol. The pre-P5
+> shapes are preserved as `uuid_async` / `jobid_async` /
+> `is_running_async` / `is_finished_async` / `exit_code_async` for
+> callers that need a temporary escape hatch.
 
 | Owner-only | Returns | Notes |
 |---|---|---|
 | `await handle.wait()` | `int \| None` | `int` = exit code; `None` = killed by signal (SLURM time-limit kill, OOM, etc.). Raises `RuntimeError` on attached / already-waited handles. |
+| `await handle.refresh()` | `None` | Re-reads persisted snapshot and broadcasts it. Read the updated state via the sync getters above. Available on attached handles too. |
+| `await handle.wait_terminal(poll_interval_secs)` | `None` | Polls via `refresh()` until `is_finished()` flips. Mirrors `SbatchJobHandle::wait_terminal`. Read the terminal `exit_code` via the sync getter after the await resolves. |
+
+> Rust's `TssrunJobHandle::refresh` / `wait_terminal` return
+> `Result<TssrunJobSnapshot>` — the Python pyo3 wrappers intentionally
+> drop the snapshot return so Python callers go through the lock-free
+> getters / `JobHandleCommon` Protocol contract instead of two parallel
+> read paths.
 
 ### Cross-process attach
 
@@ -202,6 +221,79 @@ Attached handles support every snapshot getter (they reflect the JSON's
 last-known state) but `wait()` raises — only the original spawner owns
 the child. Pids can be recycled by the kernel, so prefer `attach_uuid`
 for any long-lived reference.
+
+## sbatch (queue-managed batch jobs)
+
+`crate::sbatch` (Rust) and
+`slurm_async_runner._slurm_async_runner_core.sbatch` (Python) provide
+the same spawn / attach surface for jobs submitted with `sbatch`
+instead of `tssrun`. Snapshots persist alongside tssrun's in the same
+state directory (the `kind` discriminator field in
+`{root}/<uuid>.json` keeps the two backends separated). Typed
+flag entities live in `crate::entities::slurm::sbatch_options::*` and
+re-export as pyclasses under
+`slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options`
+(e.g. `SlurmDependency`, `SlurmSignalSpec`, `MailTypeInput`,
+`SlurmArraySpec`).
+
+`SbatchManager` mirrors `TssrunManager`:
+
+| Operation | Method | Notes |
+|---|---|---|
+| Submit single job | `await mgr.spawn(cmd)` | Returns `SbatchJobHandle` |
+| Submit `--array=<spec>` | `await mgr.spawn_array(cmd, array_spec)` | Returns `list[SbatchJobHandle]` (one per task) |
+| Submit + block until terminal | `await mgr.run(cmd)` | Returns `FinishedInfo`. Rejects array submissions. |
+| Cancel | `await mgr.cancel(jobid)` | Idempotent (delegates to `scancel`). |
+| Attach by uuid / jobid / file / array | `await mgr.attach_*` | All entry points peek the `kind` discriminator. |
+
+`SbatchJobHandle` exposes the same five sync getters (`uuid`,
+`jobid`, `is_running()`, `is_finished()`, `exit_code()`) plus an
+opt-in `refresh_with_sacct()` that calls `sacct` for terminal exit-code
+discovery. See
+[`docs/superpowers/specs/2026-05-10-sbatch-module-design.md`](docs/superpowers/specs/2026-05-10-sbatch-module-design.md)
+and the Phase 2 / Phase 3 entries in [`CHANGELOG.md`](CHANGELOG.md)
+for the full design rationale.
+
+## Cross-backend handle abstraction (`JobHandleCommon`)
+
+Both `SbatchJobHandle` and `TssrunJobHandle` implement the
+`JobHandleCommon` trait (Rust) / Protocol (Python), so dashboards and
+orchestration code can stay backend-agnostic.
+
+```rust
+use slurm_async_runner::{JobHandleCommon, handle::into_dyn};
+use std::time::Duration;
+
+async fn watch_until_done<H: JobHandleCommon>(h: H) -> anyhow::Result<()> {
+    let snap = h.wait_terminal(Duration::from_secs(5)).await?;
+    println!("done, exit_code={:?}", snap.exit_code());
+    Ok(())
+}
+
+// Heterogenous collection: mix sbatch + tssrun handles in one Vec.
+let dyn_handles: Vec<std::sync::Arc<dyn slurm_async_runner::handle::DynJobHandleCommon>> = vec![
+    into_dyn(sbatch_handle),
+    into_dyn(tssrun_handle),
+];
+```
+
+```python
+from slurm_async_runner import JobHandleCommon
+
+def describe(h: JobHandleCommon) -> None:
+    print(h.uuid, h.jobid, h.is_running(), h.exit_code())
+
+# Works against either pyo3 backend without importing the concrete class.
+assert isinstance(sbatch_handle, JobHandleCommon)
+assert isinstance(tssrun_handle, JobHandleCommon)
+```
+
+The Rust trait is **not** dyn-safe by design (it carries an associated
+`Snapshot` type); use `crate::handle::into_dyn` to erase into
+`Arc<dyn DynJobHandleCommon>` when you need heterogeneous collections.
+See
+[`docs/superpowers/specs/2026-05-11-sbatch-phase3-design.md`](docs/superpowers/specs/2026-05-11-sbatch-phase3-design.md)
+for the full rationale.
 
 ### Live smoke test on kudpc / ECCS
 

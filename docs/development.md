@@ -61,19 +61,38 @@ cargo test --lib -- --nocapture      # println! を見たい時
 
 ```bash
 cargo test --test tssrun_integration
+cargo test --test job_handle_common
 ```
 
 `tests/tssrun_integration.rs` は `bash` を `tssrun` のスタブとして使い、
 `spawn → wait → snapshot → attach_file` の一連を実行します。
+
+`tests/job_handle_common.rs` は Phase 3 で追加した跨 backend contract
+test。`sbatch::SbatchJobHandle` と `tssrun::TssrunJobHandle` の両方に対して
+generic な `assert_common_contract<H: JobHandleCommon>` を回し、コア 5
+sync getter (`uuid` / `jobid` / `is_running` / `is_finished` /
+`exit_code`) と `snapshot` / `watch` / `refresh` / `wait_terminal` の
+挙動が同一であることを検証します。新 backend を `JobHandleCommon` に
+追加した場合は、ここに fixture を 1 つ + テスト 1 行を足すだけで済みます。
 
 ### 3.3 Python 単体（クラスタ不要）
 
 ```bash
 uv run pytest python/tests -v
 uv run pytest python/tests/test_tssrun.py -v
+uv run pytest python/tests/test_sbatch.py -v       # Phase 2
+uv run pytest python/tests/test_protocol.py -v     # Phase 3 P4/P5
 ```
 
 `maturin develop` 後でないと `_slurm_async_runner_core` が見えないので注意。
+
+`test_protocol.py` は **`slurm_async_runner.JobHandleCommon`** Protocol
+が `SbatchJobHandle` / `TssrunJobHandle` の両方に対して `isinstance`
+で通り、かつ実際の call shape (Phase 3 P5 で sync 化された `uuid` /
+`jobid` / `is_running` / `is_finished` / `exit_code`) も一致することを
+verify します。前者の structural type check と後者の runtime call の
+両方を持っておくことで、`runtime_checkable` が name のみを見る性質
+（HIGH severity の Phase 3 review 指摘）に対する回帰を防ぎます。
 
 ### 3.4 Python ライブテスト（要 ECCS / kudpc 環境）
 
@@ -162,13 +181,17 @@ symbol になります。下流は `default-features = false`、または
 新しく doctest を書く場合は `feature = "pyo3"` 配下にあるシンボルが
 Rust-only ビルド経路でも見えるかを意識してください。
 
-### 5.5 `JobHandle::wait()` の二重呼び出し
+### 5.5 `TssrunJobHandle::wait()` の二重呼び出し
 
 `Option<JoinHandle>` の `.take()` 設計上、2 回目は
 `Err("not owner of the child / already waited")` になります。
 attach 済みハンドルでも同様。テストで再現する場合は
 `tssrun_integration.rs` の `spawn_then_wait_then_snapshot_then_attach`
 を参考に。
+
+> `TssrunJobHandle` は Phase 3 P1 で `JobHandle` から rename されました。
+> 旧名は `#[deprecated]` alias として残っているので既存コードはそのまま
+> 動きますが、新規コードでは `TssrunJobHandle` を使ってください。
 
 ### 5.6 `live_env()` が ECCS 上で `Err` を返す
 
@@ -260,11 +283,18 @@ tssrun (which is setuid).
 - [ ] `cargo fmt --check` を通す
 - [ ] `cargo clippy --all-targets -- -D warnings` を通す
 - [ ] `cargo test --lib` を通す
+- [ ] `cargo test --test job_handle_common` を通す（Phase 3 跨 backend contract）
 - [ ] `uv run maturin develop && uv run pytest python/tests -v` を通す
 - [ ] `uv run ruff check python/` と `ruff format --check python/` を通す
 - [ ] 公開 API を変えたら `README.md` と `CHANGELOG.md` を更新
 - [ ] 必要に応じて `docs/` 配下も更新（特にこのファイルか `architecture.md`）
-- [ ] `tssrun` 周りに触ったら、可能であれば実機ライブテスト（§3.4）も走らせる
+- [ ] `tssrun` / `sbatch` 周りに触ったら、可能であれば実機ライブテスト
+      （§3.4 の `RUN_LIVE_TSSRUN=1` / `scripts/test_sbatch_live.py`）も走らせる
+- [ ] **Phase 3 不変条件** (`docs/architecture.md` §6):
+  - [ ] `JobSnapshot::kind()` 文字列 (`"sbatch"` / `"tssrun"`) を rename していない
+  - [ ] `JobHandleCommon::refresh()` から `sacct` を呼んでいない
+  - [ ] dyn 化が必要な場合は `crate::handle::into_dyn` を経由
+        (blanket impl 追加禁止)
 
 ## 8. リリース
 

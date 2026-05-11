@@ -15,10 +15,12 @@
 //! dispatcher / handle / manager.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use anyhow::Result;
 
 use crate::entities::slurm::{JobPartition, JobTimeLimit, ResourceSpec};
-use anyhow::{Context, Result};
+use crate::util::path::absolutize;
 
 /// Spec for a single `tssrun` invocation. Pure data + an argv builder —
 /// no subprocess work. Mirrors [`crate::manager::SlurmCmd`] in spirit but
@@ -92,14 +94,6 @@ impl TssrunCmd {
         }
         Ok(argv)
     }
-}
-
-fn absolutize(p: &Path) -> Result<String> {
-    let abs =
-        std::path::absolute(p).with_context(|| format!("failed to absolutize {}", p.display()))?;
-    abs.into_os_string()
-        .into_string()
-        .map_err(|os| anyhow::anyhow!("non-UTF8 program path: {os:?}"))
 }
 
 #[cfg(test)]

@@ -7,12 +7,21 @@
 import builtins
 import os
 from collections.abc import Awaitable
-from typing import final
+from typing import TYPE_CHECKING, final
+
+if TYPE_CHECKING:
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        MailTypeInput,
+        SlurmArraySpec,
+        SlurmDependency,
+        SlurmSignalSpec,
+    )
 
 __all__ = [
     "SbatchCmd",
     "SbatchManager",
     "SbatchJobHandle",
+    "FinishedInfo",
 ]
 
 @final
@@ -33,6 +42,13 @@ class SbatchCmd:
         chdir: builtins.str | os.PathLike[builtins.str] | None = None,
         env: builtins.dict[builtins.str, builtins.str] | None = None,
         args: builtins.list[builtins.str] | None = None,
+        no_requeue: builtins.bool = False,
+        comment: builtins.str | None = None,
+        dependency: "SlurmDependency | None" = None,
+        mail_user: builtins.str | None = None,
+        mail_types: "MailTypeInput | None" = None,
+        signal: "SlurmSignalSpec | None" = None,
+        array_spec: "SlurmArraySpec | None" = None,
     ) -> None: ...
 
 @final
@@ -45,18 +61,16 @@ class SbatchJobHandle:
     ``Some(int)`` for spawned/attached handles since sbatch always
     returns a jobid; the ``Optional[int]`` return shape mirrors the
     underlying Rust trait but the value is never ``None`` in practice.
-
-    Note (Phase 1 limitation): ``exit_code()`` returns ``None`` even
-    after a successful ``refresh_with_sacct()`` call. The sacct
-    ``ExitCode`` column is not yet parsed by the underlying Rust
-    implementation. A future release will extend the sacct parser to
-    capture exit codes.
     """
 
     @property
     def uuid(self) -> builtins.str: ...
     @property
     def jobid(self) -> builtins.int | None: ...
+    @property
+    def array_jobid(self) -> builtins.int | None: ...
+    @property
+    def array_task_id(self) -> builtins.int | None: ...
     @property
     def partition(self) -> builtins.str | None: ...
     @property
@@ -77,6 +91,40 @@ class SbatchJobHandle:
     def refresh(self) -> Awaitable[None]: ...
     def refresh_with_sacct(self) -> Awaitable[None]: ...
     def wait_terminal(self, poll_interval_secs: builtins.float) -> Awaitable[None]: ...
+    def log_lines(
+        self, stream: builtins.int, n: builtins.int
+    ) -> Awaitable[builtins.list[builtins.str]]:
+        """Read the last ``n`` lines of the job's stdout (stream=0) or stderr (stream=1).
+
+        Returns an empty list if the log file does not yet exist.
+        Raises ``ValueError`` if ``stream`` is not 0 or 1.
+        """
+        ...
+
+    def read_log_to_end(self, stream: builtins.int) -> Awaitable[builtins.str]:
+        """Read the full contents of the job's stdout (0) or stderr (1) log.
+
+        Returns an empty string if the log file does not yet exist.
+        Same error semantics as ``log_lines``.
+        """
+        ...
+
+@final
+class FinishedInfo:
+    """Outcome of a finished sbatch job. Returned by ``SbatchManager.run``.
+
+    ``final_state`` is the SLURM state string (e.g. ``"COMPLETED"``, ``"FAILED"``).
+    ``exit_code`` is the conventional Unix exit code: ``None`` if not resolvable,
+    ``128 + signum`` if killed by signal.
+    ``finished_at`` is an RFC3339 timestamp string.
+    """
+
+    @property
+    def final_state(self) -> builtins.str: ...
+    @property
+    def exit_code(self) -> builtins.int | None: ...
+    @property
+    def finished_at(self) -> builtins.str: ...
 
 @final
 class SbatchManager:
@@ -87,6 +135,7 @@ class SbatchManager:
         cmd: SbatchCmd,
         *,
         state_dir: builtins.str | os.PathLike[builtins.str] | None = None,
+        scancel_bin: builtins.str | None = None,
     ) -> None: ...
     def spawn(self) -> Awaitable[SbatchJobHandle]: ...
     def attach_uuid(self, uuid: builtins.str) -> Awaitable[SbatchJobHandle]: ...
@@ -95,3 +144,47 @@ class SbatchManager:
         self,
         path: builtins.str | os.PathLike[builtins.str],
     ) -> Awaitable[SbatchJobHandle]: ...
+    def spawn_array(
+        self, array_spec: "SlurmArraySpec"
+    ) -> Awaitable[builtins.list[SbatchJobHandle]]: ...
+    def attach_array_jobid(
+        self, master_jobid: builtins.int
+    ) -> Awaitable[builtins.list[SbatchJobHandle]]: ...
+    def run(self) -> Awaitable[FinishedInfo]:
+        """Submit one job, block until terminal state, return ``FinishedInfo``.
+
+        Raises ``ValueError`` if ``cmd.array_spec`` is set — use ``spawn_array``
+        for array submissions. Raises ``RuntimeError`` for spawn / wait / sacct
+        failures or non-success terminal states.
+
+        Note: wrapping with ``asyncio.wait_for(mgr.run(), timeout=...)``
+        drops the future and strands the jobid. Use
+        ``run_with_jobid_callback`` instead if you need to call
+        ``cancel(jobid)`` after a timeout.
+        """
+        ...
+
+    def run_with_jobid_callback(
+        self,
+        on_spawn: "builtins.object",
+    ) -> Awaitable[FinishedInfo]:
+        """Same as ``run()`` but invokes ``on_spawn(jobid)`` synchronously
+        the moment sbatch returns a parseable jobid.
+
+        Use this when wrapping the resulting awaitable in
+        ``asyncio.wait_for(..., timeout=...)`` so you can recover the
+        jobid for ``cancel(jobid)`` if the timeout fires.
+
+        Same error contract as ``run()``: ``ValueError`` for array
+        submissions (callback is NOT invoked in that case),
+        ``RuntimeError`` for spawn / wait / sacct failures.
+        Exceptions raised by ``on_spawn`` surface as ``RuntimeError``.
+        """
+        ...
+
+    def cancel(self, jobid: builtins.int) -> Awaitable[None]:
+        """Send ``scancel <jobid>``. Idempotent on the SLURM side.
+
+        Raises ``RuntimeError`` if scancel itself reports a non-zero exit.
+        """
+        ...

@@ -6,12 +6,12 @@
 //! - Holds the [`TssrunCmd`] spec, a [`JobStateStore`] for snapshot
 //!   persistence, and a shared [`JobLogSink`] for tee'd stdout/stderr.
 //! - [`TssrunManager::spawn`] launches the child via
-//!   [`TokioBackgroundDispatcher`] and returns a [`JobHandle`] whose
+//!   [`TokioBackgroundDispatcher`] and returns a [`TssrunJobHandle`] whose
 //!   snapshot is updated as `salloc:` lines arrive and as the wait task
 //!   records exit info. Every spawn generates a fresh UUID v7 that is
 //!   the snapshot's primary key. Every snapshot mutation is persisted
 //!   through the configured store.
-//! - [`TssrunManager::attach`] reconstructs a read-only [`JobHandle`]
+//! - [`TssrunManager::attach`] reconstructs a read-only [`TssrunJobHandle`]
 //!   from a previously persisted snapshot, identified by [`AttachKey`].
 //!   Attach by [`AttachKey::Uuid`] is an O(1) primary-key lookup; attach
 //!   by `Pid` / `JobId` may fall back to a scan inside the store
@@ -55,7 +55,7 @@ use crate::dispatcher::{BackgroundDispatcher, TokioBackgroundDispatcher};
 use crate::runner;
 use crate::store::JobStateStore;
 use crate::tssrun::cmd::TssrunCmd;
-use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, LogLocations};
+use crate::tssrun::handle::{LogLocations, TssrunJobHandle, TssrunJobSnapshot};
 use crate::tssrun::log::{JobLogSink, StdLogSink};
 use crate::tssrun::store::{self, FileSystemStateStore, InMemoryStateStore};
 
@@ -86,7 +86,7 @@ pub enum AttachKey {
 /// `with_*` builders for new managers.
 pub struct TssrunManager {
     pub(crate) cmd: TssrunCmd,
-    pub(crate) store: Arc<dyn JobStateStore<JobHandleSnapshot>>,
+    pub(crate) store: Arc<dyn JobStateStore<TssrunJobSnapshot>>,
     pub(crate) log_sink: Arc<dyn JobLogSink>,
 }
 
@@ -114,7 +114,7 @@ impl TssrunManager {
     }
 
     /// Wire an arbitrary [`JobStateStore`] backend.
-    pub fn with_state_store(mut self, store: Arc<dyn JobStateStore<JobHandleSnapshot>>) -> Self {
+    pub fn with_state_store(mut self, store: Arc<dyn JobStateStore<TssrunJobSnapshot>>) -> Self {
         self.store = store;
         self
     }
@@ -126,17 +126,20 @@ impl TssrunManager {
 
     /// Borrow the configured store. Useful when a caller wants to save
     /// or load snapshots out-of-band (e.g. a CLI listing all known jobs).
-    pub fn store(&self) -> &Arc<dyn JobStateStore<JobHandleSnapshot>> {
+    pub fn store(&self) -> &Arc<dyn JobStateStore<TssrunJobSnapshot>> {
         &self.store
     }
 
     /// Spawn the configured command via [`TokioBackgroundDispatcher`].
-    pub async fn spawn(&self) -> Result<JobHandle> {
+    pub async fn spawn(&self) -> Result<TssrunJobHandle> {
         self.spawn_with(&TokioBackgroundDispatcher).await
     }
 
     /// Spawn via an explicit dispatcher.
-    pub async fn spawn_with<D: BackgroundDispatcher>(&self, dispatcher: &D) -> Result<JobHandle> {
+    pub async fn spawn_with<D: BackgroundDispatcher>(
+        &self,
+        dispatcher: &D,
+    ) -> Result<TssrunJobHandle> {
         let argv = self.cmd.build_argv()?;
         let cwd = self.cmd.cwd.as_deref();
         let spawned = dispatcher.spawn(&argv, &self.cmd.env, cwd).await?;
@@ -146,7 +149,7 @@ impl TssrunManager {
         // the on-disk filename, the in-memory snapshot, and the in-flight
         // store entry in sync with no second source of truth.
         let uuid = Uuid::now_v7();
-        let init = JobHandleSnapshot {
+        let init = TssrunJobSnapshot {
             uuid,
             pid: spawned.pid,
             argv,
@@ -158,7 +161,7 @@ impl TssrunManager {
             node: None,
             finished: None,
         };
-        JobHandle::from_spawn(
+        TssrunJobHandle::from_spawn(
             spawned,
             init,
             self.log_sink.clone(),
@@ -168,15 +171,18 @@ impl TssrunManager {
     }
 
     /// Re-attach to a previously persisted handle.
-    pub async fn attach(&self, key: AttachKey) -> Result<JobHandle> {
+    pub async fn attach(&self, key: AttachKey) -> Result<TssrunJobHandle> {
         match key {
             AttachKey::File(p) => {
                 let bytes = tokio::fs::read(&p)
                     .await
                     .with_context(|| format!("failed to read {}", p.display()))?;
-                let snap: JobHandleSnapshot = serde_json::from_slice(&bytes)
+                let snap: TssrunJobSnapshot = serde_json::from_slice(&bytes)
                     .with_context(|| format!("failed to decode {}", p.display()))?;
-                Ok(JobHandle::attach_snapshot(snap, Some(self.store.clone())))
+                Ok(TssrunJobHandle::attach_snapshot(
+                    snap,
+                    Some(self.store.clone()),
+                ))
             }
             AttachKey::Uuid(uuid) => {
                 let snap = self
@@ -184,13 +190,19 @@ impl TssrunManager {
                     .load(uuid)
                     .await?
                     .ok_or_else(|| anyhow!("no persisted handle matched uuid {uuid}"))?;
-                Ok(JobHandle::attach_snapshot(snap, Some(self.store.clone())))
+                Ok(TssrunJobHandle::attach_snapshot(
+                    snap,
+                    Some(self.store.clone()),
+                ))
             }
             AttachKey::Pid(pid) => {
                 let snap = store::find_by_pid(self.store.as_ref(), pid)
                     .await?
                     .ok_or_else(|| anyhow!("no persisted handle matched pid {pid}"))?;
-                Ok(JobHandle::attach_snapshot(snap, Some(self.store.clone())))
+                Ok(TssrunJobHandle::attach_snapshot(
+                    snap,
+                    Some(self.store.clone()),
+                ))
             }
             AttachKey::JobId(jobid) => {
                 let snap = self
@@ -198,14 +210,17 @@ impl TssrunManager {
                     .find_by_jobid(jobid)
                     .await?
                     .ok_or_else(|| anyhow!("no persisted handle matched jobid {jobid}"))?;
-                Ok(JobHandle::attach_snapshot(snap, Some(self.store.clone())))
+                Ok(TssrunJobHandle::attach_snapshot(
+                    snap,
+                    Some(self.store.clone()),
+                ))
             }
         }
     }
 
     /// Look up the SLURM lifecycle state via `sacct`.
     /// Returns a default `JobStatus` when the handle has no parsed jobid.
-    pub async fn query_state(&self, handle: &JobHandle) -> Result<JobStatus> {
+    pub async fn query_state(&self, handle: &TssrunJobHandle) -> Result<JobStatus> {
         match handle.jobid() {
             None => Ok(JobStatus::default()),
             Some(jid) => {
@@ -265,7 +280,7 @@ echo done
     async fn query_state_with_no_jobid_returns_default() {
         let cmd = TssrunCmd::new("/bin/true");
         let manager = TssrunManager::new(cmd);
-        let snap = JobHandleSnapshot {
+        let snap = TssrunJobSnapshot {
             uuid: Uuid::now_v7(),
             pid: 1,
             argv: vec![],
@@ -277,7 +292,7 @@ echo done
             node: None,
             finished: None,
         };
-        let h = JobHandle::attach_snapshot(snap, None);
+        let h = TssrunJobHandle::attach_snapshot(snap, None);
         let st = manager.query_state(&h).await.unwrap();
         assert_eq!(st, JobStatus::default());
     }
@@ -287,7 +302,7 @@ echo done
         let tmp = tempfile::tempdir().unwrap();
         let uuid = Uuid::now_v7();
         let path = tmp.path().join(format!("{uuid}.json"));
-        let snap = JobHandleSnapshot {
+        let snap = TssrunJobSnapshot {
             uuid,
             pid: 42,
             argv: vec!["tssrun".into(), "/x".into()],
@@ -315,7 +330,7 @@ echo done
     async fn attach_by_uuid_resolves_directly_to_filename() {
         let tmp = tempfile::tempdir().unwrap();
         let uuid = Uuid::now_v7();
-        let snap = JobHandleSnapshot {
+        let snap = TssrunJobSnapshot {
             uuid,
             pid: 1234,
             argv: vec![],
@@ -347,7 +362,7 @@ echo done
         let tmp = tempfile::tempdir().unwrap();
         for (pid, jid) in [(10u32, 100u64), (11, 101)] {
             let uuid = Uuid::now_v7();
-            let snap = JobHandleSnapshot {
+            let snap = TssrunJobSnapshot {
                 uuid,
                 pid,
                 argv: vec![],
@@ -380,7 +395,7 @@ echo done
         let tmp = tempfile::tempdir().unwrap();
         for pid in [777u32, 888] {
             let uuid = Uuid::now_v7();
-            let snap = JobHandleSnapshot {
+            let snap = TssrunJobSnapshot {
                 uuid,
                 pid,
                 argv: vec![],
@@ -447,7 +462,7 @@ echo "salloc: Nodes node-mem are ready for job"
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("never-created");
         let manager = TssrunManager::new(TssrunCmd::new("/bin/true")).with_state_dir(&dir);
-        // JobHandle isn't Debug, so we can't use unwrap_err() — match
+        // TssrunJobHandle isn't Debug, so we can't use unwrap_err() — match
         // explicitly and inspect the error message instead.
         match manager.attach(AttachKey::JobId(999)).await {
             Ok(_) => panic!("attach should have failed for missing dir"),
