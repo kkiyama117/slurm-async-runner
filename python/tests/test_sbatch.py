@@ -220,3 +220,36 @@ def test_attach_array_jobid_round_trips(tmp_path: Path):
     assert len(handles) == 2
     assert handles[0].array_task_id == 0
     assert handles[1].array_task_id == 1
+
+
+@pytest.mark.skipif(not _have_bash(), reason="bash required")
+def test_run_rejects_array_spec_with_value_error(tmp_path: Path):
+    """run() should raise ValueError when cmd.array_spec is set."""
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmArraySpec,
+    )
+
+    job = tmp_path / "j.sh"
+    job.write_text("#!/usr/bin/env bash\n:\n")
+    job.chmod(0o755)
+
+    cmd = SbatchCmd(str(job), array_spec=SlurmArraySpec.parse("0-2"))
+    mgr = SbatchManager(cmd)
+
+    async def go():
+        await mgr.run()
+
+    with pytest.raises(ValueError, match="array"):
+        asyncio.run(go())
+
+
+def test_cancel_smoke_skipped_pending_scancel_bin_override():
+    """Placeholder marker for the cancel-via-fake-scancel test.
+
+    Until ``SbatchManager`` exposes a ``scancel_bin`` override mirroring
+    ``sbatch_bin``, this Python test cannot inject a controllable scancel
+    binary. The Rust unit tests in ``src/sbatch/manager.rs`` cover the
+    success + non-zero-exit branches via the dispatcher seam.
+    Tracked as Phase 3 follow-up.
+    """
+    pytest.skip("scancel_bin override not yet implemented; see Phase 3")
