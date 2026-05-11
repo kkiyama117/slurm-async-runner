@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 2 P6
+
+- **`SbatchManager::run()`** — submit a single job and block until terminal state, then return `FinishedInfo`. Rejects array submissions early with `SbatchRunError::ArrayNotSupported` (mapped to Python `ValueError`). Polling cadence defaults to 30 s; override via `with_poll_interval` (tests use 1–10 ms).
+- **`SbatchManager::cancel(jobid)`** — send `scancel <jobid>` via the existing `JobDispatcher::capture` seam. Idempotent on the SLURM side. Non-zero exit surfaces as `SbatchCancelError::Scancel { exit_code, stdout }`.
+- **`SbatchRunError`** — typed errors for the run pipeline: `Spawn`, `Wait(anyhow::Error)`, `Sacct(anyhow::Error)`, `MissingFinished`, `JobFailed { state, exit_code }`, `ArrayNotSupported`. `#[non_exhaustive]`.
+- **`SbatchCancelError`** — `Scancel { exit_code, stdout }` and `Other(anyhow::Error)`. `#[non_exhaustive]`.
+- **Python**: `SbatchManager.run` / `SbatchManager.cancel` async methods; new `FinishedInfo` pyclass with `final_state` / `exit_code` / `finished_at` getters.
+
+### Notes (Phase 2 P6)
+
+- `run()` does not use `sbatch --wait`. The poll-based design avoids orphan-on-disconnect risk on KUDPC and preserves Phase 1's snapshot-permanence invariant. See spec §6.0 for the four-bullet justification.
+- `cancel()` does not pre-check local `is_finished()` state. SLURM's own `scancel` is idempotent for terminal jobs; pre-checking would race against external state changes.
+- Spec §6.5 (Drop auto-cancel + `tracing::warn!`) is explicitly NOT in P6. `SbatchJobHandle::Drop` is left unchanged; the warning is a Phase 3 add-on.
+- The scancel-binary-swap Python smoke test is skipped pending a `scancel_bin` override on `SbatchManager`; tracked as Phase 3.
+- spec §6.1 sketched `run(&self, cmd: SbatchCmd)`; the implementation follows the established `SbatchManager::spawn(&self)` pattern (`run(&self)`, no `cmd` parameter) for consistency.
+- spec §6.2 declared `Wait(std::io::Error)`; implementation uses `Wait(anyhow::Error)` to match the actual `wait_terminal` return type.
+- **`JobState` accessor naming**: plan referenced `JobState::as_slurm_str`, but the actual method on `JobState` (in `src/entities/slurm/status.rs`) is `as_token`. Task 6 (`PyFinishedInfo.final_state`) uses `as_token` accordingly. No behavioral change — the token strings are identical.
+- **Plan-literal canned-data correction in Tasks 4 + 5**: the plan's `qgroup` canned output `"QUEUE USER JOBID STATUS PROC\ngr u <jobid> CMP 1\n"` does not actually exercise the sacct path because `refresh_with_sacct` early-returns when `qgroup` reports a terminal status (`left_active_listing` stays `false`). Tasks 4 + 5 corrected this to an **empty `qgroup` output** so `left_active_listing=true` flips and the sacct dispatch fires, allowing the canned `sacct` row to populate `FinishedInfo`. End-state assertions are unchanged.
+
 ### Added (Phase 2 P5)
 
 - **`SbatchCmd::array_spec: Option<SlurmArraySpec>`** — wires SLURM
