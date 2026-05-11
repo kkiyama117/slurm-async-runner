@@ -13,6 +13,8 @@ pub mod dependency;
 
 pub mod resource_spec;
 
+pub mod signal;
+
 pub mod time_limit;
 
 use std::path::PathBuf;
