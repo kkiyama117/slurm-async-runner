@@ -114,6 +114,10 @@ class FinishedInfo:
     """Outcome of a finished sbatch job. Returned by ``SbatchManager.run``.
 
     ``final_state`` is the SLURM state string (e.g. ``"COMPLETED"``, ``"FAILED"``).
+    ``final_reason`` is the SLURM reason string (``%r`` column from ``sacct``):
+    ``"None"`` for a clean completion, or one of ``"NonZeroExitCode"`` /
+    ``"TimeLimit"`` / ``"OutOfMemory"`` / etc. on failure. Unknown reasons
+    are returned verbatim as the raw scheduler string.
     ``exit_code`` is the conventional Unix exit code: ``None`` if not resolvable,
     ``128 + signum`` if killed by signal.
     ``finished_at`` is an RFC3339 timestamp string.
@@ -121,6 +125,8 @@ class FinishedInfo:
 
     @property
     def final_state(self) -> builtins.str: ...
+    @property
+    def final_reason(self) -> builtins.str: ...
     @property
     def exit_code(self) -> builtins.int | None: ...
     @property
