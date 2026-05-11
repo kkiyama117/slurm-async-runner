@@ -36,16 +36,19 @@ impl SbatchManager {
         }
     }
 
+    #[must_use = "with_state_dir returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_state_dir(mut self, root: impl Into<PathBuf>) -> Self {
         self.store = Arc::new(FileSystemStateStore::<SbatchJobSnapshot>::new(root));
         self
     }
 
+    #[must_use = "with_state_store returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_state_store(mut self, store: Arc<dyn JobStateStore<SbatchJobSnapshot>>) -> Self {
         self.store = store;
         self
     }
 
+    #[must_use = "with_dispatcher returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn DynJobDispatcher>) -> Self {
         self.dispatcher = dispatcher;
         self
@@ -54,6 +57,7 @@ impl SbatchManager {
     /// Override the polling cadence used by `run()` between `wait_terminal`
     /// iterations. Default is 30 s, chosen to keep KUDPC squeue load low.
     /// Tests typically use 1–10 ms.
+    #[must_use = "with_poll_interval returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
         self
@@ -63,6 +67,7 @@ impl SbatchManager {
     /// `"scancel"` (resolved via `$PATH`). Tests and integration smokes
     /// can pass a fake-scancel script path to exercise the cancel flow
     /// without a real SLURM cluster.
+    #[must_use = "with_scancel_bin returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_scancel_bin(mut self, bin: impl Into<String>) -> Self {
         self.scancel_bin = bin.into();
         self

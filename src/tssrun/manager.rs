@@ -109,16 +109,19 @@ impl TssrunManager {
     /// Sugar for `with_state_store(Arc::new(FileSystemStateStore::new(dir)))`.
     /// The directory does not need to exist yet — it is created lazily
     /// on first save.
+    #[must_use = "with_state_dir returns a new TssrunManager; the receiver is unchanged"]
     pub fn with_state_dir(self, dir: impl Into<PathBuf>) -> Self {
         self.with_state_store(Arc::new(FileSystemStateStore::new(dir)))
     }
 
     /// Wire an arbitrary [`JobStateStore`] backend.
+    #[must_use = "with_state_store returns a new TssrunManager; the receiver is unchanged"]
     pub fn with_state_store(mut self, store: Arc<dyn JobStateStore<TssrunJobSnapshot>>) -> Self {
         self.store = store;
         self
     }
 
+    #[must_use = "with_log_sink returns a new TssrunManager; the receiver is unchanged"]
     pub fn with_log_sink(mut self, sink: Arc<dyn JobLogSink>) -> Self {
         self.log_sink = sink;
         self
