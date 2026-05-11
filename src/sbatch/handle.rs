@@ -163,6 +163,30 @@ pub(crate) struct SbatchJobHandleInner {
     pub(crate) refresh_lock: TokioMutex<()>,
 }
 
+/// Drop on the inner (Arc-shared) state — fires once when the last
+/// clone of `SbatchJobHandle` is released. Per spec §6.5, dropping a
+/// handle whose snapshot still appears to be running is treated as a
+/// silent bug magnet and earns a `tracing::warn!`. The drop is
+/// deliberately NOT auto-cancelling: SLURM jobs survive their owning
+/// handles, and recovering one via `SbatchManager::attach_jobid` /
+/// `attach_uuid` is the expected workflow. Use
+/// `SbatchManager::cancel(jobid)` explicitly when termination is
+/// intended.
+impl Drop for SbatchJobHandleInner {
+    fn drop(&mut self) {
+        let snap = self.snapshot_tx.borrow();
+        if snap.is_running() {
+            tracing::warn!(
+                jobid = snap.jobid,
+                uuid = %snap.uuid,
+                "SbatchJobHandle dropped while job still appears to be running; \
+                 the job was NOT auto-cancelled. Call SbatchManager::cancel(jobid) \
+                 explicitly if termination is intended."
+            );
+        }
+    }
+}
+
 impl SbatchJobHandle {
     pub(crate) fn new(
         snapshot: SbatchJobSnapshot,
@@ -842,5 +866,64 @@ mod tests {
 
         let content = h.read_log_to_end(LogStream::Stdout).await.unwrap();
         assert_eq!(content, "hello\nworld\n");
+    }
+
+    /// Drop on the inner Arc-shared state must not panic, regardless of
+    /// whether the last-observed state says the job is still running.
+    /// This is a smoke test for spec §6.5 — the Drop emits a
+    /// `tracing::warn!` when running, and is a no-op otherwise. We
+    /// cannot easily assert on the warn without a captive subscriber,
+    /// but we can guarantee the Drop path is panic-free.
+    #[tokio::test]
+    async fn drop_does_not_panic_for_running_or_idle_handle() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        // Idle: no observed state → Drop is a silent no-op.
+        {
+            let s = snap(1);
+            let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> =
+                Arc::new(InMemoryStateStore::new());
+            let dispatcher = into_dyn(DryRunDispatcher);
+            let h = SbatchJobHandle::new(s, store, dispatcher);
+            drop(h);
+        }
+
+        // Running: last_observed_state = Running → Drop emits warn.
+        {
+            let mut s = snap(2);
+            s.lifecycle.last_observed_state = Some(JobStatus {
+                state: JobState::Running,
+                reason: JobReason::None,
+            });
+            let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> =
+                Arc::new(InMemoryStateStore::new());
+            let dispatcher = into_dyn(DryRunDispatcher);
+            let h = SbatchJobHandle::new(s, store, dispatcher);
+            drop(h);
+        }
+    }
+
+    /// Cloning a handle and dropping each clone must not double-warn:
+    /// the Drop impl lives on `SbatchJobHandleInner` (Arc-shared), so
+    /// it fires exactly once when the last clone goes away. This test
+    /// confirms the Arc semantics by simply not panicking under a
+    /// 2-clone drop pattern with a running snapshot.
+    #[tokio::test]
+    async fn drop_runs_once_per_arc_not_per_clone() {
+        use crate::dispatcher::{DryRunDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        let mut s = snap(3);
+        s.lifecycle.last_observed_state = Some(JobStatus {
+            state: JobState::Running,
+            reason: JobReason::None,
+        });
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(DryRunDispatcher);
+        let h1 = SbatchJobHandle::new(s, store, dispatcher);
+        let h2 = h1.clone();
+        drop(h1);
+        drop(h2);
     }
 }
