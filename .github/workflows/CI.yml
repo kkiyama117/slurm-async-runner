@@ -11,10 +11,6 @@ on:
       - main
     tags:
       - '*'
-  pull_request:
-    branches:
-      - main
-      - develop
   workflow_dispatch:
 
 permissions:
