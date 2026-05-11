@@ -3,13 +3,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
 use crate::dispatcher::{DynJobDispatcher, TokioDispatcher, into_dyn};
 use crate::sbatch::cmd::SbatchCmd;
-use crate::sbatch::error::SbatchSpawnError;
+use crate::sbatch::error::{SbatchAttachError, SbatchSpawnError};
 use crate::sbatch::handle::{
     LogPathSpec, SbatchAttachKey, SbatchJobHandle, SbatchJobSnapshot, SbatchLifecycle,
 };
@@ -95,26 +95,45 @@ impl SbatchManager {
         ))
     }
 
-    pub async fn attach(&self, key: SbatchAttachKey) -> Result<SbatchJobHandle> {
+    pub async fn attach(&self, key: SbatchAttachKey) -> Result<SbatchJobHandle, SbatchAttachError> {
+        let key_repr = format!("{key:?}");
         let snapshot = match key {
-            SbatchAttachKey::Uuid(u) => self.store.load(u).await?,
-            SbatchAttachKey::JobId(j) => self.store.find_by_jobid(j).await?,
+            SbatchAttachKey::Uuid(u) => self.store.load(u).await.map_err(SbatchAttachError::Io)?,
+            SbatchAttachKey::JobId(j) => {
+                let snaps = self
+                    .store
+                    .find_all_by_jobid(j)
+                    .await
+                    .map_err(SbatchAttachError::Io)?;
+                if snaps.len() > 1 {
+                    return Err(SbatchAttachError::MultipleMatch {
+                        jobid: j,
+                        count: snaps.len(),
+                    });
+                }
+                snaps.into_iter().next()
+            }
             SbatchAttachKey::File(path) => {
-                let bytes = tokio::fs::read(&path).await?;
-                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| SbatchAttachError::Io(anyhow::Error::from(e)))?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| SbatchAttachError::Io(anyhow::Error::from(e)))?;
                 if let Some(k) = value.get("kind").and_then(|v| v.as_str())
                     && k != <SbatchJobSnapshot as JobSnapshot>::kind()
                 {
-                    return Err(anyhow!(
-                        "snapshot file kind mismatch: expected '{}', got '{}'",
-                        <SbatchJobSnapshot as JobSnapshot>::kind(),
-                        k
-                    ));
+                    return Err(SbatchAttachError::KindMismatch {
+                        expected: <SbatchJobSnapshot as JobSnapshot>::kind(),
+                        got: k.to_string(),
+                    });
                 }
-                Some(serde_json::from_value(value)?)
+                Some(
+                    serde_json::from_value(value)
+                        .map_err(|e| SbatchAttachError::Io(anyhow::Error::from(e)))?,
+                )
             }
         }
-        .ok_or_else(|| anyhow!("snapshot not found"))?;
+        .ok_or_else(|| SbatchAttachError::NotFound { key: key_repr })?;
         Ok(SbatchJobHandle::new(
             snapshot,
             self.store.clone(),
@@ -122,13 +141,16 @@ impl SbatchManager {
         ))
     }
 
-    pub async fn attach_uuid(&self, u: Uuid) -> Result<SbatchJobHandle> {
+    pub async fn attach_uuid(&self, u: Uuid) -> Result<SbatchJobHandle, SbatchAttachError> {
         self.attach(SbatchAttachKey::Uuid(u)).await
     }
-    pub async fn attach_jobid(&self, j: u64) -> Result<SbatchJobHandle> {
+    pub async fn attach_jobid(&self, j: u64) -> Result<SbatchJobHandle, SbatchAttachError> {
         self.attach(SbatchAttachKey::JobId(j)).await
     }
-    pub async fn attach_file(&self, p: impl Into<PathBuf>) -> Result<SbatchJobHandle> {
+    pub async fn attach_file(
+        &self,
+        p: impl Into<PathBuf>,
+    ) -> Result<SbatchJobHandle, SbatchAttachError> {
         self.attach(SbatchAttachKey::File(p.into())).await
     }
 }
@@ -234,7 +256,6 @@ mod tests {
     async fn attach_file_rejects_wrong_kind_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("wrong.json");
-        // A snapshot with a different kind field — kind check fires before schema decode.
         std::fs::write(&path, r#"{"kind":"tssrun"}"#).unwrap();
 
         let cmd = SbatchCmd::new("/w/job.sh");
@@ -242,10 +263,11 @@ mod tests {
         let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
         match mgr.attach_file(&path).await {
             Ok(_) => panic!("attach_file should fail on wrong kind"),
-            Err(e) => assert!(
-                e.to_string().contains("kind mismatch"),
-                "expected 'kind mismatch' in error, got: {e}"
-            ),
+            Err(SbatchAttachError::KindMismatch { expected, got }) => {
+                assert_eq!(expected, "sbatch");
+                assert_eq!(got, "tssrun");
+            }
+            Err(other) => panic!("expected KindMismatch, got {other:?}"),
         }
     }
 
