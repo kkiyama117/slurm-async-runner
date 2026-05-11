@@ -145,6 +145,33 @@ uv run ruff format --check python/
 CI が `-D warnings` で clippy を回しているので、警告 1 つでも残ると
 落ちます。
 
+### 3.6 Pre-commit Hooks (local autofix)
+
+[`.pre-commit-config.yaml`](../.pre-commit-config.yaml) は `ruff check --fix` /
+`ruff format` / `cargo clippy --fix` / `rustfmt` (edition 2024, see
+[`rustfmt.toml`](../rustfmt.toml)) を commit 前に走らせ、CI と同じチェックを
+ローカルで autofix 付きで実行します。
+
+クローン直後のワンタイム設定:
+
+```bash
+uv tool install pre-commit          # または: pipx install pre-commit
+pre-commit install                  # .git/hooks/pre-commit を登録
+```
+
+リポジトリ全体に手動で sweep:
+
+```bash
+pre-commit run --all-files
+```
+
+hook がファイルを書き換えた場合は commit が中断されるので、差分を確認した上
+で `git add -u && git commit` で再投入してください。フレッシュなクローンでは
+`cargo clippy` がワークスペース全体をコンパイルするため最初の commit が遅く
+なりますが、以降は cargo キャッシュに乗ります。緊急時は
+`git commit --no-verify` で hook をバイパスできますが、CI で同じチェックが
+走るので push 前には必ず修正してください。
+
 ## 4. `.pyi` 型スタブの再生成
 
 スタブは 2 系統あります。

@@ -169,6 +169,83 @@ sbatch サブシステム（§3.5）は **子プロセスを持たない**ため
   から in-tree 移管）に委譲し、未知トークンは `Unknown` / `Other(String)`
   に落とす forward-compat 設計。
 
+#### 3.3.1 低レベル `SlurmManager` の使用例（reference）
+
+`SlurmManager` は `srun` を直接呼ぶ最小 primitive で、1 ショット
+`run_job` / `query_job_state` だけが必要な呼び出し側向けです。
+ライブラリの主用途は §3.4 tssrun と §3.5 sbatch ですが、テストハーネスや
+カスタムバックエンドのプロトタイプではこの層を直接叩く方が見通しが良く
+なることがあります。
+
+```rust
+use slurm_async_runner::{
+    SlurmCmd, SlurmManager,
+    JobDispatcher, TokioDispatcher, DryRunDispatcher,
+    JobStatus, JobState, JobReason,
+    query_job_states_batch, query_job_states_batch_with,
+};
+use std::path::Path;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let manager = SlurmManager::default(); // launcher = "srun"
+
+    // バッチスクリプトを ディスパッチ。
+    let exit_code = manager.run_job(Path::new("./job.sh"), false).await?;
+
+    // ライフサイクル状態を問合せ（squeue → sacct fallback）。
+    let status: JobStatus = manager.query_job_state(12345).await?;
+    println!("state={:?} reason={:?}", status.state, status.reason);
+
+    // 一括問合せ。
+    let states = manager.query_job_states_batch(&[12345, 12346]).await?;
+
+    // カスタムディスパッチャ（テスト・リモートバックエンドなど）の差し込み。
+    let dry = DryRunDispatcher;
+    manager.run_job_with(&dry, Path::new("./job.sh")).await?;
+    Ok(())
+}
+```
+
+Python 側は `slurm_async_runner._slurm_async_runner_core.manager` /
+`.runner` サブモジュールに対応する `SlurmCmd` / `SlurmManager` /
+`query_job_states_batch` が export されています:
+
+```python
+import asyncio
+from slurm_async_runner._slurm_async_runner_core.manager import SlurmCmd, SlurmManager
+from slurm_async_runner._slurm_async_runner_core.runner import query_job_states_batch
+from slurm_async_runner._slurm_async_runner_core.entities.slurm.status import JobStatus
+
+async def main():
+    manager = SlurmManager()                      # launcher = "srun"
+    # または override:
+    manager = SlurmManager(SlurmCmd(srun_cmd="srun"))
+
+    code: int = await manager.run_job("./job.sh", dry_run=False)
+    status: JobStatus = await manager.query_job_state(12345)
+    states: dict[int, JobStatus] = await manager.query_job_states_batch([12345, 12346])
+
+    # モジュール関数 helper:
+    states = await query_job_states_batch([12345, 12346])
+
+asyncio.run(main())
+```
+
+`JobStatus` は `(state, reason)` を保持し、SLURM の `squeue` 出力
+（`-o "%i %T %r"`）からパースされ、完了済みジョブは `sacct` fallback に
+回ります。state / reason 語彙（24 official states、~80 reason codes、
+`Unknown` / `Other(String)` forward-compat fallback 付き）は
+`entities::slurm` に in-tree で保持されており、Python 側は
+`slurm_async_runner._slurm_async_runner_core.entities.slurm.*` から
+re-export されています（PR #5 で `gaussian_job_shared` から移管 — §6
+不変条件「Pyclass Single Owner」と整合）。
+
+シェル経由でラップしない（`$SHELL -c "..."` を使わない）のは Python の
+`asyncio.create_subprocess_exec` と Rust の
+`tokio::process::Command::args` がどちらも argv 配列を直接受け付けるため、
+シェル層が不要だからです。
+
 ### 3.4 tssrun サブシステム（`src/tssrun/`）
 
 ECCS の `tssrun`（= `salloc` + `srun` 対話バッチフロントエンド）を

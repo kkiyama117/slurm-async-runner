@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-05-12
+
 ### KUDPC live correctness fixes — watch updates, qgroup `FINI`/`FAIL`, sacct gating
 
 - **Fix: `watch::Sender::send` → `send_replace` (6 call sites)**. Both
@@ -409,4 +411,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   substitutes the coreutils `true` / `false` / `echo` binaries through
   `SlurmCmd::new(...)`, plus a `MockDispatcher` for argv-plumbing assertions.
 
-[Unreleased]: https://github.com/kkiyama117/slurm-async-runner2/compare/HEAD
+[Unreleased]: https://github.com/kkiyama117/slurm-async-runner2/compare/v1.0.0...HEAD
+[v1.0.0]: https://github.com/kkiyama117/slurm-async-runner2/releases/tag/v1.0.0
