@@ -376,10 +376,17 @@ impl SbatchJobHandle {
         Ok(snap)
     }
 
-    /// Heavyweight finalizer. Calls `refresh()` first; only invokes
-    /// sacct if the job has actually left both `qgroup -l` and `squeue`
-    /// **and** `lifecycle.finished` is still None. Otherwise behaves
-    /// identically to `refresh()`.
+    /// Heavyweight finalizer. Calls `refresh()` first; invokes sacct if
+    /// the job has reached a terminal state (observed via `qgroup -l` /
+    /// `squeue`) **or** has left both active listings, **and**
+    /// `lifecycle.finished` is still None. Otherwise behaves identically
+    /// to `refresh()`.
+    ///
+    /// The terminal-state-from-qgroup branch is required because KUDPC's
+    /// `qgroup -l` reports `FINI` (mapped to `JobState::Completed`) for
+    /// freshly-finished jobs while they are still in the listing — i.e.
+    /// `left_active_listing` is still `false` but the job is provably
+    /// done and sacct is the authoritative source for `exit_code`.
     ///
     /// For array-task handles (`array_task_id.is_some()`), the sacct
     /// call queries `sacct -j <master>_<idx>` so the captured
@@ -391,7 +398,12 @@ impl SbatchJobHandle {
         if snap.lifecycle.finished.is_some() {
             return Ok(snap);
         }
-        if !snap.lifecycle.left_active_listing {
+        let observed_terminal = snap
+            .lifecycle
+            .last_observed_state
+            .as_ref()
+            .is_some_and(|s| s.state.is_terminal());
+        if !snap.lifecycle.left_active_listing && !observed_terminal {
             return Ok(snap);
         }
 
@@ -726,6 +738,46 @@ mod tests {
         let after = h.refresh_with_sacct().await.unwrap();
         assert!(after.lifecycle.finished.is_none());
         assert_eq!(canned.sacct_calls(), 0);
+    }
+
+    /// Regression: when qgroup -l reports a *terminal* state (FINI / CMP
+    /// → `Completed`), `refresh_with_sacct` must still call sacct to
+    /// resolve `exit_code`. Previously it short-circuited on
+    /// `!left_active_listing`, leaving `lifecycle.finished == None` and
+    /// `is_finished() == false` even after the post-`wait_terminal` call.
+    /// Live KUDPC reproducer: a 5-second job whose qgroup row reads
+    /// `FINI` while still in the listing.
+    #[tokio::test]
+    async fn refresh_with_sacct_calls_sacct_when_qgroup_reports_terminal_fini() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            // KUDPC pipe layout, terminal token FINI — job still listed
+            // (so left_active_listing stays false through refresh()).
+            " gr u 12345 | FINI 2026-05-12 01:48 | 1 | 1 1 1M 00:00:05\n",
+            "",
+            "12345|COMPLETED|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh_with_sacct().await.unwrap();
+        assert!(
+            !after.lifecycle.left_active_listing,
+            "qgroup still listed the job; left_active_listing must stay false",
+        );
+        assert_eq!(
+            canned.sacct_calls(),
+            1,
+            "terminal qgroup state must still trigger sacct for exit_code resolution",
+        );
+        let finished = after
+            .lifecycle
+            .finished
+            .expect("FinishedInfo must be populated after sacct");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
     }
 
     #[tokio::test]
