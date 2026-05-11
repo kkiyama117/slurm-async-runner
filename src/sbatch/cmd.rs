@@ -8,11 +8,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::Result;
-
 use crate::entities::slurm::{
     JobPartition, JobTimeLimit, MailAddress, MailTypeInput, ResourceSpec, SlurmDependency,
 };
+use crate::sbatch::error::SbatchSpawnError;
 use crate::util::path::absolutize;
 
 #[derive(Debug, Clone)]
@@ -76,7 +75,7 @@ impl SbatchCmd {
         }
     }
 
-    pub fn build_argv(&self) -> Result<Vec<String>> {
+    pub fn build_argv(&self) -> Result<Vec<String>, SbatchSpawnError> {
         let mut argv = Vec::with_capacity(16 + self.args.len());
         argv.push(self.sbatch_bin.clone());
 
@@ -112,7 +111,7 @@ impl SbatchCmd {
             argv.push(absolutize(c)?);
         }
         if !self.env.is_empty() {
-            argv.push(format!("--export={}", render_export(&self.env)));
+            argv.push(format!("--export={}", render_export(&self.env)?));
         }
         if let Some(dep) = &self.dependency {
             argv.push("-d".to_string());
@@ -141,17 +140,31 @@ impl SbatchCmd {
 
 /// Render `--export=ALL,K1=V1,K2=V2,...` with deterministic key order
 /// so argv is reproducible.
-fn render_export(env: &HashMap<String, String>) -> String {
+///
+/// Both keys and values are rejected if they contain `,` or `=`, since
+/// those characters are SLURM's in-band separators on the `--export`
+/// payload and any inline occurrence would silently corrupt the argv.
+fn render_export(env: &HashMap<String, String>) -> Result<String, SbatchSpawnError> {
     let mut keys: Vec<&String> = env.keys().collect();
     keys.sort();
     let mut out = String::from("ALL");
     for k in keys {
+        let v = &env[k];
+        if k.contains(',') || k.contains('=') {
+            return Err(SbatchSpawnError::InvalidExportKey { key: k.clone() });
+        }
+        if v.contains(',') || v.contains('=') {
+            return Err(SbatchSpawnError::InvalidExportValue {
+                key: k.clone(),
+                value: v.clone(),
+            });
+        }
         out.push(',');
         out.push_str(k);
         out.push('=');
-        out.push_str(&env[k]);
+        out.push_str(v);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -376,6 +389,75 @@ mod tests {
         assert!(
             user_idx < type_idx,
             "expected --mail-user before --mail-type, got argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn export_key_with_comma_is_rejected() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.env.insert("BAD,KEY".to_string(), "ok".to_string());
+        let err = cmd.build_argv().unwrap_err();
+        match err {
+            crate::sbatch::error::SbatchSpawnError::InvalidExportKey { key } => {
+                assert_eq!(key, "BAD,KEY");
+            }
+            other => panic!("expected InvalidExportKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_key_with_equals_is_rejected() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.env.insert("BAD=KEY".to_string(), "ok".to_string());
+        let err = cmd.build_argv().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::sbatch::error::SbatchSpawnError::InvalidExportKey { .. }
+            ),
+            "expected InvalidExportKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_value_with_comma_is_rejected() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.env.insert("FOO".to_string(), "1,2".to_string());
+        let err = cmd.build_argv().unwrap_err();
+        match err {
+            crate::sbatch::error::SbatchSpawnError::InvalidExportValue { key, value } => {
+                assert_eq!(key, "FOO");
+                assert_eq!(value, "1,2");
+            }
+            other => panic!("expected InvalidExportValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_value_with_equals_is_rejected() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.env.insert("FOO".to_string(), "a=b".to_string());
+        let err = cmd.build_argv().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::sbatch::error::SbatchSpawnError::InvalidExportValue { .. }
+            ),
+            "expected InvalidExportValue, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_valid_pairs_pass_through_unchanged() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.env.insert("FOO".to_string(), "bar".to_string());
+        cmd.env
+            .insert("OMP_NUM_THREADS".to_string(), "8".to_string());
+        let argv = cmd.build_argv().expect("valid pairs accepted");
+        assert!(
+            argv.iter()
+                .any(|a| a == "--export=ALL,FOO=bar,OMP_NUM_THREADS=8"),
+            "expected canonical --export form, got argv={argv:?}"
         );
     }
 }

@@ -132,3 +132,11 @@ def test_sbatch_cmd_kwargs_listed_in_runtime_signature():
         mail_types=None,
     )
     assert cmd is not None
+
+
+def test_sbatch_cmd_build_argv_rejects_comma_in_value(tmp_path):
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho hi\n")
+    cmd = SbatchCmd(str(job), env={"FOO": "a,b"})
+    with pytest.raises(RuntimeError, match="FOO"):
+        cmd.build_argv()
