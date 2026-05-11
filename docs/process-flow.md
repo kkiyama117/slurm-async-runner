@@ -173,11 +173,11 @@ code = await handle.wait()                 # <- 子の終了を待つ
        |     in-memory snapshot / on-disk filename / store entry が
        |     全部この uuid を共有（second source of truth を作らない）
        |
-       |-- init = JobHandleSnapshot { uuid, pid, argv, sent_env,
+       |-- init = TssrunJobSnapshot { uuid, pid, argv, sent_env,    // Phase 3 P1 rename
        |          cwd, started_at_unix, log_locations: None,
        |          jobid: None, node: None, finished: None }
        |
-       `-- JobHandle::from_spawn(spawned, init, log_sink, Some(store))
+       `-- TssrunJobHandle::from_spawn(spawned, init, log_sink, Some(store))
               |
               |-- watch::channel(init) -> (tx, rx)
               |
@@ -210,7 +210,7 @@ code = await handle.wait()                 # <- 子の終了を待つ
    PyTssrunJobHandle::pid (getter)
        |
        `-- self.rx.borrow().pid   <- snapshot からロックフリーで読む
-                                     Mutex<JobHandle> には触らない
+                                     Mutex<TssrunJobHandle> には触らない
 
 [3] Python が `await handle.wait()` する
        |
@@ -219,7 +219,7 @@ code = await handle.wait()                 # <- 子の終了を待つ
        |
        `-- self.inner.lock().await.wait().await
               |
-              `-- JobHandle::wait
+              `-- TssrunJobHandle::wait
                     - tee_stdout_handle.take().await  (drain)
                     - tee_stderr_handle.take().await
                     - wait_handle.take().await        <- Option<i32>
@@ -232,7 +232,7 @@ code = await handle.wait()                 # <- 子の終了を待つ
 ### 並行性のキーポイント
 
 - **スナップショット getter は `watch::Receiver` から読む**ので
-  `wait()` の `Mutex<JobHandle>` を取らない。Python 側で
+  `wait()` の `Mutex<TssrunJobHandle>` を取らない。Python 側で
   `is_running` をループしながら `wait()` を進めても両者は競合しない。
 - **`wait()` は唯一の `&mut self` メソッド**で、内部の
   `Option<JoinHandle>` を `.take()` する。1 回しか呼べない設計を
@@ -269,7 +269,7 @@ print(await attached.jobid, await attached.node)
 [A プロセス: spawn]                 [ファイルシステム / store]      [B プロセス: attach]
 TssrunManager.with_state_dir(d)         |
         .spawn()                        |
-   v JobHandle::from_spawn               |
+   v TssrunJobHandle::from_spawn         |
    v store.save(&snap).await             |
                                          |
                             <state_dir>/<uuid>.json
@@ -292,7 +292,7 @@ TssrunManager.with_state_dir(d)         |
                                          |     File(p)  => tokio::fs::read(p) +
                                          |                 serde_json::from_slice,
                                          |   }
-                                         |   -> JobHandle::attach_snapshot(
+                                         |   -> TssrunJobHandle::attach_snapshot(
                                          |        snap, Some(store))
                                          |       wait_handle = None
                                          |       tee_handles = None
@@ -316,9 +316,10 @@ TssrunManager.with_state_dir(d)         |
 - `AttachKey::File(path)` — JSON パスを直接指定。store を経由しないので
   デバッグ・リカバリ用。
 
-### `JobHandleSnapshot` の永続フォーマット
+### `TssrunJobSnapshot` の永続フォーマット
 
-JSON ファイルのスキーマは `src/tssrun/handle.rs::JobHandleSnapshot` の
+JSON ファイルのスキーマは `src/tssrun/handle.rs::TssrunJobSnapshot` の
+（Phase 3 P1 で `JobHandleSnapshot` から rename。`kind = "tssrun"` 文字列は不変）
 `Serialize` 派生に従います。ファイル名は `{uuid}.json` で、`uuid` は
 スナップショット内のフィールドと完全一致します（合成例）:
 
@@ -387,7 +388,7 @@ read_live_env_for_pid(pid)
 | 1ms | Rust | `TssrunCmd.build_argv` → `["tssrun", "-p", ..., "/work/job.sh"]` |
 | 2ms | Rust | `TokioBackgroundDispatcher.spawn` → 子 pid=12345 取得 |
 | 2ms | Rust | `Uuid::now_v7()` → `01900000-0000-7000-8000-000000000000` 生成 |
-| 3ms | Rust | `JobHandle::from_spawn` で watch チャンネルと 3 タスク起動 |
+| 3ms | Rust | `TssrunJobHandle::from_spawn` で watch チャンネルと 3 タスク起動 |
 | 3ms | Store | `store.save(&init)` で初期スナップショット永続化（FS なら `<state_dir>/01900000-….json`、jobid/node/finished は None） |
 | 4ms | Python | `spawn()` が `PyTssrunJobHandle` を返す |
 | 5ms | Python | `await handle.pid` → 12345（rx.borrow から即返） |
