@@ -534,24 +534,6 @@ impl crate::handle::JobHandleCommon for TssrunJobHandle {
     }
 }
 
-/// Deprecated alias for [`TssrunJobSnapshot`]. Phase 3 P1 renamed the
-/// canonical struct to be naming-symmetric with [`crate::SbatchJobSnapshot`].
-/// Remove in the next major.
-#[deprecated(
-    since = "0.1.0",
-    note = "use TssrunJobSnapshot — Phase 3 P1 rename for naming symmetry with SbatchJobSnapshot"
-)]
-pub type JobHandleSnapshot = TssrunJobSnapshot;
-
-/// Deprecated alias for [`TssrunJobHandle`]. Phase 3 P1 renamed the
-/// canonical struct to be naming-symmetric with [`crate::SbatchJobHandle`].
-/// Remove in the next major.
-#[deprecated(
-    since = "0.1.0",
-    note = "use TssrunJobHandle — Phase 3 P1 rename for naming symmetry with SbatchJobHandle"
-)]
-pub type JobHandle = TssrunJobHandle;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,24 +765,6 @@ echo done"#
         assert!(!s.is_running());
         assert!(s.is_finished());
         assert_eq!(s.exit_code(), None);
-    }
-
-    #[test]
-    fn tssrun_job_snapshot_alias_for_jobhandlesnapshot_resolves() {
-        // Deprecated alias must continue to compile after the Phase 3 P1 rename.
-        let snap = snap_running();
-        #[allow(deprecated)]
-        let _: super::JobHandleSnapshot = snap.clone();
-    }
-
-    #[test]
-    fn tssrun_job_handle_alias_for_jobhandle_resolves() {
-        // Type-level assertion that both the new name and the deprecated
-        // alias refer to the same Send + Sync type.
-        fn _assert_send_sync<T: Send + Sync>() {}
-        _assert_send_sync::<TssrunJobHandle>();
-        #[allow(deprecated)]
-        _assert_send_sync::<super::JobHandle>();
     }
 
     #[tokio::test]

@@ -47,9 +47,6 @@ pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
 };
 pub use tssrun::handle::{FinishedInfo, LogLocations, TssrunJobHandle, TssrunJobSnapshot};
-// Deprecated re-exports (Phase 3 P1 rename); remove next major.
-#[allow(deprecated)]
-pub use tssrun::handle::{JobHandle, JobHandleSnapshot};
 pub use tssrun::log::{
     FileLogSink, InMemoryLogSink, JobLogSink, LogStream, NullLogSink, StdLogSink,
 };
