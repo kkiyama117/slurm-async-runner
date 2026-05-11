@@ -9,8 +9,9 @@ on:
   push:
     branches:
       - main
-    tags:
-      - '*'
+      - develop
+    pull_request:
+      - develop
   workflow_dispatch:
 
 permissions:
