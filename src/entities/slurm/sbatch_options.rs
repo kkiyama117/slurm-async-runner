@@ -56,6 +56,18 @@ pub use dependency::{
 // https://slurm.schedmd.com/sbatch.html
 pub use resource_spec::{Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU};
 
+// `SlurmSignalSpec` and `SignalIdent` live in their own file
+// (see [`crate::entities::slurm::sbatch_options::signal`]) so the
+// `--signal` BNF parsing and serde plumbing can be reasoned about in
+// isolation. Re-exported here so existing references such as
+// `crate::entities::slurm::SlurmSignalSpec` keep working.
+//
+//   #SBATCH --signal=USR1@60
+//   #SBATCH --signal=R:SIGTERM@30
+//
+// https://slurm.schedmd.com/sbatch.html (`--signal`)
+pub use signal::{SignalIdent, SlurmSignalSpec};
+
 // `JobTimeLimit` lives in its own file (see [`crate::entities::slurm::time_limit`])
 // so the Slurm `--time` parsing and serde plumbing can be reasoned about in
 // isolation. Re-exported here so existing references such as
@@ -269,5 +281,16 @@ mod tests {
         let rendered = original.to_string();
         let parsed = MailTypeInput::try_from(rendered).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn signal_types_reachable_from_entities_slurm() {
+        use crate::entities::slurm::{SignalIdent, SlurmSignalSpec};
+        let s = SlurmSignalSpec {
+            allow_resignal: false,
+            signal: SignalIdent::Number(15),
+            seconds_before_end: None,
+        };
+        assert_eq!(s.to_string(), "15");
     }
 }
