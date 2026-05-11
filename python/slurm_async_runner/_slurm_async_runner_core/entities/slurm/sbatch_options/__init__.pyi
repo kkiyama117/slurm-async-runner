@@ -24,6 +24,7 @@ __all__ = [
     "SlurmArraySpec",
     "SlurmDependency",
     "SlurmJobConfig",
+    "SlurmSignalSpec",
 ]
 
 @typing.final
@@ -378,6 +379,24 @@ class SlurmJobConfig:
         mail_types: typing.Optional[MailTypeInput] = None,
         resource_spec: typing.Optional[ResourceSpec] = None,
     ) -> SlurmJobConfig: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class SlurmSignalSpec:
+    @property
+    def allow_resignal(self) -> builtins.bool: ...
+    @property
+    def signal(self) -> builtins.str: ...
+    @property
+    def seconds_before_end(self) -> typing.Optional[builtins.int]: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(cls, s: builtins.str) -> SlurmSignalSpec:
+        r"""
+        Parse a Slurm `--signal` spec string, e.g. `"USR1@60"` or `"R:SIGTERM@30"`.
+        """
+    @staticmethod
+    def parse(s: builtins.str) -> SlurmSignalSpec: ...
+    def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
