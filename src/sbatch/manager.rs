@@ -31,7 +31,7 @@ impl SbatchManager {
             cmd,
             store: Arc::new(InMemoryStateStore::<SbatchJobSnapshot>::new()),
             dispatcher: into_dyn(TokioDispatcher),
-            poll_interval: std::time::Duration::from_secs(30),
+            poll_interval: std::time::Duration::from_secs(60),
             scancel_bin: "scancel".to_string(),
         }
     }
@@ -55,8 +55,10 @@ impl SbatchManager {
     }
 
     /// Override the polling cadence used by `run()` between `wait_terminal`
-    /// iterations. Default is 30 s, chosen to keep KUDPC squeue load low.
-    /// Tests typically use 1–10 ms.
+    /// iterations. Default is **60 s** — chosen to stay strictly longer than
+    /// SLURM's default 30 s task sampling interval (so two consecutive polls
+    /// cannot land inside a single sampling window) and to keep KUDPC
+    /// squeue load low. Tests typically use 1–10 ms.
     #[must_use = "with_poll_interval returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
