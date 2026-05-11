@@ -1,4 +1,4 @@
-//! `JobHandleSnapshot` participation in the generic [`JobStateStore`] layer.
+//! `TssrunJobSnapshot` participation in the generic [`JobStateStore`] layer.
 //!
 //! See `docs/superpowers/specs/2026-05-10-sbatch-module-design.md` §5
 //! for why this module shrunk from a full trait + two impls to just the
@@ -7,9 +7,9 @@
 use uuid::Uuid;
 
 use crate::store::JobSnapshot;
-use crate::tssrun::handle::JobHandleSnapshot;
+use crate::tssrun::handle::TssrunJobSnapshot;
 
-impl JobSnapshot for JobHandleSnapshot {
+impl JobSnapshot for TssrunJobSnapshot {
     fn uuid(&self) -> Uuid {
         self.uuid
     }
@@ -22,17 +22,17 @@ impl JobSnapshot for JobHandleSnapshot {
 }
 
 // Back-compat aliases.
-pub type JobStateStore = dyn crate::store::JobStateStore<JobHandleSnapshot>;
-pub type InMemoryStateStore = crate::store::InMemoryStateStore<JobHandleSnapshot>;
-pub type FileSystemStateStore = crate::store::FileSystemStateStore<JobHandleSnapshot>;
+pub type JobStateStore = dyn crate::store::JobStateStore<TssrunJobSnapshot>;
+pub type InMemoryStateStore = crate::store::InMemoryStateStore<TssrunJobSnapshot>;
+pub type FileSystemStateStore = crate::store::FileSystemStateStore<TssrunJobSnapshot>;
 
 /// Tssrun-specific helper: scan the store for the first snapshot whose
 /// `pid` equals `pid`. Built on `list()` because `pid` is not a generic
 /// `JobSnapshot` concept.
 pub async fn find_by_pid(
-    store: &dyn crate::store::JobStateStore<JobHandleSnapshot>,
+    store: &dyn crate::store::JobStateStore<TssrunJobSnapshot>,
     pid: u32,
-) -> anyhow::Result<Option<JobHandleSnapshot>> {
+) -> anyhow::Result<Option<TssrunJobSnapshot>> {
     Ok(store.list().await?.into_iter().find(|s| s.pid == pid))
 }
 
@@ -42,8 +42,8 @@ mod tests {
     use crate::store::JobStateStore as _;
     use crate::tssrun::handle::LogLocations;
 
-    fn snap(uuid: Uuid, pid: u32, jobid: Option<u64>) -> JobHandleSnapshot {
-        JobHandleSnapshot {
+    fn snap(uuid: Uuid, pid: u32, jobid: Option<u64>) -> TssrunJobSnapshot {
+        TssrunJobSnapshot {
             uuid,
             pid,
             argv: vec![],
