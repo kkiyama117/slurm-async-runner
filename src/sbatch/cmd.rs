@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::entities::slurm::{
     JobPartition, JobTimeLimit, MailAddress, MailTypeInput, ResourceSpec, SlurmDependency,
+    SlurmSignalSpec,
 };
 use crate::sbatch::error::SbatchSpawnError;
 use crate::util::path::absolutize;
@@ -41,6 +42,11 @@ pub struct SbatchCmd {
     /// in the canonical comma-separated Slurm form (e.g. `"BEGIN,END"`).
     pub mail_types: Option<MailTypeInput>,
 
+    /// `--signal` spec. When `Some`, emitted as `["--signal", spec.to_string()]`
+    /// (e.g. `["--signal", "USR1@60"]` or `["--signal", "R:SIGTERM@30"]`).
+    /// See [`SlurmSignalSpec`] for the BNF and parsing rules.
+    pub signal: Option<SlurmSignalSpec>,
+
     pub env: HashMap<String, String>,
 
     /// `--no-requeue` flag. When `true`, the job is not requeued on node failure.
@@ -67,6 +73,7 @@ impl SbatchCmd {
             dependency: None,
             mail_user: None,
             mail_types: None,
+            signal: None,
             env: HashMap::new(),
             no_requeue: false,
             comment: None,
@@ -124,6 +131,10 @@ impl SbatchCmd {
         if let Some(mts) = &self.mail_types {
             argv.push("--mail-type".to_string());
             argv.push(mts.to_string());
+        }
+        if let Some(sig) = &self.signal {
+            argv.push("--signal".to_string());
+            argv.push(sig.to_string());
         }
         if self.no_requeue {
             argv.push("--no-requeue".to_string());
@@ -389,6 +400,65 @@ mod tests {
         assert!(
             user_idx < type_idx,
             "expected --mail-user before --mail-type, got argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn signal_name_only_emits_double_dash_signal() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.signal = Some("USR1".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--signal")
+            .expect("--signal present");
+        assert_eq!(argv[i + 1], "USR1");
+    }
+
+    #[test]
+    fn signal_with_seconds_renders_at_form() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.signal = Some("USR1@60".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--signal")
+            .expect("--signal present");
+        assert_eq!(argv[i + 1], "USR1@60");
+    }
+
+    #[test]
+    fn signal_r_prefix_round_trips_through_argv() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.signal = Some("R:SIGTERM@30".parse().unwrap());
+        let argv = cmd.build_argv().unwrap();
+        let i = argv
+            .iter()
+            .position(|a| a == "--signal")
+            .expect("--signal present");
+        assert_eq!(argv[i + 1], "R:SIGTERM@30");
+    }
+
+    #[test]
+    fn signal_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a == "--signal"));
+    }
+
+    #[test]
+    fn signal_emits_after_mail_type_and_before_no_requeue() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.mail_types = Some("ALL".to_string().try_into().unwrap());
+        cmd.signal = Some("USR1@10".parse().unwrap());
+        cmd.no_requeue = true;
+        let argv = cmd.build_argv().unwrap();
+        let mail_idx = argv.iter().position(|a| a == "--mail-type").unwrap();
+        let signal_idx = argv.iter().position(|a| a == "--signal").unwrap();
+        let nr_idx = argv.iter().position(|a| a == "--no-requeue").unwrap();
+        assert!(
+            mail_idx < signal_idx && signal_idx < nr_idx,
+            "expected mail < signal < no-requeue, got argv={argv:?}"
         );
     }
 
