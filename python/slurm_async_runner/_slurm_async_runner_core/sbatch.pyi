@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
         MailTypeInput,
         SlurmDependency,
+        SlurmSignalSpec,
     )
 
 __all__ = [
@@ -44,6 +45,7 @@ class SbatchCmd:
         dependency: "SlurmDependency | None" = None,
         mail_user: builtins.str | None = None,
         mail_types: "MailTypeInput | None" = None,
+        signal: "SlurmSignalSpec | None" = None,
     ) -> None: ...
 
 @final
