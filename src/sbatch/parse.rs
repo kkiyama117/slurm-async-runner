@@ -93,7 +93,6 @@ pub(crate) fn parse_sacct_exit_code(field: &str) -> Option<i32> {
 /// `max_concurrent` (the `%N` suffix) is deliberately ignored — it
 /// constrains runtime concurrency at SLURM, not the set of tasks
 /// submitted. Indices are returned in declaration order (`Vec` order).
-#[allow(dead_code)]
 pub(crate) fn expand_array_indices(spec: &crate::entities::slurm::SlurmArraySpec) -> Vec<u32> {
     use crate::entities::slurm::ArrayIndex;
     let mut out = Vec::new();
