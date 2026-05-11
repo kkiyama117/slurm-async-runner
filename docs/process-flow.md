@@ -346,7 +346,158 @@ JSON ファイルのスキーマは `src/tssrun/handle.rs::TssrunJobSnapshot` �
 - `log_locations` の variant は `"None"` / `{ "Files": {...} }` の 2 つ
   （将来 SQLite 等に拡張する想定）。
 
-## 5. live_env — `/proc/<pid>/environ` の best-effort 読み出し
+## 5. sbatch `wait_terminal` → `refresh_with_sacct` — KUDPC ジョブの finalize 経路
+
+### Python 側のコード例
+
+```python
+from slurm_async_runner._slurm_async_runner_core.sbatch import (
+    SbatchCmd, SbatchManager,
+)
+
+cmd = SbatchCmd("/work/job.sh", partition="gr19999a", time_limit="0:01:00")
+mgr = SbatchManager(cmd, state_dir="/var/lib/slurm-runner")
+handle = await mgr.spawn()                  # sbatch 投入、UUID 払い出し
+await handle.wait_terminal(poll_interval_secs=10.0)  # qgroup を polling
+await handle.refresh_with_sacct()           # 終端 exit_code を確定
+assert handle.is_finished()
+print(handle.exit_code())                    # int | None
+```
+
+### 処理フロー (success case: KUDPC で `exit 0`)
+
+```
+[1] SbatchManager.spawn()
+       |
+       v
+   sbatch <script> 投入 -> stdout から jobid を抽出
+       |
+       |-- Uuid::now_v7()
+       |-- SbatchJobSnapshot { uuid, jobid, lifecycle: default(), ... }
+       |     lifecycle = { last_observed_state: None,
+       |                   left_active_listing: false,
+       |                   finished: None }
+       |-- store.save(&snap)
+       `-- snapshot_tx.send_replace(snap)   <-- watch 更新は send_replace
+                                                (send だと receiver 0 で silent fail)
+
+[2] handle.wait_terminal(poll_interval=10s)
+       |
+       loop:
+       |   refresh() — sacct は呼ばない
+       |     |-- qgroup -l                       <- KUDPC は | 区切りレイアウト
+       |     |     parse_qgroup_l(out)
+       |     |       - "|" トークンを skip
+       |     |       - jobid==0 (per-queue/per-user summary 行) を除外
+       |     |       - STAT 列を JobState::parse
+       |     |           "RUN"  -> Running   (active)
+       |     |           "QUE"  -> Pending   (active)
+       |     |           "FINI" -> Completed (terminal, input-only alias)
+       |     |           "FAIL" -> Failed    (terminal, input-only alias)
+       |     |
+       |     |-- qgroup ヒット時:
+       |     |     snap.lifecycle.last_observed_state = Some(JobStatus)
+       |     |     snapshot_tx.send_replace(snap)
+       |     |
+       |     |-- qgroup miss → squeue -j <jobid> でフォールバック
+       |     |     ヒット時は同様に last_observed_state を更新
+       |     |
+       |     `-- どちらも miss → snap.lifecycle.left_active_listing = true
+       |             snapshot_tx.send_replace(snap)
+       |
+       |-- ループ脱出条件:
+       |     (a) last_observed_state.is_some() && state.is_terminal()
+       |          → FINI で Completed、FAIL で Failed を観測した瞬間
+       |     (b) snap.lifecycle.left_active_listing == true
+       |          → qgroup / squeue 両方から消えたとき (KUDPC では FINI/FAIL を
+       |             観測してから消えるまで数十秒のラグがある)
+       |
+       v
+   return Ok(snap)
+
+[3] handle.refresh_with_sacct()
+       |
+       |-- self.refresh().await?               <- もう一度 qgroup / squeue を polling
+       |
+       |-- snap.lifecycle.finished.is_some()
+       |     => return Ok(snap)                <- idempotency 短絡
+       |
+       |-- gating: observed_terminal || left_active_listing
+       |     - observed_terminal = last_observed_state.is_terminal() (PR #14 追加)
+       |     - どちらも false なら return Ok(snap) (sacct は重いので skip)
+       |     - KUDPC で FINI/FAIL を観測したばかり (まだ qgroup に居る) ケースは
+       |       observed_terminal=true で sacct を起動できる
+       |
+       |-- query_job_states_with_exit_code_with(view, [jobid])
+       |     |-- squeue -j <jobid> -o "%i %T %r"
+       |     |     ヒットしたら active map に入れて sacct を呼ばない (exit_code=None)
+       |     |     ミスしたら missing に追加
+       |     `-- missing が非空なら sacct -P -n -j <missing> -o JobID,State,Reason,ExitCode
+       |           parse_sacct_with_exit_code でステップ行を弾いて
+       |           JobOutcome { status, exit_code: Some(i32) } を返す
+       |
+       |-- snap.lifecycle.finished = Some(FinishedInfo {
+       |     final_state: outcome.status.state,    // 例: Completed
+       |     final_reason: outcome.status.reason,  // 例: None
+       |     exit_code: outcome.exit_code,         // 例: Some(0)
+       |     finished_at: Utc::now(),
+       |   })
+       |
+       |-- store.save(&snap).await
+       |-- snapshot_tx.send_replace(snap)
+       |
+       v
+   return Ok(snap)
+
+[4] Python が handle.is_finished() / .exit_code() を読む
+       |
+       v
+   PySbatchJobHandle::{is_finished, exit_code}
+       |
+       `-- self.0.snapshot_tx.borrow()          <- ロックフリー
+              は最新の snap (finished=Some) を返す
+              => is_finished() == true / exit_code() == Some(0)
+```
+
+### キーになる関数と不変条件
+
+- `src/sbatch/handle.rs::SbatchJobHandle::refresh` … qgroup → squeue
+  チェーン。**sacct は呼ばない**。`array_task_id.is_some()` の handle は
+  qgroup を skip して `squeue -j <master>_<idx>` に直行（PR #12）。
+- `src/sbatch/handle.rs::SbatchJobHandle::refresh_with_sacct` …
+  「heavyweight finalizer」。`lifecycle.finished` が None かつ
+  「`left_active_listing` が真 OR `last_observed_state.is_terminal()`」
+  のときだけ sacct を呼ぶ。PR #14 で terminal-observed branch を
+  追加（FINI/FAIL を観測した直後、まだ qgroup に居るケースをカバー）。
+- `src/sbatch/handle.rs::SbatchJobHandle::wait_terminal` … `refresh()`
+  を `poll_interval` 間隔でループ。デフォルトは 60 秒
+  （`SbatchManager::new`、PR #14）— SLURM の task-sampling 30 秒既定を
+  必ず跨ぐため。
+- `src/runner.rs::parse_qgroup_l` … KUDPC の `|` 区切りレイアウトと
+  per-queue / per-user サマリ行 (`jobid==0`) を吸収（PR #14）。
+- `src/entities/slurm/status.rs::JobState::parse` … `FINI` / `FAIL` を
+  それぞれ `Completed` / `Failed` への input-only alias として持つ
+  （`as_token()` は SLURM 正規の `COMPLETED` / `FAILED` を返す、PR #14）。
+- watch チャンネル更新は **`send_replace` 一択**。`send` は receiver 0
+  のとき値を更新せず Err を返すので、Python 側の `is_finished()` /
+  `exit_code()` が spawn 時 default に凍結するライブ不具合になる
+  (PR #14、`architecture.md` §3.5 設計判断 #6)。
+
+### failure case (`exit 7`) との差分
+
+| ステップ | success | failure |
+|---|---|---|
+| `qgroup -l` STAT | `FINI` | `FAIL` |
+| `JobState::parse` 結果 | `Completed` | `Failed` |
+| `is_terminal()` | true | true |
+| `wait_terminal` の脱出ブランチ | (a) terminal 観測 | (a) terminal 観測 |
+| `refresh_with_sacct` での gating | observed_terminal=true → sacct | observed_terminal=true → sacct |
+| `sacct -P -n -o ExitCode` | `0:0` | `7:0` |
+| `parse_sacct_exit_code` の戻り | `Some(0)` | `Some(7)` |
+| `handle.exit_code()` | `Some(0)` | `Some(7)` |
+| `handle.is_finished()` | true | true |
+
+## 6. live_env — `/proc/<pid>/environ` の best-effort 読み出し
 
 ### 流れ
 
@@ -380,7 +531,7 @@ read_live_env_for_pid(pid)
 > を返します。`None` は「読めなかった」を**全部丸めた**ものなので、
 > 失敗扱いしないでください（仕様）。詳しくは `docs/setup_test.md` §6.1。
 
-## 6. 全体タイムライン例: tssrun ジョブの生涯
+## 7. 全体タイムライン例: tssrun ジョブの生涯
 
 | t | アクター | イベント |
 |---|---|---|

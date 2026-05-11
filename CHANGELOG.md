@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### KUDPC live correctness fixes — watch updates, qgroup `FINI`/`FAIL`, sacct gating
+
+- **Fix: `watch::Sender::send` → `send_replace` (6 call sites)**. Both
+  `SbatchJobHandle::new` and `TssrunJobHandle::new` construct the watch
+  channel and immediately drop the initial `_rx`. Until a caller subscribes
+  via `.watch()`, `receiver_count == 0`, and tokio's `send` early-returns
+  `Err(SendError)` **without updating the stored value**. `let _ =
+  snapshot_tx.send(...)` silently discarded that Err, so every
+  `refresh()` / `refresh_with_sacct()` update was a no-op against the
+  watch channel. Python-side reads via `borrow()` (e.g.
+  `handle.is_finished()` / `exit_code()` / `is_running()`) returned the
+  spawn-time defaults forever. Switched all 5 sbatch + 1 tssrun internal
+  sends to `send_replace`, which updates the value unconditionally.
+  See `docs/architecture.md` §3.5 design judgement #6 and
+  `docs/development.md` §5.9 for the diagnosis. Follow-up "internal
+  keepalive receiver" / "replace `watch` with `Arc<RwLock<...>>` /
+  `ArcSwap`" options are recorded as issue #8 comment for future work.
+- **Fix: `SbatchJobHandle::refresh_with_sacct` gating loosened**. The
+  previous `!lifecycle.left_active_listing → return early` guard skipped
+  sacct whenever the job was still listed in qgroup. After the `FINI`
+  token was mapped to `JobState::Completed` (below), a freshly-finished
+  job that is still listed in qgroup now provably reaches a terminal
+  state via `last_observed_state.is_terminal()`. The new gating fires
+  sacct when **either** the active listing has been left **or** the last
+  observed state is terminal — `lifecycle.finished.is_some()` keeps the
+  idempotency short-circuit. sacct is still treated as heavyweight and
+  not called from `refresh()`. Regression test
+  `refresh_with_sacct_calls_sacct_when_qgroup_reports_terminal_fini` and
+  the idempotency test `refresh_with_sacct_is_idempotent_when_finished_already_set`
+  pin the new behaviour.
+- **Fix: KUDPC `qgroup -l` parser handles pipe-separated layout and
+  `FINI` / `FAIL` STAT tokens.** The current KUDPC layout emits
+  `QUEUE USER JOBID | STAT ...` with `|` column dividers; the previous
+  `parse_qgroup_l` indexed field 3 as STAT and consumed `"|"` instead,
+  silently mapping every observed state to `JobState::Unknown`. The new
+  parser drops standalone `|` tokens before indexing and rejects
+  `jobid == 0` so per-queue / per-user summary rows aren't injected as
+  phantom entries. `JobState::parse` gains `"FINI"` → `Completed` and
+  `"FAIL"` → `Failed` as **input-only KUDPC aliases**; `as_token()`
+  continues to return the SLURM canonical `"COMPLETED"` / `"FAILED"` so
+  persisted snapshots stay in the SLURM vocabulary. Regression tests
+  pin both the full 3-section pipe layout and the FINI/FAIL terminal
+  round-trip.
+- **Refactor: `SbatchManager::new` default `poll_interval` 30 s → 60 s**.
+  SLURM's default task-sampling interval is 30 s, so 30 s polling could
+  trap two consecutive `qgroup -l` calls inside one sampling window and
+  miss state transitions. 60 s guarantees we always cross at least one
+  sampling boundary between polls and reduces KUDPC squeue load.
+  Override via `SbatchManager::with_poll_interval(Duration)`.
+- **Fix: `TokioDispatcher::capture` merges stderr after stdout**.
+  Previous implementation returned `(exit_code, stdout)` and silently
+  discarded stderr — so `sbatch: error: invalid partition` and friends
+  reached `SbatchSpawnError::SubmitFailed::output` as empty strings,
+  hiding the actual failure cause from users. `capture` now appends
+  stderr after stdout with a `\n[stderr]\n` marker when stderr is
+  non-empty, leaving the success path untouched (stderr empty → no
+  marker). Line-based parsers (`parse_qgroup_l`, `parse_squeue`,
+  `parse_sacct_*`, `parse_submitted_jobid`) ignore unknown prefixes so
+  the merge is non-destructive. Regression test
+  `tokio_capture_merges_stderr_after_stdout` pins the failure-mode
+  diagnostic contract.
+- **Test: `scripts/test_sbatch_live.py` adds a failure case**. The
+  standalone live smoke script now runs two cases back-to-back: success
+  (`exit 0` → expect `exit_code == 0`) and failure (`exit 7` → expect
+  `exit_code == 7`). The new `_run_one_case` helper factors the shared
+  `wait_terminal → refresh_with_sacct → attach_uuid` round-trip path.
+  `SBATCH_LIVE_POLL_INTERVAL` env var added (default `10` s) so live
+  smokes can poll faster than the new 60 s `SbatchManager` default.
+
 ### Post-merge follow-ups — `run_with` callback, `_async` removal
 
 - **`SbatchManager::run_with<F: FnOnce(u64)>(on_spawn: F)` callback variant added** to close the timeout-with-cancel gap that PR #6 review M2 surfaced. Spec §6.1 instructed callers to wrap `mgr.run()` in `tokio::time::timeout` and call `mgr.cancel(jobid)` after a timeout, but the dropped future stranded the jobid. `run_with` invokes `on_spawn(jobid)` synchronously the moment sbatch returns, giving callers a hook to stash the jobid before the wait_terminal/refresh_with_sacct phase. Existing `run()` now delegates to `run_with(|_| {})`. pyo3 exposes it as `SbatchManager.run_with_jobid_callback(on_spawn)`. Spec §6.1 in `docs/superpowers/specs/2026-05-10-sbatch-phase2-design.md` has a "Post-Phase-2 follow-up" note documenting this resolution. Resolves PR #6 review M2.

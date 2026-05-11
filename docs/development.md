@@ -114,6 +114,24 @@ TSSRUN_LIVE_QUEUE="<group-queue>" \
   uv run python scripts/test_tssrun_live.py
 ```
 
+sbatch サブシステムの live smoke は `scripts/test_sbatch_live.py` で
+**success (`exit 0`) と failure (`exit 7`) の 2 ケース**を順に流します
+(PR #14 で failure case 追加)。両ケースとも `wait_terminal` →
+`refresh_with_sacct` → `attach_uuid` round-trip まで一気通貫で検証する
+ので、`is_finished() == true` と `exit_code() == Some(N)` の両方が
+KUDPC 上で正しく伝播することを確認できます。
+
+```bash
+SBATCH_LIVE_QUEUE="<group-queue>" \
+TMPDIR="$HOME/.cache/sbatch-live" \
+  uv run python scripts/test_sbatch_live.py
+```
+
+`SBATCH_LIVE_POLL_INTERVAL`（既定 `10`、ライブ smoke 用に
+`SbatchManager` 既定の 60 s より短く設定）, `SBATCH_LIVE_TIMEOUT`
+（既定 `180`）, `SBATCH_LIVE_TIME_LIMIT` / `SBATCH_LIVE_RSC` /
+`SBATCH_LIVE_BIN` で site 固有のチューニングが可能。
+
 ### 3.5 Lint / Format
 
 ```bash
@@ -232,6 +250,36 @@ surfaced していました）。
 ヒットしません。spawn 直後だと `snapshot.jobid` はまだ `None` です。
 長期参照には `attach_uuid`（UUID v7 primary key）を使うのが安全です。
 
+### 5.9 KUDPC で `handle.is_finished()` が常に `False`、`exit_code()` が `None`
+
+ライブ実行で sbatch handle が「終わっているはずなのに状態が更新されない」
+症状を踏んだ場合、原因は 3 系統あります（PR #14 で全部直しています）:
+
+1. **`qgroup -l` の STAT トークンが未マッピングで `JobState::Unknown` 扱い**。
+   KUDPC は終端を `FINI` (success) / `FAIL` (failure) で出すので、未知の
+   トークンは `src/entities/slurm/status.rs::JobState::parse` の `match`
+   に追加 (input-only alias、`as_token()` は SLURM 正規語彙を維持)。
+2. **`refresh_with_sacct` が sacct を呼ぶ条件**は「`lifecycle.finished` が
+   None かつ (`left_active_listing` OR `last_observed_state.is_terminal()`)」。
+   FINI/FAIL を観測した直後で qgroup から消えるまでにラグがあるケースは
+   `observed_terminal` branch でカバー（`src/sbatch/handle.rs:399`）。
+3. **`watch::Sender::send` は receiver 0 のとき値を更新しない**。これは
+   tokio の仕様。`SbatchJobHandle::new` / `TssrunJobHandle::new` は初期
+   receiver を drop するので、`.watch()` を呼ばないユーザに対しては
+   常に receiver 0 になる。**`send_replace` を使うこと** (PR #14 で 6
+   箇所すべてを置換済み)。新しい refresh 経路を増やすときも必ず
+   `snapshot_tx.send_replace(snap.clone())` を呼ぶ。詳細は
+   `docs/architecture.md` §3.5 設計判断 #6。
+
+### 5.10 sbatch がエラーで落ちたのに `SubmitFailed.output` が空
+
+PR #14 までの `TokioDispatcher::capture` は stdout だけを返し stderr を
+捨てていた。sbatch / scancel が失敗すると `sbatch: error: ...` は stderr
+に出るので、`SbatchSpawnError::SubmitFailed::output` が空になって診断
+不能になっていた。現在は stdout 末尾に `[stderr]` マーカー区切りで stderr
+を結合する（`src/dispatcher.rs::TokioDispatcher::capture`）。line-based
+パーサ群は `[stderr]` マーカーを skip するので非破壊。
+
 ## 6. CI と同じ条件をローカルで回す
 
 ```bash
@@ -299,6 +347,10 @@ tssrun (which is setuid).
         `<master>_<idx>` 形式の squeue クエリを使っている (PR #12)
   - [ ] dyn 化が必要な場合は `crate::handle::into_dyn` を経由
         (blanket impl 追加禁止)
+  - [ ] watch チャンネル更新は **`snapshot_tx.send_replace(snap.clone())`**
+        を使う。`let _ = snapshot_tx.send(...)` は receiver 0 で値が更新
+        されず、Python 側の `is_finished()` / `exit_code()` が spawn 時
+        default に凍結する (PR #14、§5.9)
 
 ## 8. リリース
 

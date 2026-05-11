@@ -140,7 +140,12 @@ sbatch サブシステム（§3.5）は **子プロセスを持たない**ため
   `run(argv) -> i32` と `capture(argv) -> (i32, String)` の 2 メソッド。
 - `TokioDispatcher` … `tokio::process::Command` で実プロセスを起動。
   `run` 側は stdout/stderr を pipe + 親へ echo、`capture` 側は stdout
-  だけを文字列に集約。
+  に加えて **stderr も `[stderr]` マーカー区切りで末尾結合**する
+  （sbatch 失敗時の `sbatch: error: ...` 等の診断メッセージを
+  `SbatchSpawnError::SubmitFailed::output` まで届けるため。`stderr` が
+  空のときは何も付けないので line-based パーサ群 (`parse_qgroup_l` /
+  `parse_squeue` / `parse_sacct_*` / `parse_submitted_jobid`) は
+  非破壊）。
 - `DryRunDispatcher` … プロセスを起動せず argv を `println!` するだけ。
   常に `Ok(0)` を返す。
 - `BackgroundDispatcher` extends `JobDispatcher` … `spawn` を追加。
@@ -235,6 +240,26 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    `squeue -j <master>_<idx>` (`query_array_task_state_with`) を直叩きする。
    `refresh_with_sacct()` の array-task branch も同様で `sacct -j <master>_<idx>`
    (`query_array_task_outcome_with`) を使う。
+   **KUDPC `qgroup -l` 互換 (PR #14)**: 詳細行は `QUEUE USER JOBID | STAT
+   SUBMIT_AT | RSC:core | PROC CORE MEM ELAPSE` のパイプ区切りレイアウト。
+   `parse_qgroup_l` は `|` トークンを skip し、`jobid_str.parse::<u64>() == 0`
+   は per-queue/per-user サマリ行として除外する。STAT トークンの `FINI` /
+   `FAIL` は KUDPC 独自エイリアスで、それぞれ `JobState::Completed` /
+   `JobState::Failed` (どちらも `is_terminal() == true`) に **input-only
+   alias** としてマップ — `as_token()` は SLURM 正規の `COMPLETED` /
+   `FAILED` を返すので永続化される文字列は SLURM 語彙のまま。
+   **`refresh_with_sacct` の起動条件 (PR #14)**: `lifecycle.finished` が
+   None の状態で「`left_active_listing` が立った」**または**
+   「`last_observed_state.is_terminal()`」のどちらかが真なら sacct を
+   呼ぶ。KUDPC では FINI/FAIL を観測しても qgroup から消えるまでに数十
+   秒のラグがあるため、`left_active_listing` だけを起動条件にすると
+   `wait_terminal` 直後の `refresh_with_sacct()` が sacct を呼ばずに
+   早期 return してしまっていた。
+   **default polling cadence (PR #14)**: `SbatchManager::new` の
+   `poll_interval` 既定値は **60 秒**。SLURM の task-sampling 既定が 30 秒
+   なので、2 連続 poll が同一サンプリング窓に閉じ込められないよう 60 秒
+   以上にしている。`with_poll_interval(Duration)` で override 可能、
+   テストは 1〜10 ms。
 2. **typed `--flag` entities を強制**。すべての SLURM `--*` 値型は
    `crate::entities::slurm::*` で定義し、Spec 層 (`SbatchCmd`) は型 leaf を
    持つ。`MailTypeInput::parse("BEGIN,END")` のように `FromStr` で
@@ -255,6 +280,18 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    tssrun と同じ。先頭の `"kind": "sbatch"` で peek し、`FileSystemStateStore<S>::list`
    は不一致 kind を silent-skip する設計のため、tssrun と sbatch は安全に
    同居できる。
+6. **watch チャンネル更新は `send_replace` を使う (PR #14)**。
+   `SbatchJobHandle::new` / `TssrunJobHandle::new` は
+   `let (tx, _rx) = watch::channel(...)` で初期 receiver を drop するため、
+   呼び出し側が `.watch()` を叩かない限り receiver count は 0。
+   `tokio::sync::watch::Sender::send` は receiver 0 のとき **値を更新せず
+   `Err(SendError)` を返す**仕様で、`let _ = ` で握り潰すと snapshot が
+   spawn 時の初期値で凍結する。`is_finished()` / `exit_code()` が常に
+   spawn 時 default を返す live バグの原因だった。`send_replace` は
+   receiver の有無に関わらず値を unconditional に置換するので、`refresh`
+   / `refresh_with_sacct` 内部の 6 つの送信点はすべてこちらを使う。
+   Python 側のラッパは `handle.is_finished()` 等を `snapshot_tx.borrow()`
+   経由で読むため、この置換なしには Rust 側の更新が一切伝わらない。
 
 ### 3.6 跨 backend handle 抽象（`src/handle.rs`、PR #7）
 
@@ -383,6 +420,13 @@ PR #5 までは `gaussian_job_shared._core.entities.slurm.status` から
   associated `Snapshot` 型がある時点で dyn-safe ではない。
   `Arc<dyn DynJobHandleCommon>` が必要なときは `crate::handle::into_dyn`
   を経由すること（blanket impl は意図的に提供していない、§3.6 参照）。
+- **watch 更新は `send_replace` 一択**。`SbatchJobHandle` /
+  `TssrunJobHandle` の `snapshot_tx` は初期 receiver が drop されるため、
+  `send` は receiver 0 のとき値を更新せず Err を返す。新規 refresh
+  経路を増やすときは必ず `send_replace(snap)` を呼ぶこと
+  （§3.5 設計判断 #6）。`let _ = snapshot_tx.send(...)` を書くと
+  Python 側の `is_finished()` / `exit_code()` がサイレントに spawn 時の
+  default を返し続ける live バグになる。
 - **`TssrunManager` のフィールドは `pub(crate)`**。`with_state_dir` /
   `with_state_store` / `with_log_sink` ビルダー以外で書き換えると、
   既に走っている `TssrunJobHandle` には反映されません（後から store を
