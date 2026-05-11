@@ -173,7 +173,7 @@ code = await handle.wait()                 # <- 子の終了を待つ
        |     in-memory snapshot / on-disk filename / store entry が
        |     全部この uuid を共有（second source of truth を作らない）
        |
-       |-- init = TssrunJobSnapshot { uuid, pid, argv, sent_env,    // Phase 3 P1 rename
+       |-- init = TssrunJobSnapshot { uuid, pid, argv, sent_env,    // PR #7 rename
        |          cwd, started_at_unix, log_locations: None,
        |          jobid: None, node: None, finished: None }
        |
@@ -319,7 +319,7 @@ TssrunManager.with_state_dir(d)         |
 ### `TssrunJobSnapshot` の永続フォーマット
 
 JSON ファイルのスキーマは `src/tssrun/handle.rs::TssrunJobSnapshot` の
-（Phase 3 P1 で `JobHandleSnapshot` から rename。`kind = "tssrun"` 文字列は不変）
+（PR #7 で `JobHandleSnapshot` から rename。`kind = "tssrun"` 文字列は不変）
 `Serialize` 派生に従います。ファイル名は `{uuid}.json` で、`uuid` は
 スナップショット内のフィールドと完全一致します（合成例）:
 

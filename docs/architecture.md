@@ -17,7 +17,7 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 |                Python 利用者                                       |
 |   slurm_async_runner._slurm_async_runner_core.                    |
 |     {manager, runner, tssrun, sbatch, entities.slurm.*}           |
-|   slurm_async_runner.JobHandleCommon (Protocol, Phase 3 P4)        |
+|   slurm_async_runner.JobHandleCommon (Protocol, PR #7)             |
 +----------------------------+-------------------------------------+
                              | pyo3 (async = pyo3-async-runtimes)
 +----------------------------v-------------------------------------+
@@ -40,7 +40,7 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 |  | SbatchCmd |  | Background系  |  | qgroup -l パース    |          |
 |  +-----------+  +--------------+  +--------------------+          |
 |                                                                   |
-|  +-- 跨 backend 抽象 (Phase 3, src/handle.rs) --+                   |
+|  +-- 跨 backend 抽象 (PR #7, src/handle.rs) -----+                  |
 |  | JobHandleCommon trait (associated Snapshot 型)                  |
 |  | DynJobHandleCommon + into_dyn() (object-safe facade)            |
 |  +----------------------------------------------+                  |
@@ -53,10 +53,12 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 |  |     primary key = UUID v7、{dir}/{uuid}.json を atomic 保存|       |
 |  +---------------------------------------------------------+        |
 |                                                                   |
-|  +------------------ sbatch サブシステム (Phase 2) --------+        |
+|  +------------------ sbatch サブシステム (PR #6) ----------+        |
 |  | SbatchManager -> SbatchJobHandle (watch スナップショット)|        |
 |  |   - sbatch でキュー投入、子プロセスは持たない              |        |
-|  |   - refresh() = qgroup -l → squeue (sacct を呼ばない)    |        |
+|  |   - 単発 refresh()  = qgroup -l → squeue (sacct なし)    |        |
+|  |   - array task refresh() = squeue -j <master>_<idx>     |        |
+|  |     (PR #12、qgroup は per-task では集計しか返さないため) |        |
 |  |   - refresh_with_sacct() / run() のみ sacct 経由         |        |
 |  |   - SlurmDependency / SlurmSignalSpec / MailTypeInput /  |        |
 |  |     SlurmArraySpec などの typed --flag entities         |        |
@@ -121,7 +123,7 @@ sbatch サブシステム（§3.5）は **子プロセスを持たない**ため
   PR #5 までは `tssrun::cmd::Resource` というローカル型を使っていたが、
   `gaussian_job_shared` の vocab を in-tree に取り込んだタイミングで
   `ResourceSpec` 1 つに統合された。
-- `src/sbatch/cmd.rs::SbatchCmd` … `sbatch` 用 argv ビルダー（Phase 2）。
+- `src/sbatch/cmd.rs::SbatchCmd` … `sbatch` 用 argv ビルダー（PR #6）。
   `--dependency` / `--mail-user` / `--mail-type` / `--no-requeue` /
   `--signal` / `--comment` / `--array` / `--export` などを typed
   フィールドで保持。値型はすべて `crate::entities::slurm::sbatch_options::*`
@@ -170,8 +172,8 @@ ECCS の `tssrun`（= `salloc` + `srun` 対話バッチフロントエンド）�
 | 型 | 役割 |
 |---|---|
 | `TssrunCmd` (cmd.rs) | argv の Spec ビルダー |
-| `TssrunJobHandle` (handle.rs) | `BackgroundDispatcher::spawn` で得た子プロセスを所有し、tee タスク・wait タスク・スナップショット送信器を保持。Phase 3 P1 で `JobHandle` から rename (`#[deprecated]` alias を保持) |
-| `TssrunJobSnapshot` (handle.rs) | Serde 対応の状態。**primary key は `uuid: Uuid`（v7、時刻順）**。`pid` / `argv` / `sent_env` / `jobid` / `node` / `finished` などを含み、watch チャンネルで配信されストアに永続化される。Phase 3 P1 で `JobHandleSnapshot` から rename |
+| `TssrunJobHandle` (handle.rs) | `BackgroundDispatcher::spawn` で得た子プロセスを所有し、tee タスク・wait タスク・スナップショット送信器を保持。PR #7 で `JobHandle` から rename (旧 alias は PR #11 で削除) |
+| `TssrunJobSnapshot` (handle.rs) | Serde 対応の状態。**primary key は `uuid: Uuid`（v7、時刻順）**。`pid` / `argv` / `sent_env` / `jobid` / `node` / `finished` などを含み、watch チャンネルで配信されストアに永続化される。PR #7 で `JobHandleSnapshot` から rename (旧 alias は PR #11 で削除) |
 | `JobStateStore<S>` trait (`crate::store`) | スナップショット永続化の抽象（汎用化されており tssrun / sbatch 両方が利用）。組み込み実装は `InMemoryStateStore<S>`（`HashMap<Uuid, _>`、デフォルト）と `FileSystemStateStore<S>`（`{dir}/{uuid}.json`、atomic-rename、ディレクトリ遅延作成、`kind` discriminator により他 backend snapshot は silent-skip）。Redis / SQLite 等は外部 crate で `#[async_trait]` 実装するだけで差し込める |
 | `TssrunManager` (manager.rs) | `TssrunCmd` + `Arc<dyn JobStateStore<TssrunJobSnapshot>>` + `Arc<dyn JobLogSink>` を保持。`spawn` / `attach` / `query_state` を提供 |
 
@@ -199,15 +201,15 @@ ECCS の `tssrun`（= `salloc` + `srun` 対話バッチフロントエンド）�
    key を共有する（second source of truth を作らない）。`AttachKey::Uuid`
    は store.load() で O(1)、`Pid` / `JobId` は scan ベースのフォールバック。
    Pid はカーネルで再利用されうるため、長期参照には `Uuid` を使うこと。
-6. **`refresh()` / `wait_terminal()` の追加 (Phase 3 P2)**。`refresh()` は
+6. **`refresh()` / `wait_terminal()` の追加 (PR #7)**。`refresh()` は
    永続化スナップショットを読み直して broadcast し、`Result<TssrunJobSnapshot>`
    を返す（旧 `Result<()>` シグネチャと non-breaking 互換）。
    `wait_terminal(poll_interval)` は `refresh()` を繰り返して
    `is_finished()` が立つまで待つ。`sbatch` 側の同名メソッドと parity を
-   揃えてあり、Phase 3 P3 で `JobHandleCommon` trait が両 backend を
+   揃えてあり、`JobHandleCommon` trait (PR #7、§3.6) が両 backend を
    束ねる前提として導入された。
 
-### 3.5 sbatch サブシステム（`src/sbatch/`、Phase 2）
+### 3.5 sbatch サブシステム（`src/sbatch/`、PR #6）
 
 KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシステム。tssrun と
 違い **子プロセスを持たない** — ジョブは SLURM 側で動き、handle は
@@ -216,10 +218,10 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
 | 型 | 役割 |
 |---|---|
 | `SbatchCmd` (`src/sbatch/cmd.rs`) | `sbatch` argv の Spec ビルダー。`--dependency` / `--mail-user` / `--mail-type` / `--no-requeue` / `--signal` / `--comment` / `--array` / `--export` などを typed フィールドで保持し、`build_argv()` を提供 |
-| `SbatchJobSnapshot` (`src/sbatch/handle.rs`) | Serde 対応の状態。`uuid`（UUID v7）/ `jobid` / `last_observed_state` / `array_task_id` / `finished` (`FinishedInfo`) を保持。`kind = "sbatch"` で tssrun と区別される。Phase 3 (#8 B1) で `array_jobid` フィールドは削除（旧 Phase 2 JSON は `deny_unknown_fields` 未指定により silently 無視されて読み込める）|
-| `SbatchJobHandle` (`src/sbatch/handle.rs`) | 子プロセスを持たない handle。`refresh()` で `qgroup -l → squeue` チェーン、`refresh_with_sacct()` で sacct を呼んで `exit_code` を確定、`wait_terminal()` で polling、`log_lines` / `read_log_to_end` で stdout/stderr のテール読み |
+| `SbatchJobSnapshot` (`src/sbatch/handle.rs`) | Serde 対応の状態。`uuid`（UUID v7）/ `jobid` / `last_observed_state` / `array_task_id` / `finished` (`FinishedInfo`) を保持。`kind = "sbatch"` で tssrun と区別される。PR #10 (#8 B1) で `array_jobid` フィールドは削除（旧 JSON は `deny_unknown_fields` 未指定により silently 無視されて読み込める）|
+| `SbatchJobHandle` (`src/sbatch/handle.rs`) | 子プロセスを持たない handle。`refresh()` で `qgroup -l → squeue` チェーン、`refresh_with_sacct()` で sacct を呼んで `exit_code` を確定、`wait_terminal()` で polling、`log_lines` / `read_log_to_end` で stdout/stderr のテール読み。`SbatchJobHandleInner` には PR #9 (#8 A7) で `Drop` 実装が追加され、終端到達前に最後の clone が drop された場合は `tracing::warn!` を発火する |
 | `SbatchManager` (`src/sbatch/manager.rs`) | `Arc<dyn DynJobDispatcher>` + `JobStateStore<SbatchJobSnapshot>` を保持。`spawn` / `spawn_array` / `run` / `cancel` / `attach_uuid` / `attach_jobid` / `attach_array_jobid` / `attach_file` を提供 |
-| `SbatchSpawnError` / `SbatchRunError` / `SbatchCancelError` / `SbatchAttachError` (`src/sbatch/error.rs`) | `#[non_exhaustive]` typed enum。`anyhow::Error` への型崩しを避ける（Phase 2 final review HIGH issue から） |
+| `SbatchSpawnError` / `SbatchRunError` / `SbatchCancelError` / `SbatchAttachError` (`src/sbatch/error.rs`) | `#[non_exhaustive]` typed enum。`anyhow::Error` への型崩しを避ける（PR #6 final review HIGH issue から） |
 
 サブシステム独自の設計判断:
 
@@ -227,7 +229,12 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    `qgroup -l` がキューから消えたジョブに対しては `left_active_listing`
    flag を立てるだけ。終端 exit_code が必要なときだけ `refresh_with_sacct()` を
    明示的に呼ぶ。`run()` だけが内部で `spawn → wait_terminal → refresh_with_sacct`
-   を合成する。これは Phase 1 ハンドオーバ §2 の不変条件として固定。
+   を合成する。これは sbatch サブシステム導入時からの不変条件として固定。
+   PR #12 (#8 A5) で array-task の per-task `refresh` を追加: `array_task_id.is_some()`
+   の handle は `qgroup -l`（master 集計しか返さない）を skip して
+   `squeue -j <master>_<idx>` (`query_array_task_state_with`) を直叩きする。
+   `refresh_with_sacct()` の array-task branch も同様で `sacct -j <master>_<idx>`
+   (`query_array_task_outcome_with`) を使う。
 2. **typed `--flag` entities を強制**。すべての SLURM `--*` 値型は
    `crate::entities::slurm::*` で定義し、Spec 層 (`SbatchCmd`) は型 leaf を
    持つ。`MailTypeInput::parse("BEGIN,END")` のように `FromStr` で
@@ -236,6 +243,11 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    を 1 回叩き、master jobid から `expand_array_indices(&SlurmArraySpec)` で
    各 task に 1 つずつ `SbatchJobHandle` (= 別 UUID) を発行する。`attach_array_jobid`
    は master jobid から N 個の handle を `array_task_id` 昇順で再構成する。
+   各 task の状態は §3.5 設計判断 #1 で述べた per-task `refresh()` 経路
+   (`<master>_<idx>` 直叩き、PR #12) で個別に追跡できる。`attach_array_jobid`
+   は `find_all_by_jobid -> list -> decode_with_kind_check` を経由するため、
+   同じ state dir に tssrun の snapshot が同居していても kind 不一致で
+   silent-skip される (PR #12 でこの contract を test で固定)。
 4. **`run()` は `sbatch --wait` を使わない**。KUDPC で disconnect すると
    ジョブが orphan 化するため、poll ベースで `spawn → wait_terminal → refresh_with_sacct`
    を合成する。`ArrayNotSupported` を typed error で早期 reject。
@@ -244,18 +256,18 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    は不一致 kind を silent-skip する設計のため、tssrun と sbatch は安全に
    同居できる。
 
-### 3.6 跨 backend handle 抽象（`src/handle.rs`、Phase 3）
+### 3.6 跨 backend handle 抽象（`src/handle.rs`、PR #7）
 
-Phase 2 で sbatch / tssrun の handle が「コア 5 sync getter (`uuid` /
+PR #6 で sbatch / tssrun の handle が「コア 5 sync getter (`uuid` /
 `jobid` / `is_running` / `is_finished` / `exit_code`)」を持ち、`watch()` /
 `snapshot()` / `refresh()` / `wait_terminal()` のシグネチャも揃った時点で、
-これを **trait として機械的に保証する** のが Phase 3 の主眼。
+これを **trait として機械的に保証する** のが PR #7 の主眼。
 
 | 型 / trait | 役割 |
 |---|---|
 | `JobHandleCommon` trait | 5 sync getter + `snapshot()` / `watch()` + `async fn refresh() / wait_terminal()` を associated `type Snapshot: JobSnapshot` 経由で表現。`SbatchJobHandle` / `TssrunJobHandle` の両方が impl |
 | `DynJobHandleCommon` trait | associated type を `serde_json::Value` に flatten した object-safe 版。公開メソッドは 5 sync getter + `kind() -> &'static str` + `snapshot_json()` + `async refresh_json() -> Result<serde_json::Value>` のみ。`watch::Receiver<S>` と `wait_terminal()` は dyn 経路に乗らないため **本体 trait からのみアクセス可能**（dashboard 用途では `refresh_json()` を手動 polling）。`Vec<Arc<dyn DynJobHandleCommon>>` で sbatch + tssrun handle を混ぜて持てる |
-| `DynHandleAdapter<H>` + `into_dyn(handle) -> Arc<dyn DynJobHandleCommon>` | 明示的な type-erasure コンストラクタ。**blanket impl を提供しない** ことで Phase 1 で発生した E0034 ambiguity を回避（Phase 1 handover §4） |
+| `DynHandleAdapter<H>` + `into_dyn(handle) -> Arc<dyn DynJobHandleCommon>` | 明示的な type-erasure コンストラクタ。**blanket impl を提供しない** ことで過去に発生した E0034 ambiguity を回避（`DynJobDispatcher` の `into_dyn` パターンと同じ） |
 
 設計判断:
 
@@ -269,13 +281,13 @@ Phase 2 で sbatch / tssrun の handle が「コア 5 sync getter (`uuid` /
    公開する案 (PR #7 で議論) は YAGNI として見送り。両 backend は既に
    構造的に Protocol を満たすので `isinstance(h, JobHandleCommon)` で
    structural type check できる。
-4. **Phase 3 P5 で Python side の sync 化**。`TssrunJobHandle.uuid` /
-   `jobid` / `is_running()` / `is_finished()` / `exit_code()` は元々
-   tokio runtime work を持たない読み取りだったが、`future_into_py` でラップして
-   awaitable として露出していた。これを **sync `@property` / 普通の
-   sync method に直し**、`SbatchJobHandle` と call shape を揃えた。
-   旧 await-style は `uuid_async` / `jobid_async` / `is_running_async` /
-   `is_finished_async` / `exit_code_async` として escape hatch を残す。
+4. **Python side の sync 化** (`JobHandleCommon` trait 導入時)。
+   `TssrunJobHandle.uuid` / `jobid` / `is_running()` / `is_finished()` /
+   `exit_code()` は元々 tokio runtime work を持たない読み取りだったが、
+   `future_into_py` でラップして awaitable として露出していた。これを
+   **sync `@property` / 普通の sync method に直し**、`SbatchJobHandle` と
+   call shape を揃えた。旧 await-style の `*_async` エスケープハッチは
+   PR #6 review fix で削除済み (sync 版で十分なため drop)。
 
 ### 3.7 ログシンク（`src/tssrun/log.rs`）
 
@@ -328,10 +340,10 @@ Python の名前空間 `slurm_async_runner._slurm_async_runner_core` 配下に
 | `slurm_async_runner._slurm_async_runner_core.manager` | `py_export/manager.rs::inner_module` | `SlurmCmd`, `SlurmManager` |
 | `slurm_async_runner._slurm_async_runner_core.runner` | `py_export/runner.rs::inner_module` | `query_job_states_batch` |
 | `slurm_async_runner._slurm_async_runner_core.tssrun` | `py_export/tssrun.rs::inner_module` | `TssrunCmd`, `LogSink`, `TssrunJobHandle`, `TssrunManager`, `JobStateStore`, `ResourceSpec`, `JobTimeLimit`（再エクスポート）, `null_log_sink`, `std_log_sink`, `file_log_sink`, `in_memory_state_store`, `file_system_state_store` |
-| `slurm_async_runner._slurm_async_runner_core.sbatch` | `py_export/sbatch.rs::inner_module` | `SbatchCmd`, `SbatchManager`, `SbatchJobHandle`, `FinishedInfo`（Phase 2） |
+| `slurm_async_runner._slurm_async_runner_core.sbatch` | `py_export/sbatch.rs::inner_module` | `SbatchCmd`, `SbatchManager`, `SbatchJobHandle`, `FinishedInfo`（PR #6） |
 | `slurm_async_runner._slurm_async_runner_core.entities.slurm.status` | `py_export/entities/slurm/status.rs` | `JobStatus`, `JobState`, `JobReason` |
 | `slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options` | `py_export/entities/slurm/sbatch_options.rs` | `ResourceSpec`, `ResourceSpecCPU`, `ResourceSpecGPU`, `JobTimeLimit`, `JobPartition`, `Memory`, `MemoryUnit`, `ArraySpec`, `SlurmDependency`, `MailTypeInput`, `SlurmSignalSpec` ほか |
-| `slurm_async_runner` (Python facade) | `python/slurm_async_runner/__init__.py` | `JobHandleCommon`（Phase 3 P4 の `runtime_checkable Protocol`） |
+| `slurm_async_runner` (Python facade) | `python/slurm_async_runner/__init__.py` | `JobHandleCommon`（PR #7 の `runtime_checkable Protocol`） |
 
 それぞれの `#[pymodule_init]` で `sys.modules` に明示登録しているのは、
 サブモジュールの import が pyo3 規約上で `module-name` フルパスから
@@ -358,14 +370,14 @@ PR #5 までは `gaussian_job_shared._core.entities.slurm.status` から
   ただし 2 回目の `wait()` はエラー。これを誤って書き直して曖昧な
   `Ok(0)` を返してしまわないように。
 - **`JobHandleCommon::refresh()` から `sacct` を呼んではいけない**
-  （Phase 1 handover §2 + Phase 3 §3.6）。`sacct` は重いので
+  （§3.5 + §3.6）。`sacct` は重いので
   `SbatchJobHandle::refresh_with_sacct` と `SbatchManager::run` の
   内部からしか呼ばれない。trait に新しい backend を加えるときも
   この不変条件を継承すること。
 - **`JobSnapshot::kind()` の戻り値を rename しない**。`"sbatch"` /
   `"tssrun"` は `{root}/<uuid>.json` の `kind` フィールドに書かれて
   永続化されているため、変更すると既存ユーザの state ディレクトリを
-  silent break する。Phase 3 P1 で Rust struct を rename したときも
+  silent break する。PR #7 で Rust struct を rename したときも
   `TssrunJobSnapshot::kind()` は `"tssrun"` を返し続けている。
 - **`JobHandleCommon` 本体 trait を dyn 化しようとしない**。
   associated `Snapshot` 型がある時点で dyn-safe ではない。
