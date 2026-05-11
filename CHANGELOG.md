@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 3 P4 — type-erased `DynJobHandleCommon` + Python `Protocol`
+
+- **`crate::handle::DynJobHandleCommon`** — object-safe companion to `JobHandleCommon`. Snapshot is exposed as `serde_json::Value` to flatten the associated type. Carries a static `kind() -> &'static str` discriminator that matches `JobSnapshot::kind()`.
+- **`crate::handle::DynHandleAdapter<H>`** + **`crate::handle::into_dyn(handle)`** free function — the explicit constructor avoids the blanket-impl + associated-type E0034 ambiguity diagnosed in Phase 1 (handover §4). Mirrors the `dispatcher::into_dyn` pattern.
+- Heterogenous collections of `Arc<dyn DynJobHandleCommon>` mixing tssrun and sbatch handles now compile (see new tests in `tests/job_handle_common.rs`).
+- Crate-root re-exports: `pub use handle::{DynHandleAdapter, DynJobHandleCommon, JobHandleCommon};`. `handle::into_dyn` is **not** re-exported at the crate root because `dispatcher::into_dyn` already lives there — use `slurm_async_runner::handle::into_dyn` or aliased `use ... as into_dyn_handle;`.
+- **Python**: `runtime_checkable Protocol` `JobHandleCommon` added to `python/slurm_async_runner/__init__.py`. Callers can write `from slurm_async_runner import JobHandleCommon` and `isinstance(h, JobHandleCommon)` to accept either backend.
+- **Python (parity)**: `TssrunJobHandle.is_finished()` async method added so the tssrun pyo3 wrapper exposes the same surface as `SbatchJobHandle.is_finished()` and satisfies the Protocol. `.pyi` updated.
+
 ### Phase 3 P3 — `JobHandleCommon` cross-backend trait
 
 - New module `crate::handle` exposing the `JobHandleCommon` trait — the Phase 2 §7.1 naming convergence (5 sync getters + `snapshot` / `watch` + async `refresh` / `wait_terminal`) is now a mechanically-checkable contract on the public crate API.

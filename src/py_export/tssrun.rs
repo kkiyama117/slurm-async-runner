@@ -242,6 +242,14 @@ impl PyTssrunJobHandle {
         future_into_py(py, async move { Ok(running) })
     }
 
+    /// Inverse of ``is_running``. Phase 3 P4: exposed for parity with
+    /// ``SbatchJobHandle.is_finished`` and to satisfy the
+    /// ``slurm_async_runner.JobHandleCommon`` runtime Protocol.
+    fn is_finished<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let finished = self.rx.borrow().finished.is_some();
+        future_into_py(py, async move { Ok(finished) })
+    }
+
     fn exit_code<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let code = self.rx.borrow().finished.as_ref().and_then(|f| f.exit_code);
         future_into_py(py, async move { Ok(code) })

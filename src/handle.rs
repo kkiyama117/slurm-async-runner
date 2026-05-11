@@ -19,6 +19,8 @@
 //! `Snapshot`. Phase 3 P4 introduces the type-erased `DynJobHandleCommon`
 //! companion for callers that need `dyn` dispatch.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -102,4 +104,120 @@ pub trait JobHandleCommon: Send + Sync + 'static {
     /// Polls via [`refresh`](Self::refresh) every `poll_interval`. Returns
     /// the first refreshed snapshot that the backend considers terminal.
     async fn wait_terminal(&self, poll_interval: std::time::Duration) -> Result<Self::Snapshot>;
+}
+
+/// Object-safe companion to [`JobHandleCommon`].
+///
+/// Use this trait when you need a heterogenous collection of handles —
+/// e.g. `Vec<Arc<dyn DynJobHandleCommon>>` mixing tssrun and sbatch jobs in
+/// a single dashboard or attach UI. The associated `Snapshot` of
+/// [`JobHandleCommon`] is flattened to [`serde_json::Value`] so dynamic
+/// dispatch is possible.
+///
+/// Construct with [`into_dyn`] — there is intentionally **no blanket
+/// `impl<H: JobHandleCommon> DynJobHandleCommon for H`**. Phase 1's
+/// handover §4 documented that blanket impls combined with an associated
+/// type trigger `E0034: multiple applicable items in scope`; the explicit
+/// `into_dyn` constructor keeps the conversion site obvious and the trait
+/// resolution unambiguous.
+///
+/// [`watch::Receiver`] is intentionally absent — type-erased subscribers
+/// should poll via [`Self::snapshot_json`] / [`Self::refresh_json`].
+#[async_trait::async_trait]
+pub trait DynJobHandleCommon: Send + Sync + 'static {
+    /// See [`JobHandleCommon::uuid`].
+    fn uuid(&self) -> Uuid;
+    /// See [`JobHandleCommon::jobid`].
+    fn jobid(&self) -> Option<u64>;
+    /// See [`JobHandleCommon::is_running`].
+    fn is_running(&self) -> bool;
+    /// See [`JobHandleCommon::is_finished`].
+    fn is_finished(&self) -> bool;
+    /// See [`JobHandleCommon::exit_code`].
+    fn exit_code(&self) -> Option<i32>;
+
+    /// Static discriminator string for the underlying snapshot type.
+    /// Matches [`crate::store::JobSnapshot::kind`] — `"sbatch"` or `"tssrun"`.
+    fn kind(&self) -> &'static str;
+
+    /// Current snapshot, flattened to JSON. The structure matches
+    /// `serde_json::to_value(handle.snapshot())` of the concrete
+    /// `JobHandleCommon` impl.
+    fn snapshot_json(&self) -> serde_json::Value;
+
+    /// JSON-flattened equivalent of [`JobHandleCommon::refresh`]. Same
+    /// invariants apply (MUST NOT call `sacct`).
+    async fn refresh_json(&self) -> Result<serde_json::Value>;
+}
+
+/// Adapter that erases an `H: JobHandleCommon` into a
+/// `dyn DynJobHandleCommon`. Constructed via [`into_dyn`].
+pub struct DynHandleAdapter<H: JobHandleCommon> {
+    inner: H,
+}
+
+impl<H: JobHandleCommon> DynHandleAdapter<H> {
+    /// Wrap `inner` in an adapter. Prefer the free function [`into_dyn`]
+    /// when you want an `Arc<dyn DynJobHandleCommon>` directly.
+    pub fn new(inner: H) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<H: JobHandleCommon> DynJobHandleCommon for DynHandleAdapter<H> {
+    fn uuid(&self) -> Uuid {
+        self.inner.uuid()
+    }
+    fn jobid(&self) -> Option<u64> {
+        self.inner.jobid()
+    }
+    fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+    fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+    fn exit_code(&self) -> Option<i32> {
+        self.inner.exit_code()
+    }
+    fn kind(&self) -> &'static str {
+        <H::Snapshot as JobSnapshot>::kind()
+    }
+    fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::to_value(self.inner.snapshot())
+            .expect("JobSnapshot must always serialize to JSON")
+    }
+    async fn refresh_json(&self) -> Result<serde_json::Value> {
+        let snap = self.inner.refresh().await?;
+        Ok(serde_json::to_value(snap)?)
+    }
+}
+
+/// Type-erase any `H: JobHandleCommon` into a shareable
+/// `Arc<dyn DynJobHandleCommon>`.
+///
+/// Mirrors the Phase 1 `dispatcher::into_dyn` constructor pattern.
+/// There is intentionally **no blanket impl** of `DynJobHandleCommon`
+/// for `JobHandleCommon`; see the [`DynJobHandleCommon`] doc-comment.
+pub fn into_dyn<H: JobHandleCommon>(h: H) -> Arc<dyn DynJobHandleCommon> {
+    Arc::new(DynHandleAdapter::new(h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-only assertion that `DynJobHandleCommon` is object-safe.
+    /// A non-object-safe trait would fail to coerce `Box<T>` to
+    /// `Box<dyn Trait>`, which this function exercises in argument position.
+    #[allow(dead_code)]
+    fn _dyn_safe(_h: &dyn DynJobHandleCommon) {}
+
+    /// Compile-only assertion that `into_dyn` accepts any
+    /// `JobHandleCommon` impl and yields an `Arc<dyn DynJobHandleCommon>`.
+    #[allow(dead_code)]
+    fn _into_dyn_signature<H: JobHandleCommon>(h: H) -> Arc<dyn DynJobHandleCommon> {
+        into_dyn(h)
+    }
 }

@@ -20,12 +20,13 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
+use slurm_async_runner::handle::into_dyn;
 use slurm_async_runner::sbatch::handle::{LogPathSpec, SbatchLifecycle};
 use slurm_async_runner::tssrun::handle::{FinishedInfo as TssrunFinishedInfo, LogLocations};
 use slurm_async_runner::{
-    FileSystemStateStore, InMemoryStateStore, JobHandleCommon, JobReason, JobState, JobStateStore,
-    JobStatus, SbatchCmd, SbatchFinishedInfo, SbatchJobHandle, SbatchJobSnapshot, SbatchManager,
-    TssrunJobHandle, TssrunJobSnapshot,
+    DynJobHandleCommon, FileSystemStateStore, InMemoryStateStore, JobHandleCommon, JobReason,
+    JobState, JobStateStore, JobStatus, SbatchCmd, SbatchFinishedInfo, SbatchJobHandle,
+    SbatchJobSnapshot, SbatchManager, TssrunJobHandle, TssrunJobSnapshot,
 };
 
 /// Compile-time assertion that the named type implements `JobHandleCommon`.
@@ -89,16 +90,19 @@ fn finished_tssrun_snapshot(uuid: Uuid, jobid: u64) -> TssrunJobSnapshot {
     }
 }
 
-#[tokio::test]
-async fn tssrun_handle_satisfies_common_contract() {
-    let uuid = Uuid::now_v7();
-    let jobid = 42_u64;
+async fn build_finished_tssrun_handle(uuid: Uuid, jobid: u64) -> TssrunJobHandle {
     let store: Arc<dyn JobStateStore<TssrunJobSnapshot>> =
         Arc::new(InMemoryStateStore::<TssrunJobSnapshot>::new());
     let snap = finished_tssrun_snapshot(uuid, jobid);
     store.save(&snap).await.unwrap();
+    TssrunJobHandle::attach_snapshot(snap, Some(store))
+}
 
-    let handle = TssrunJobHandle::attach_snapshot(snap, Some(store));
+#[tokio::test]
+async fn tssrun_handle_satisfies_common_contract() {
+    let uuid = Uuid::now_v7();
+    let jobid = 42_u64;
+    let handle = build_finished_tssrun_handle(uuid, jobid).await;
     assert_common_contract(handle, uuid, Some(jobid)).await;
 }
 
@@ -132,11 +136,13 @@ fn finished_sbatch_snapshot(uuid: Uuid, jobid: u64) -> SbatchJobSnapshot {
     }
 }
 
-#[tokio::test]
-async fn sbatch_handle_satisfies_common_contract() {
-    let uuid = Uuid::now_v7();
-    let jobid = 7777_u64;
-
+/// Build a finished sbatch handle backed by a fresh tempdir + filesystem
+/// store. Returns `(handle, tempdir_guard)` — the guard must outlive the
+/// handle to keep the state files on disk.
+async fn build_finished_sbatch_handle(
+    uuid: Uuid,
+    jobid: u64,
+) -> (SbatchJobHandle, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> =
         Arc::new(FileSystemStateStore::<SbatchJobSnapshot>::new(tmp.path()));
@@ -146,6 +152,85 @@ async fn sbatch_handle_satisfies_common_contract() {
     let cmd = SbatchCmd::new(PathBuf::from("/tmp/job.sh"));
     let manager = SbatchManager::new(cmd).with_state_store(store);
     let handle = manager.attach_uuid(uuid).await.unwrap();
+    (handle, tmp)
+}
 
+#[tokio::test]
+async fn sbatch_handle_satisfies_common_contract() {
+    let uuid = Uuid::now_v7();
+    let jobid = 7777_u64;
+    let (handle, _tmp) = build_finished_sbatch_handle(uuid, jobid).await;
     assert_common_contract(handle, uuid, Some(jobid)).await;
+}
+
+// ─── Phase 3 P4: type-erased DynJobHandleCommon round-trip ────────────
+
+#[tokio::test]
+async fn into_dyn_sbatch_preserves_kind_and_getters() {
+    let uuid = Uuid::now_v7();
+    let jobid = 8888_u64;
+    let (h, _tmp) = build_finished_sbatch_handle(uuid, jobid).await;
+    let expected_uuid = h.uuid();
+    let expected_jobid = h.jobid();
+
+    let dyn_h: Arc<dyn DynJobHandleCommon> = into_dyn(h);
+
+    assert_eq!(dyn_h.uuid(), expected_uuid);
+    assert_eq!(dyn_h.jobid(), expected_jobid);
+    assert_eq!(dyn_h.kind(), "sbatch");
+    assert!(dyn_h.is_finished());
+    assert!(!dyn_h.is_running());
+    assert_eq!(dyn_h.exit_code(), Some(0));
+
+    let json = dyn_h.snapshot_json();
+    assert!(json.is_object(), "snapshot_json should be a JSON object");
+    assert_eq!(
+        json.get("uuid").and_then(|v| v.as_str()),
+        Some(expected_uuid.to_string().as_str()),
+        "uuid must round-trip into JSON: {json}"
+    );
+    assert_eq!(json.get("jobid").and_then(|v| v.as_u64()), Some(jobid));
+    // The static `kind` discriminator is exposed separately via `kind()`
+    // and is NOT part of the snapshot's serde body — the file-store writes
+    // it as an envelope sibling, not nested inside the snapshot fields.
+}
+
+#[tokio::test]
+async fn into_dyn_tssrun_preserves_kind_and_getters() {
+    let uuid = Uuid::now_v7();
+    let jobid = 99_u64;
+    let h = build_finished_tssrun_handle(uuid, jobid).await;
+    let expected_uuid = h.uuid();
+
+    let dyn_h: Arc<dyn DynJobHandleCommon> = into_dyn(h);
+
+    assert_eq!(dyn_h.uuid(), expected_uuid);
+    assert_eq!(dyn_h.jobid(), Some(jobid));
+    assert_eq!(dyn_h.kind(), "tssrun");
+    assert!(dyn_h.is_finished());
+
+    let json = dyn_h.snapshot_json();
+    assert!(json.is_object());
+    assert_eq!(
+        json.get("uuid").and_then(|v| v.as_str()),
+        Some(expected_uuid.to_string().as_str()),
+        "uuid must round-trip into JSON: {json}"
+    );
+    assert_eq!(json.get("jobid").and_then(|v| v.as_u64()), Some(jobid));
+}
+
+#[tokio::test]
+async fn dyn_handles_can_be_held_in_a_heterogenous_vec() {
+    let sbatch_uuid = Uuid::now_v7();
+    let tssrun_uuid = Uuid::now_v7();
+    let (s, _tmp) = build_finished_sbatch_handle(sbatch_uuid, 1234).await;
+    let t = build_finished_tssrun_handle(tssrun_uuid, 56).await;
+
+    let handles: Vec<Arc<dyn DynJobHandleCommon>> = vec![into_dyn(s), into_dyn(t)];
+
+    let kinds: Vec<&'static str> = handles.iter().map(|h| h.kind()).collect();
+    assert_eq!(kinds, vec!["sbatch", "tssrun"]);
+
+    let uuids: Vec<Uuid> = handles.iter().map(|h| h.uuid()).collect();
+    assert_eq!(uuids, vec![sbatch_uuid, tssrun_uuid]);
 }

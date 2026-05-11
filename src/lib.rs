@@ -71,7 +71,12 @@ pub use sbatch::parse::{parse_submitted_jobid, resolve_log_path};
 pub use store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
 
 // Phase 3 P3: cross-backend handle trait.
-pub use handle::JobHandleCommon;
+// Phase 3 P4: dyn-safe companion + type-erasure adapter. The
+// `handle::into_dyn` free function is intentionally NOT re-exported at
+// the crate root because `dispatcher::into_dyn` already lives there;
+// callers should write `slurm_async_runner::handle::into_dyn(h)` or
+// `use slurm_async_runner::handle::into_dyn as into_dyn_handle;`.
+pub use handle::{DynHandleAdapter, DynJobHandleCommon, JobHandleCommon};
 
 #[cfg(test)]
 mod tests {
