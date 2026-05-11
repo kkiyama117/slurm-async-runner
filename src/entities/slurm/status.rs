@@ -87,6 +87,33 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// True for states that mean "the job is currently using compute".
+    /// Per SLURM convention: only `Running` qualifies. Pending/Configuring
+    /// /Suspended/etc. do NOT count as running.
+    pub fn is_running(&self) -> bool {
+        matches!(self, JobState::Running)
+    }
+
+    /// True if the state means the job will never run again (`Completed`,
+    /// `Failed`, `Cancelled`, `Timeout`, etc.). Pending/Running/etc. are NOT
+    /// terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobState::Completed
+                | JobState::BootFail
+                | JobState::Cancelled
+                | JobState::Deadline
+                | JobState::Failed
+                | JobState::NodeFail
+                | JobState::OutOfMemory
+                | JobState::Preempted
+                | JobState::Revoked
+                | JobState::SpecialExit
+                | JobState::Timeout
+        )
+    }
+
     /// Parse a raw `squeue` / `sacct` state token.
     ///
     /// Accepts SLURM long forms (`"PENDING"`, `"OUT_OF_MEMORY"`, …),
@@ -105,18 +132,28 @@ impl JobState {
             "SUSPENDED" | "S" => Self::Suspended,
             "STOPPED" | "ST" => Self::Stopped,
 
-            "RUNNING" | "R" => Self::Running,
+            // KUDPC qgroup -l active token
+            "RUNNING" | "R" | "RUN" => Self::Running,
             "COMPLETING" | "CG" => Self::Completing,
             "RESIZING" | "RS" => Self::Resizing,
             "SIGNALING" | "SI" => Self::Signaling,
             "STAGE_OUT" | "SO" => Self::StageOut,
 
-            "COMPLETED" | "CD" => Self::Completed,
+            // KUDPC qgroup -l pending token
+            "QUE" => Self::Pending,
+
+            // KUDPC qgroup -l completed tokens. `FINI` is a one-way
+            // alias: parse maps it to Completed but `as_token` returns
+            // the SLURM canonical `COMPLETED`.
+            "COMPLETED" | "CD" | "CMP" | "FINI" => Self::Completed,
 
             "BOOT_FAIL" | "BF" => Self::BootFail,
             "CANCELLED" | "CA" => Self::Cancelled,
             "DEADLINE" | "DL" => Self::Deadline,
-            "FAILED" | "F" => Self::Failed,
+            // KUDPC qgroup -l failed token. `FAIL` is a one-way alias:
+            // parse maps it to Failed but `as_token` returns the SLURM
+            // canonical `FAILED`. Symmetric with `FINI` → `Completed`.
+            "FAILED" | "F" | "FAIL" => Self::Failed,
             "NODE_FAIL" | "NF" => Self::NodeFail,
             "OUT_OF_MEMORY" | "OOM" => Self::OutOfMemory,
             "PREEMPTED" | "PR" => Self::Preempted,
@@ -163,6 +200,17 @@ impl JobState {
 
             Self::Unknown => "UNKNOWN",
         }
+    }
+}
+
+/// Renders the canonical SLURM long-form token (UPPERCASE, e.g.
+/// `"PENDING"`, `"OUT_OF_MEMORY"`). Matches [`JobState::as_token`], so
+/// `state.to_string() == state.as_token()`. Used in user-facing
+/// messages (errors, logs) for consistency with `sacct` / `squeue`
+/// output.
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_token())
     }
 }
 
@@ -443,6 +491,31 @@ mod tests {
         assert_eq!(JobState::parse("CANCELLED by 1234"), JobState::Cancelled);
     }
 
+    /// KUDPC `qgroup -l` emits `FINI` for finished jobs. Must map to
+    /// `Completed` (which is `is_terminal()`) so `wait_terminal` exits.
+    /// `as_token` still returns the SLURM canonical `COMPLETED` — `FINI`
+    /// is a one-way input alias only.
+    #[test]
+    fn job_state_parse_kudpc_fini_token_maps_to_completed() {
+        let st = JobState::parse("FINI");
+        assert_eq!(st, JobState::Completed);
+        assert!(st.is_terminal(), "FINI must be treated as terminal");
+        assert_eq!(st.as_token(), "COMPLETED");
+    }
+
+    /// KUDPC `qgroup -l` emits `FAIL` for jobs whose script exited
+    /// non-zero. Must map to `Failed` (terminal) so `wait_terminal`
+    /// exits and `refresh_with_sacct` proceeds to resolve the actual
+    /// exit code. `as_token` returns the SLURM canonical `FAILED` —
+    /// `FAIL` is a one-way input alias only. Symmetric with `FINI`.
+    #[test]
+    fn job_state_parse_kudpc_fail_token_maps_to_failed() {
+        let st = JobState::parse("FAIL");
+        assert_eq!(st, JobState::Failed);
+        assert!(st.is_terminal(), "FAIL must be treated as terminal");
+        assert_eq!(st.as_token(), "FAILED");
+    }
+
     #[test]
     fn job_state_parse_padding_and_case() {
         assert_eq!(JobState::parse("  RUNNING  "), JobState::Running);
@@ -467,6 +540,13 @@ mod tests {
     fn job_state_as_token_round_trips() {
         for s in all_states() {
             assert_eq!(JobState::parse(s.as_token()), s, "round-trip for {s:?}");
+        }
+    }
+
+    #[test]
+    fn job_state_display_matches_as_token() {
+        for s in all_states() {
+            assert_eq!(s.to_string(), s.as_token(), "Display mismatch for {s:?}");
         }
     }
 

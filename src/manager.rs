@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::JobStatus;
 use crate::dispatcher::{DryRunDispatcher, JobDispatcher, TokioDispatcher};
@@ -54,16 +54,11 @@ impl SlurmCmd {
 
     /// Build the argv that would dispatch `batch_file`.
     ///
-    /// The path is resolved to absolute form via `std::path::absolute`
+    /// The path is resolved to absolute form via `crate::util::path::absolutize`
     /// (matches Python `Path.absolute()` — no symlink resolution, no
     /// existence requirement).
     pub fn build_argv(&self, batch_file: &Path) -> Result<Vec<String>> {
-        let abs = std::path::absolute(batch_file)
-            .with_context(|| format!("failed to absolutize {}", batch_file.display()))?;
-        let abs_str = abs
-            .into_os_string()
-            .into_string()
-            .map_err(|os| anyhow::anyhow!("non-UTF8 batch path: {os:?}"))?;
+        let abs_str = crate::util::path::absolutize(batch_file)?;
         Ok(vec![self.srun_cmd.clone(), abs_str])
     }
 }

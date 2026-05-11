@@ -61,19 +61,38 @@ cargo test --lib -- --nocapture      # println! を見たい時
 
 ```bash
 cargo test --test tssrun_integration
+cargo test --test job_handle_common
 ```
 
 `tests/tssrun_integration.rs` は `bash` を `tssrun` のスタブとして使い、
 `spawn → wait → snapshot → attach_file` の一連を実行します。
+
+`tests/job_handle_common.rs` は PR #7 で追加した跨 backend contract
+test。`sbatch::SbatchJobHandle` と `tssrun::TssrunJobHandle` の両方に対して
+generic な `assert_common_contract<H: JobHandleCommon>` を回し、コア 5
+sync getter (`uuid` / `jobid` / `is_running` / `is_finished` /
+`exit_code`) と `snapshot` / `watch` / `refresh` / `wait_terminal` の
+挙動が同一であることを検証します。新 backend を `JobHandleCommon` に
+追加した場合は、ここに fixture を 1 つ + テスト 1 行を足すだけで済みます。
 
 ### 3.3 Python 単体（クラスタ不要）
 
 ```bash
 uv run pytest python/tests -v
 uv run pytest python/tests/test_tssrun.py -v
+uv run pytest python/tests/test_sbatch.py -v       # PR #6
+uv run pytest python/tests/test_protocol.py -v     # PR #7
 ```
 
 `maturin develop` 後でないと `_slurm_async_runner_core` が見えないので注意。
+
+`test_protocol.py` は **`slurm_async_runner.JobHandleCommon`** Protocol
+が `SbatchJobHandle` / `TssrunJobHandle` の両方に対して `isinstance`
+で通り、かつ実際の call shape (PR #7 で sync 化された `uuid` /
+`jobid` / `is_running` / `is_finished` / `exit_code`) も一致することを
+verify します。前者の structural type check と後者の runtime call の
+両方を持っておくことで、`runtime_checkable` が name のみを見る性質
+（PR #7 review の HIGH severity 指摘）に対する回帰を防ぎます。
 
 ### 3.4 Python ライブテスト（要 ECCS / kudpc 環境）
 
@@ -95,6 +114,24 @@ TSSRUN_LIVE_QUEUE="<group-queue>" \
   uv run python scripts/test_tssrun_live.py
 ```
 
+sbatch サブシステムの live smoke は `scripts/test_sbatch_live.py` で
+**success (`exit 0`) と failure (`exit 7`) の 2 ケース**を順に流します
+(PR #14 で failure case 追加)。両ケースとも `wait_terminal` →
+`refresh_with_sacct` → `attach_uuid` round-trip まで一気通貫で検証する
+ので、`is_finished() == true` と `exit_code() == Some(N)` の両方が
+KUDPC 上で正しく伝播することを確認できます。
+
+```bash
+SBATCH_LIVE_QUEUE="<group-queue>" \
+TMPDIR="$HOME/.cache/sbatch-live" \
+  uv run python scripts/test_sbatch_live.py
+```
+
+`SBATCH_LIVE_POLL_INTERVAL`（既定 `10`、ライブ smoke 用に
+`SbatchManager` 既定の 60 s より短く設定）, `SBATCH_LIVE_TIMEOUT`
+（既定 `180`）, `SBATCH_LIVE_TIME_LIMIT` / `SBATCH_LIVE_RSC` /
+`SBATCH_LIVE_BIN` で site 固有のチューニングが可能。
+
 ### 3.5 Lint / Format
 
 ```bash
@@ -107,6 +144,33 @@ uv run ruff format --check python/
 
 CI が `-D warnings` で clippy を回しているので、警告 1 つでも残ると
 落ちます。
+
+### 3.6 Pre-commit Hooks (local autofix)
+
+[`.pre-commit-config.yaml`](../.pre-commit-config.yaml) は `ruff check --fix` /
+`ruff format` / `cargo clippy --fix` / `rustfmt` (edition 2024, see
+[`rustfmt.toml`](../rustfmt.toml)) を commit 前に走らせ、CI と同じチェックを
+ローカルで autofix 付きで実行します。
+
+クローン直後のワンタイム設定:
+
+```bash
+uv tool install pre-commit          # または: pipx install pre-commit
+pre-commit install                  # .git/hooks/pre-commit を登録
+```
+
+リポジトリ全体に手動で sweep:
+
+```bash
+pre-commit run --all-files
+```
+
+hook がファイルを書き換えた場合は commit が中断されるので、差分を確認した上
+で `git add -u && git commit` で再投入してください。フレッシュなクローンでは
+`cargo clippy` がワークスペース全体をコンパイルするため最初の commit が遅く
+なりますが、以降は cargo キャッシュに乗ります。緊急時は
+`git commit --no-verify` で hook をバイパスできますが、CI で同じチェックが
+走るので push 前には必ず修正してください。
 
 ## 4. `.pyi` 型スタブの再生成
 
@@ -162,13 +226,18 @@ symbol になります。下流は `default-features = false`、または
 新しく doctest を書く場合は `feature = "pyo3"` 配下にあるシンボルが
 Rust-only ビルド経路でも見えるかを意識してください。
 
-### 5.5 `JobHandle::wait()` の二重呼び出し
+### 5.5 `TssrunJobHandle::wait()` の二重呼び出し
 
 `Option<JoinHandle>` の `.take()` 設計上、2 回目は
 `Err("not owner of the child / already waited")` になります。
 attach 済みハンドルでも同様。テストで再現する場合は
 `tssrun_integration.rs` の `spawn_then_wait_then_snapshot_then_attach`
 を参考に。
+
+> `TssrunJobHandle` は PR #7 で `JobHandle` から rename されました。
+> 旧名の `#[deprecated]` alias は PR #11 で削除されているため、
+> `JobHandle` / `JobHandleSnapshot` を import している既存コードは
+> `TssrunJobHandle` / `TssrunJobSnapshot` に置換してください。
 
 ### 5.6 `live_env()` が ECCS 上で `Err` を返す
 
@@ -207,6 +276,36 @@ surfaced していました）。
 `salloc:` バナーがパースされて `snapshot.jobid` がセットされてからでないと
 ヒットしません。spawn 直後だと `snapshot.jobid` はまだ `None` です。
 長期参照には `attach_uuid`（UUID v7 primary key）を使うのが安全です。
+
+### 5.9 KUDPC で `handle.is_finished()` が常に `False`、`exit_code()` が `None`
+
+ライブ実行で sbatch handle が「終わっているはずなのに状態が更新されない」
+症状を踏んだ場合、原因は 3 系統あります（PR #14 で全部直しています）:
+
+1. **`qgroup -l` の STAT トークンが未マッピングで `JobState::Unknown` 扱い**。
+   KUDPC は終端を `FINI` (success) / `FAIL` (failure) で出すので、未知の
+   トークンは `src/entities/slurm/status.rs::JobState::parse` の `match`
+   に追加 (input-only alias、`as_token()` は SLURM 正規語彙を維持)。
+2. **`refresh_with_sacct` が sacct を呼ぶ条件**は「`lifecycle.finished` が
+   None かつ (`left_active_listing` OR `last_observed_state.is_terminal()`)」。
+   FINI/FAIL を観測した直後で qgroup から消えるまでにラグがあるケースは
+   `observed_terminal` branch でカバー（`src/sbatch/handle.rs:399`）。
+3. **`watch::Sender::send` は receiver 0 のとき値を更新しない**。これは
+   tokio の仕様。`SbatchJobHandle::new` / `TssrunJobHandle::new` は初期
+   receiver を drop するので、`.watch()` を呼ばないユーザに対しては
+   常に receiver 0 になる。**`send_replace` を使うこと** (PR #14 で 6
+   箇所すべてを置換済み)。新しい refresh 経路を増やすときも必ず
+   `snapshot_tx.send_replace(snap.clone())` を呼ぶ。詳細は
+   `docs/architecture.md` §3.5 設計判断 #6。
+
+### 5.10 sbatch がエラーで落ちたのに `SubmitFailed.output` が空
+
+PR #14 までの `TokioDispatcher::capture` は stdout だけを返し stderr を
+捨てていた。sbatch / scancel が失敗すると `sbatch: error: ...` は stderr
+に出るので、`SbatchSpawnError::SubmitFailed::output` が空になって診断
+不能になっていた。現在は stdout 末尾に `[stderr]` マーカー区切りで stderr
+を結合する（`src/dispatcher.rs::TokioDispatcher::capture`）。line-based
+パーサ群は `[stderr]` マーカーを skip するので非破壊。
 
 ## 6. CI と同じ条件をローカルで回す
 
@@ -260,11 +359,25 @@ tssrun (which is setuid).
 - [ ] `cargo fmt --check` を通す
 - [ ] `cargo clippy --all-targets -- -D warnings` を通す
 - [ ] `cargo test --lib` を通す
+- [ ] `cargo test --test job_handle_common` を通す（PR #7 で導入した跨 backend contract）
 - [ ] `uv run maturin develop && uv run pytest python/tests -v` を通す
 - [ ] `uv run ruff check python/` と `ruff format --check python/` を通す
 - [ ] 公開 API を変えたら `README.md` と `CHANGELOG.md` を更新
 - [ ] 必要に応じて `docs/` 配下も更新（特にこのファイルか `architecture.md`）
-- [ ] `tssrun` 周りに触ったら、可能であれば実機ライブテスト（§3.4）も走らせる
+- [ ] `tssrun` / `sbatch` 周りに触ったら、可能であれば実機ライブテスト
+      （§3.4 の `RUN_LIVE_TSSRUN=1` / `scripts/test_sbatch_live.py`）も走らせる
+- [ ] **跨 backend handle 不変条件** (`docs/architecture.md` §6):
+  - [ ] `JobSnapshot::kind()` 文字列 (`"sbatch"` / `"tssrun"`) を rename していない
+  - [ ] `JobHandleCommon::refresh()` から `sacct` を呼んでいない
+  - [ ] `SbatchJobHandle::refresh()` の array-task branch
+        (`array_task_id.is_some()`) が `qgroup -l` を skip して
+        `<master>_<idx>` 形式の squeue クエリを使っている (PR #12)
+  - [ ] dyn 化が必要な場合は `crate::handle::into_dyn` を経由
+        (blanket impl 追加禁止)
+  - [ ] watch チャンネル更新は **`snapshot_tx.send_replace(snap.clone())`**
+        を使う。`let _ = snapshot_tx.send(...)` は receiver 0 で値が更新
+        されず、Python 側の `is_finished()` / `exit_code()` が spawn 時
+        default に凍結する (PR #14、§5.9)
 
 ## 8. リリース
 

@@ -3,100 +3,35 @@
 Async SLURM job dispatcher and lifecycle-status query backend, implemented in
 Rust and exposed to Python via [pyo3] + [pyo3-async-runtimes].
 
-This is the Rust port of the original pure-Python `slurm-async-runner`. The
-public Python API is intentionally compatible: callers continue to `await`
-coroutines that wrap the same set of operations.
+Two job-submission backends share a common handle contract:
+
+- **[`tssrun`](#tssrun-background-mode--env-inspection)** — background
+  `salloc` + `srun` flow for the Kyoto-U ECCS / KUDPC interactive batch
+  frontend. Non-blocking spawn, lock-free snapshot getters, cross-process
+  attach via UUID v7 primary key, `/proc/<pid>/environ` live inspection.
+- **[`sbatch`](#sbatch-queue-managed-batch-jobs)** — queue-managed batch
+  jobs (`sbatch --array=<spec>` / `--dependency` / `--mail-*` / `--signal`
+  / `--no-requeue` / `--comment` / typed export). Polling-based wait via
+  `qgroup -l` → `squeue` → `sacct`, idempotent `cancel(jobid)`,
+  `refresh_with_sacct()` for terminal exit-code discovery.
+
+Both expose the same five sync getters (`uuid` / `jobid` / `is_running()` /
+`is_finished()` / `exit_code()`) and async `refresh()` / `wait_terminal()`
+contract — see [Cross-backend handle abstraction](#cross-backend-handle-abstraction-jobhandlecommon).
 
 [pyo3]: https://pyo3.rs/
 [pyo3-async-runtimes]: https://github.com/PyO3/pyo3-async-runtimes
 
-## Public API
+> **Low-level `srun` primitive.** A minimal `SlurmCmd` / `SlurmManager` API
+> wrapping `srun` directly (`run_job` / `query_job_state` /
+> `query_job_states_batch`) is also exposed for test harnesses and custom
+> backend prototypes. See [`docs/architecture.md`](docs/architecture.md)
+> §3.1–§3.3 (including §3.3.1 usage example) for the rationale and code.
 
-### Rust
-
-```rust
-use slurm_async_runner::{
-    SlurmCmd, SlurmManager,
-    JobDispatcher, TokioDispatcher, DryRunDispatcher,
-    JobStatus, JobState, JobReason,
-    // tssrun vocabulary lives in this crate (migrated out of gaussian_job_shared in PR #5):
-    JobPartition, JobTimeLimit, Memory, MemoryUnit,
-    ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
-    query_job_states_batch, query_job_states_batch_with,
-};
-use std::path::Path;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let manager = SlurmManager::default(); // launcher = "srun"
-
-    // Dispatch a batch script.
-    let exit_code = manager.run_job(Path::new("./job.sh"), false).await?;
-
-    // Query lifecycle status (squeue then sacct fallback).
-    let status: JobStatus = manager.query_job_state(12345).await?;
-    println!("state={:?} reason={:?}", status.state, status.reason);
-
-    // Bulk query.
-    let states = manager.query_job_states_batch(&[12345, 12346]).await?;
-
-    // Plug in a custom dispatcher (e.g. for tests or a remote backend).
-    let dry = DryRunDispatcher;
-    manager.run_job_with(&dry, Path::new("./job.sh")).await?;
-    Ok(())
-}
-```
-
-### Python
-
-```python
-import asyncio
-from slurm_async_runner._slurm_async_runner_core.manager import SlurmCmd, SlurmManager
-from slurm_async_runner._slurm_async_runner_core.runner import query_job_states_batch
-from slurm_async_runner._slurm_async_runner_core.entities.slurm.status import JobStatus
-
-async def main():
-    manager = SlurmManager()                      # launcher = "srun"
-    # Or override:
-    manager = SlurmManager(SlurmCmd(srun_cmd="srun"))
-
-    code: int = await manager.run_job("./job.sh", dry_run=False)
-    status: JobStatus = await manager.query_job_state(12345)
-    states: dict[int, JobStatus] = await manager.query_job_states_batch([12345, 12346])
-
-    # Module-level helper:
-    states = await query_job_states_batch([12345, 12346])
-
-asyncio.run(main())
-```
-
-`JobStatus` carries `(state, reason)` and is parsed from SLURM's `squeue`
-output (`-o "%i %T %r"`) with an `sacct` fallback for completed jobs. The
-state/reason vocabularies (24 official states, ~80 reason codes, with
-`Unknown` / `Other(String)` forward-compat fallbacks) live in this crate's
-`entities::slurm` module, re-exposed to Python via
-`slurm_async_runner._slurm_async_runner_core.entities.slurm.*`. They were
-migrated out of [`gaussian_job_shared`](https://github.com/kkiyama117/gaussian_job_shared)
-in PR #5 (single-owner rule for pyclass wrappers).
-
-## Architecture
-
-The crate is split along two axes:
-
-| Layer | Type | Concern |
-|-------|------|---------|
-| Spec | `SlurmCmd`, `SlurmManager` | Pure data + argv builders. No I/O. |
-| Runtime | `JobDispatcher` trait, `TokioDispatcher`, `DryRunDispatcher` | Subprocess execution. Swappable. |
-| Query | `runner::query_job_states_batch_with` | `squeue` then `sacct` fallback parsing. |
-
-This separation lets tests substitute mock dispatchers without spawning real
-processes, and keeps the spec layer language-agnostic so the same argv builder
-feeds both the Rust runtime and a Python `asyncio.create_subprocess_exec`
-runtime.
-
-No shell wrapping (`$SHELL -c "..."`) is used — both Python's
-`asyncio.create_subprocess_exec` and Rust's `tokio::process::Command::args`
-accept argv directly.
+> **Looking for in-depth docs?** This README covers the public API surface
+> only. For the full architecture, code map, runtime flows, development
+> workflow, and live-cluster operator checklist, start from the
+> documentation index at [`docs/README.md`](docs/README.md).
 
 ## tssrun (background mode + env inspection)
 
@@ -129,36 +64,28 @@ async def main():
     )
 
     handle = await manager.spawn()
-    print("uuid", await handle.uuid, "pid", await handle.pid, "jobid", await handle.jobid)
+    # uuid / jobid are sync `@property` getters (Phase 3 P5); pid is still async.
+    print("uuid", handle.uuid, "pid", await handle.pid, "jobid", handle.jobid)
     code = await handle.wait()  # int on normal exit, None on signal kill
     print("exit", code)
 
 asyncio.run(main())
 ```
 
-> **PR #5 migration note.** `Resource(processes=4, memory="2G")` is gone —
-> use `ResourceSpec(processes=4, memory=Memory("2G"))` instead. `queue=`
-> was renamed to `partition=` (matching Slurm's `--partition` flag), and
-> `time_limit=` now expects a `JobTimeLimit(...)` value instead of a raw
-> string. `TssrunManager` no longer accepts `state_dir=`; pass
-> `store=file_system_state_store(path)` (or omit `store=` for the default
-> in-memory backend). `ResourceSpec` and `JobTimeLimit` are re-exported
-> from the `tssrun` submodule for one-stop import; `Memory` lives in
-> `entities.slurm.sbatch_options`.
-
 ### Handle API contract
 
-`TssrunJobHandle` returns awaitables for all reads, but the **snapshot
-getters are lock-free against an in-flight `wait()`** — you can poll
-liveness while the wait is pending without blocking it:
+`TssrunJobHandle` exposes a mix of **sync snapshot getters** and async
+operations. All snapshot reads are lock-free against an in-flight
+`wait()` / `refresh()` / `wait_terminal()` — you can poll liveness
+while a wait is pending without blocking it:
 
 ```python
 handle = await manager.spawn()
 wait_fut = asyncio.ensure_future(handle.wait())
 
 while not wait_fut.done():
-    if await handle.is_running():
-        print("jobid", await handle.jobid, "node", await handle.node)
+    if handle.is_running():                      # sync (Phase 3 P5)
+        print("jobid", handle.jobid, "node", await handle.node)
     await asyncio.sleep(1)
 
 code = await wait_fut
@@ -166,20 +93,29 @@ code = await wait_fut
 
 The full snapshot surface:
 
-| Reader (lock-free) | Returns | Notes |
-|---|---|---|
-| `await handle.uuid` | `str` | UUID v7 primary key (canonical hyphenated string). Pass straight back to `attach_uuid` |
-| `await handle.pid` | `int` | The OS pid of the spawned `tssrun` process |
-| `await handle.jobid` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
-| `await handle.node` | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
-| `await handle.sent_env` | `dict[str, str]` | Env explicitly passed via `TssrunCmd.env` |
-| `await handle.live_env()` | `dict[str, str] \| None` | Reads `/proc/<pid>/environ` on Linux; `None` off-Linux or after exit |
-| `await handle.is_running()` | `bool` | `True` until the wait task records `finished` |
-| `await handle.exit_code()` | `int \| None` | Available after exit; `None` for signal kill |
+| Reader (lock-free) | Shape | Returns | Notes |
+|---|---|---|---|
+| `handle.uuid` | sync `@property` | `str` | UUID v7 primary key (canonical hyphenated string). Pass straight back to `attach_uuid` |
+| `await handle.pid` | async | `int` | The OS pid of the spawned `tssrun` process |
+| `handle.jobid` | sync `@property` | `int \| None` | Parsed from `salloc: Granted job allocation N` |
+| `await handle.node` | async | `str \| None` | Parsed from `salloc: Nodes <spec> are ready for job` |
+| `await handle.sent_env` | async | `dict[str, str]` | Env explicitly passed via `TssrunCmd.env` |
+| `await handle.live_env()` | async | `dict[str, str] \| None` | Reads `/proc/<pid>/environ` on Linux; `None` off-Linux or after exit |
+| `handle.is_running()` | sync | `bool` | `True` until the wait task records `finished` |
+| `handle.is_finished()` | sync | `bool` | Inverse of `is_running()` |
+| `handle.exit_code()` | sync | `int \| None` | Available after exit; `None` for signal kill |
 
 | Owner-only | Returns | Notes |
 |---|---|---|
 | `await handle.wait()` | `int \| None` | `int` = exit code; `None` = killed by signal (SLURM time-limit kill, OOM, etc.). Raises `RuntimeError` on attached / already-waited handles. |
+| `await handle.refresh()` | `None` | Re-reads persisted snapshot and broadcasts it. Read the updated state via the sync getters above. Available on attached handles too. |
+| `await handle.wait_terminal(poll_interval_secs)` | `None` | Polls via `refresh()` until `is_finished()` flips. Mirrors `SbatchJobHandle::wait_terminal`. Read the terminal `exit_code` via the sync getter after the await resolves. |
+
+> Rust's `TssrunJobHandle::refresh` / `wait_terminal` return
+> `Result<TssrunJobSnapshot>` — the Python pyo3 wrappers intentionally
+> drop the snapshot return so Python callers go through the lock-free
+> getters / `JobHandleCommon` Protocol contract instead of two parallel
+> read paths.
 
 ### Cross-process attach
 
@@ -202,6 +138,92 @@ Attached handles support every snapshot getter (they reflect the JSON's
 last-known state) but `wait()` raises — only the original spawner owns
 the child. Pids can be recycled by the kernel, so prefer `attach_uuid`
 for any long-lived reference.
+
+For the tssrun spawn / `salloc:` parsing / attach sequence diagrams (the four
+`AttachKey` variants and how they resolve through `JobStateStore`), read
+[`docs/process-flow.md`](docs/process-flow.md), and see
+[`docs/architecture.md`](docs/architecture.md) §3 for the tssrun subsystem
+design rationale.
+
+## sbatch (queue-managed batch jobs)
+
+`crate::sbatch` (Rust) and
+`slurm_async_runner._slurm_async_runner_core.sbatch` (Python) provide
+the same spawn / attach surface for jobs submitted with `sbatch`
+instead of `tssrun`. Snapshots persist alongside tssrun's in the same
+state directory (the `kind` discriminator field in
+`{root}/<uuid>.json` keeps the two backends separated). Typed
+flag entities live in `crate::entities::slurm::sbatch_options::*` and
+re-export as pyclasses under
+`slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options`
+(e.g. `SlurmDependency`, `SlurmSignalSpec`, `MailTypeInput`,
+`SlurmArraySpec`).
+
+`SbatchManager` mirrors `TssrunManager`:
+
+| Operation | Method | Notes |
+|---|---|---|
+| Submit single job | `await mgr.spawn(cmd)` | Returns `SbatchJobHandle` |
+| Submit `--array=<spec>` | `await mgr.spawn_array(cmd, array_spec)` | Returns `list[SbatchJobHandle]` (one per task) |
+| Submit + block until terminal | `await mgr.run(cmd)` | Returns `FinishedInfo`. Rejects array submissions. |
+| Cancel | `await mgr.cancel(jobid)` | Idempotent (delegates to `scancel`). |
+| Attach by uuid / jobid / file / array | `await mgr.attach_*` | All entry points peek the `kind` discriminator. |
+
+`SbatchJobHandle` exposes the same five sync getters (`uuid`,
+`jobid`, `is_running()`, `is_finished()`, `exit_code()`) plus an
+opt-in `refresh_with_sacct()` that calls `sacct` for terminal exit-code
+discovery. See
+[`docs/superpowers/specs/2026-05-10-sbatch-module-design.md`](docs/superpowers/specs/2026-05-10-sbatch-module-design.md)
+and the Phase 2 / Phase 3 entries in [`CHANGELOG.md`](CHANGELOG.md)
+for the full design rationale.
+
+For the `wait_terminal` → `refresh_with_sacct` → `qgroup -l` → `squeue` →
+`sacct` chain (including FINI/FAIL terminal recognition and the sacct gating
+heuristic), read [`docs/process-flow.md`](docs/process-flow.md) §5, and see
+[`docs/architecture.md`](docs/architecture.md) §3.5 for the sbatch design
+judgements (poll-cadence default, watch `send_replace` invariant, sacct as
+heavyweight opt-in).
+
+## Cross-backend handle abstraction (`JobHandleCommon`)
+
+Both `SbatchJobHandle` and `TssrunJobHandle` implement the
+`JobHandleCommon` trait (Rust) / Protocol (Python), so dashboards and
+orchestration code can stay backend-agnostic.
+
+```rust
+use slurm_async_runner::{JobHandleCommon, handle::into_dyn};
+use std::time::Duration;
+
+async fn watch_until_done<H: JobHandleCommon>(h: H) -> anyhow::Result<()> {
+    let snap = h.wait_terminal(Duration::from_secs(5)).await?;
+    println!("done, exit_code={:?}", snap.exit_code());
+    Ok(())
+}
+
+// Heterogenous collection: mix sbatch + tssrun handles in one Vec.
+let dyn_handles: Vec<std::sync::Arc<dyn slurm_async_runner::handle::DynJobHandleCommon>> = vec![
+    into_dyn(sbatch_handle),
+    into_dyn(tssrun_handle),
+];
+```
+
+```python
+from slurm_async_runner import JobHandleCommon
+
+def describe(h: JobHandleCommon) -> None:
+    print(h.uuid, h.jobid, h.is_running(), h.exit_code())
+
+# Works against either pyo3 backend without importing the concrete class.
+assert isinstance(sbatch_handle, JobHandleCommon)
+assert isinstance(tssrun_handle, JobHandleCommon)
+```
+
+The Rust trait is **not** dyn-safe by design (it carries an associated
+`Snapshot` type); use `crate::handle::into_dyn` to erase into
+`Arc<dyn DynJobHandleCommon>` when you need heterogeneous collections.
+See
+[`docs/superpowers/specs/2026-05-11-sbatch-phase3-design.md`](docs/superpowers/specs/2026-05-11-sbatch-phase3-design.md)
+for the full rationale.
 
 ### Live smoke test on kudpc / ECCS
 
@@ -265,27 +287,22 @@ PyPI publishing is in [`.github/workflows/CI.yml`](.github/workflows/CI.yml).
 
 ### Pre-commit hooks (local autofix)
 
-[`.pre-commit-config.yaml`](.pre-commit-config.yaml) wires `ruff check --fix`,
-`ruff format`, `cargo clippy --fix`, and `rustfmt` (edition 2024, see
-[`rustfmt.toml`](rustfmt.toml)) to run before each commit, mirroring CI but
-with autofix. One-time setup per clone:
+[`.pre-commit-config.yaml`](.pre-commit-config.yaml) mirrors CI with autofix
+(ruff + clippy + rustfmt). One-time setup per clone:
 
 ```bash
 uv tool install pre-commit          # or: pipx install pre-commit
-pre-commit install                  # registers .git/hooks/pre-commit
+pre-commit install
 ```
 
-Manual sweep across the repo:
+See [`docs/development.md`](docs/development.md) §3.6 for the manual-sweep,
+hook-rewrite reconciliation, and bypass workflow.
 
-```bash
-pre-commit run --all-files
-```
-
-When a hook rewrites files, the commit aborts so you can review the diff and
-re-stage (`git add -u && git commit`). The first commit on a fresh clone is
-slow because `cargo clippy` compiles the workspace; subsequent runs hit the
-cargo cache. To bypass hooks in an emergency, use `git commit --no-verify`.
+For the full local dev workflow (live smoke env vars, gotchas around
+`handle.is_finished()` / empty `SubmitFailed.output` / watch `send_replace`
+invariants, PR checklist, stub regeneration), read
+[`docs/development.md`](docs/development.md).
 
 ## License
 
-See repository root.
+MIT.

@@ -6,6 +6,7 @@ pub mod entities;
 pub mod error;
 pub mod manager;
 pub mod runner;
+pub mod sbatch;
 pub mod tssrun;
 
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
@@ -37,6 +38,10 @@ mod slurm_async_runner {
     // ---- tssrun sub-module: slurm_async_runner._slurm_async_runner_core.tssrun ----
     #[pymodule_export]
     use super::tssrun::inner_module as tssrun_module;
+
+    // ---- sbatch sub-module: slurm_async_runner._slurm_async_runner_core.sbatch ----
+    #[pymodule_export]
+    use super::sbatch::inner_module as sbatch_module;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {

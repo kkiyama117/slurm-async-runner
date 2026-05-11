@@ -13,6 +13,8 @@ pub mod dependency;
 
 pub mod resource_spec;
 
+pub mod signal;
+
 pub mod time_limit;
 
 use std::path::PathBuf;
@@ -53,6 +55,18 @@ pub use dependency::{
 // https://web.kudpc.kyoto-u.ac.jp/manual/ja/run/batch#slurm
 // https://slurm.schedmd.com/sbatch.html
 pub use resource_spec::{Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU};
+
+// `SlurmSignalSpec` and `SignalIdent` live in their own file
+// (see [`crate::entities::slurm::sbatch_options::signal`]) so the
+// `--signal` BNF parsing and serde plumbing can be reasoned about in
+// isolation. Re-exported here so existing references such as
+// `crate::entities::slurm::SlurmSignalSpec` keep working.
+//
+//   #SBATCH --signal=USR1@60
+//   #SBATCH --signal=R:SIGTERM@30
+//
+// https://slurm.schedmd.com/sbatch.html (`--signal`)
+pub use signal::{SignalIdent, SlurmSignalSpec};
 
 // `JobTimeLimit` lives in its own file (see [`crate::entities::slurm::time_limit`])
 // so the Slurm `--time` parsing and serde plumbing can be reasoned about in
@@ -101,6 +115,29 @@ impl TryFrom<&str> for MailType {
     }
 }
 
+impl MailType {
+    /// Render this mail type as the canonical uppercase Slurm token
+    /// (`BEGIN`, `END`, `FAIL`, `REQUEUE`, `ALL`).
+    ///
+    /// This is the exact string accepted by sbatch's `--mail-type` flag and
+    /// produced by sacct, so `Display` is implemented in terms of this method.
+    pub const fn as_slurm_str(self) -> &'static str {
+        match self {
+            MailType::BEGIN => "BEGIN",
+            MailType::END => "END",
+            MailType::FAIL => "FAIL",
+            MailType::REQUEUE => "REQUEUE",
+            MailType::ALL => "ALL",
+        }
+    }
+}
+
+impl std::fmt::Display for MailType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_slurm_str())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MailTypeInput(Vec<MailType>);
 
@@ -111,6 +148,22 @@ impl TryFrom<String> for MailTypeInput {
         Ok(MailTypeInput(
             value.split(',').map(MailType::try_from).try_collect()?,
         ))
+    }
+}
+
+impl std::fmt::Display for MailTypeInput {
+    /// Comma-separated rendering matching Slurm's `--mail-type` syntax.
+    /// Round-trips with [`TryFrom<String>`] for any non-empty value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for mt in &self.0 {
+            if !first {
+                f.write_str(",")?;
+            }
+            first = false;
+            std::fmt::Display::fmt(mt, f)?;
+        }
+        Ok(())
     }
 }
 
@@ -161,4 +214,83 @@ pub struct SlurmJobConfig {
     /// p=PROCS:t=THREADSc=CORES:m=MEMORY (or g=GPU)
     #[serde(default)]
     pub resource_spec: Option<ResourceSpec>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mail_type_as_slurm_str_matches_kudpc_tokens() {
+        assert_eq!(MailType::BEGIN.as_slurm_str(), "BEGIN");
+        assert_eq!(MailType::END.as_slurm_str(), "END");
+        assert_eq!(MailType::FAIL.as_slurm_str(), "FAIL");
+        assert_eq!(MailType::REQUEUE.as_slurm_str(), "REQUEUE");
+        assert_eq!(MailType::ALL.as_slurm_str(), "ALL");
+    }
+
+    #[test]
+    fn mail_type_display_matches_as_slurm_str() {
+        for mt in [
+            MailType::BEGIN,
+            MailType::END,
+            MailType::FAIL,
+            MailType::REQUEUE,
+            MailType::ALL,
+        ] {
+            assert_eq!(mt.to_string(), mt.as_slurm_str());
+        }
+    }
+
+    #[test]
+    fn mail_type_display_roundtrips_through_try_from() {
+        for mt in [
+            MailType::BEGIN,
+            MailType::END,
+            MailType::FAIL,
+            MailType::REQUEUE,
+            MailType::ALL,
+        ] {
+            let rendered = mt.to_string();
+            let parsed = MailType::try_from(rendered.as_str()).unwrap();
+            assert_eq!(parsed, mt);
+        }
+    }
+
+    #[test]
+    fn mail_type_input_display_joins_with_commas() {
+        let mti = MailTypeInput::try_from("BEGIN,END".to_string()).unwrap();
+        assert_eq!(mti.to_string(), "BEGIN,END");
+    }
+
+    #[test]
+    fn mail_type_input_display_single_value() {
+        let mti = MailTypeInput::try_from("FAIL".to_string()).unwrap();
+        assert_eq!(mti.to_string(), "FAIL");
+    }
+
+    #[test]
+    fn mail_type_input_display_preserves_order() {
+        let mti = MailTypeInput::try_from("END,BEGIN,FAIL".to_string()).unwrap();
+        assert_eq!(mti.to_string(), "END,BEGIN,FAIL");
+    }
+
+    #[test]
+    fn mail_type_input_display_roundtrips() {
+        let original = MailTypeInput::try_from("ALL".to_string()).unwrap();
+        let rendered = original.to_string();
+        let parsed = MailTypeInput::try_from(rendered).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn signal_types_reachable_from_entities_slurm() {
+        use crate::entities::slurm::{SignalIdent, SlurmSignalSpec};
+        let s = SlurmSignalSpec {
+            allow_resignal: false,
+            signal: SignalIdent::Number(15),
+            seconds_before_end: None,
+        };
+        assert_eq!(s.to_string(), "15");
+    }
 }

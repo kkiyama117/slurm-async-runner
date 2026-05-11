@@ -168,7 +168,8 @@ async def _exercise_backend(
 
     handle = await manager.spawn()
     pid = await handle.pid
-    uuid = await handle.uuid
+    # ``uuid`` is a sync getter (lock-free read off the local watch::Receiver).
+    uuid = handle.uuid
     assert pid > 0, f"[{label}] expected pid > 0, got {pid}"
     # uuid is the canonical hyphenated form, e.g.
     # "0190cc1c-7a48-7c0e-a0a0-1234567890ab" — 36 chars / 4 dashes.
@@ -228,7 +229,8 @@ async def _exercise_backend(
         )
         return 1
 
-    jobid_val = await handle.jobid
+    # Phase 3 P5: ``jobid`` is sync; ``node`` is still async.
+    jobid_val = handle.jobid
     node_val = await handle.node
     print(f"[live:{label}] parsed jobid={jobid_val} node={node_val}")
     assert jobid_val is not None, (
@@ -251,8 +253,8 @@ async def _exercise_backend(
 
         attached = await manager.attach_file(str(snap_path))
         attached_pid = await attached.pid
-        attached_uuid = await attached.uuid
-        attached_jobid = await attached.jobid
+        attached_uuid = attached.uuid
+        attached_jobid = attached.jobid
         attached_node = await attached.node
         assert attached_pid == pid, (label, attached_pid, pid)
         assert attached_uuid == uuid, (label, attached_uuid, uuid)
@@ -276,9 +278,9 @@ async def _exercise_backend(
     # resolves through the store directly to the JSON file; for in-memory
     # it hits the process-local HashMap entry the spawn just inserted.
     attached_by_uuid = await manager.attach_uuid(uuid)
-    assert (await attached_by_uuid.uuid) == uuid, label
+    assert attached_by_uuid.uuid == uuid, label
     assert (await attached_by_uuid.pid) == pid, label
-    assert (await attached_by_uuid.jobid) == jobid_val, label
+    assert attached_by_uuid.jobid == jobid_val, label
     print(f"[live:{label}] attach_uuid round-trip OK")
 
     stdout_text = stdout_log.read_text() if stdout_log.exists() else ""
