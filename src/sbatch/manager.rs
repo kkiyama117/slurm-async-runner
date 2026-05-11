@@ -613,6 +613,53 @@ mod tests {
         assert!(attached.is_empty());
     }
 
+    /// spec §5.6 / issue #8 A6: `attach_array_jobid` must inherit the
+    /// `kind = "sbatch"` peek that already guards the single-snapshot
+    /// attach paths. A `{"kind":"tssrun"}` JSON file sitting in the same
+    /// state dir with the same master jobid must be silently skipped —
+    /// never panicking, never being returned as a snapshot.
+    ///
+    /// The kind check itself lives in
+    /// [`crate::store::decode_with_kind_check`]; this test just pins the
+    /// behaviour at the `attach_array_jobid` entry point so a future
+    /// refactor cannot accidentally bypass it.
+    #[tokio::test]
+    async fn attach_array_jobid_silently_skips_wrong_kind_file() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::ok(90001));
+        let mgr = SbatchManager::new(cmd)
+            .with_state_dir(tmp.path())
+            .with_dispatcher(dispatcher);
+
+        // Plant a tssrun-kind JSON file sharing the master jobid in the
+        // state dir, BEFORE the array submission. `attach_array_jobid`
+        // must skip it via the kind-peek filter and not surface it as a
+        // snapshot.
+        let intruder = tmp.path().join("intruder.json");
+        std::fs::write(
+            &intruder,
+            r#"{"kind":"tssrun","jobid":90001,"uuid":"00000000-0000-0000-0000-000000000000"}"#,
+        )
+        .unwrap();
+
+        // Now spawn a real 2-task array job under the same master jobid.
+        let spec: SlurmArraySpec = "0-1".parse().unwrap();
+        let _ = mgr.spawn_array(spec).await.unwrap();
+
+        let attached = mgr.attach_array_jobid(90001).await.unwrap();
+        assert_eq!(
+            attached.len(),
+            2,
+            "tssrun-kind intruder must be silently skipped; only the 2 array tasks should attach"
+        );
+        // Sanity: both attached handles are real sbatch array tasks.
+        assert!(attached[0].snapshot().array_task_id.is_some());
+        assert!(attached[1].snapshot().array_task_id.is_some());
+    }
+
     #[tokio::test]
     async fn attach_jobid_returns_multiple_match_for_array_master() {
         use crate::entities::slurm::SlurmArraySpec;
