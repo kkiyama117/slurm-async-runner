@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 3 P1 — tssrun naming symmetry
+
+- **Breaking (with alias)**: `tssrun::JobHandle` and `tssrun::JobHandleSnapshot` are renamed to `TssrunJobHandle` and `TssrunJobSnapshot` for naming symmetry with `SbatchJobHandle` / `SbatchJobSnapshot`. Deprecated `pub type` aliases preserve compilation; downstream callers can migrate at their leisure.
+- Crate-root re-exports (`crate::JobHandle`, `crate::JobHandleSnapshot`) remain available via `#[allow(deprecated)]` re-export.
+- Python pyo3 binding names (`TssrunJobHandle`) are unchanged — already named symmetrically.
+- Why: Phase 3 P3 introduces a `JobHandleCommon` trait; symmetric Rust struct naming makes the trait docs and impls read cleanly.
+
 ### Phase 2 P6
 
 - **`SbatchManager::run()`** — submit a single job and block until terminal state, then return `FinishedInfo`. Rejects array submissions early with `SbatchRunError::ArrayNotSupported` (mapped to Python `ValueError`). Polling cadence defaults to 30 s; override via `with_poll_interval` (tests use 1–10 ms).

@@ -9,7 +9,7 @@
 //!   enum); the wall-clock limit is the shared `JobTimeLimit`.
 //! - [`manager::TssrunManager`] — orchestrates `spawn` / `attach` / state
 //!   queries with a shared log sink and (optional) on-disk state directory.
-//! - [`handle::JobHandle`] — owns the spawned child plus background tee
+//! - [`handle::TssrunJobHandle`] — owns the spawned child plus background tee
 //!   tasks that parse `salloc:` lines into a [`watch::Receiver`]-backed
 //!   snapshot. The snapshot is also persisted as JSON via atomic rename.
 //! - [`log::JobLogSink`] — pluggable trait for tee'd stdout/stderr lines.
@@ -20,9 +20,9 @@
 //!
 //! # Concurrency model
 //!
-//! - [`handle::JobHandle::watch`] returns a clonable
+//! - [`handle::TssrunJobHandle::watch`] returns a clonable
 //!   [`watch::Receiver`] over the snapshot. Snapshot reads
-//!   are lock-free against [`handle::JobHandle::wait`], which is the only
+//!   are lock-free against [`handle::TssrunJobHandle::wait`], which is the only
 //!   `&mut self` method (it `.take()`s the join handles exactly once).
 //! - The pyo3 wrapper exploits this so Python users can poll
 //!   `is_running` / `pid` / `jobid` while `await handle.wait()` is in
@@ -30,7 +30,7 @@
 //!
 //! # Exit-status semantics
 //!
-//! [`handle::JobHandle::wait`] returns `Result<Option<i32>>`:
+//! [`handle::TssrunJobHandle::wait`] returns `Result<Option<i32>>`:
 //!
 //! - `Ok(Some(n))` — the child exited normally with code `n`.
 //! - `Ok(None)` — the child was terminated by a signal (e.g. SLURM

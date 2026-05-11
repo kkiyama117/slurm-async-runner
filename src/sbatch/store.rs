@@ -82,15 +82,15 @@ mod tests {
 
     #[tokio::test]
     async fn sbatch_and_tssrun_coexist_in_same_dir() {
-        use crate::tssrun::handle::JobHandleSnapshot;
+        use crate::tssrun::handle::TssrunJobSnapshot;
         let tmp = tempfile::tempdir().unwrap();
         let sb_store: FileSystemStateStore<SbatchJobSnapshot> =
             FileSystemStateStore::new(tmp.path());
-        let ts_store: FileSystemStateStore<JobHandleSnapshot> =
+        let ts_store: FileSystemStateStore<TssrunJobSnapshot> =
             FileSystemStateStore::new(tmp.path());
         sb_store.save(&snap(1)).await.unwrap();
         ts_store
-            .save(&JobHandleSnapshot {
+            .save(&TssrunJobSnapshot {
                 uuid: Uuid::now_v7(),
                 pid: 1,
                 argv: vec![],

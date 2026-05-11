@@ -18,7 +18,7 @@ use crate::py_export::entities::slurm::sbatch_options::time_limit::PyJobTimeLimi
 use crate::tssrun::cmd::TssrunCmd;
 
 use crate::store::JobStateStore;
-use crate::tssrun::handle::{JobHandle, JobHandleSnapshot, read_live_env_for_pid};
+use crate::tssrun::handle::{TssrunJobHandle, TssrunJobSnapshot, read_live_env_for_pid};
 use crate::tssrun::log::{FileLogSink, JobLogSink, NullLogSink, StdLogSink};
 use crate::tssrun::manager::{AttachKey, TssrunManager};
 use crate::tssrun::store::{FileSystemStateStore, InMemoryStateStore};
@@ -119,7 +119,7 @@ fn file_log_sink<'py>(
 
 // ---------- JobStateStore ----------
 
-/// Opaque Python handle to an [`Arc<dyn JobStateStore<JobHandleSnapshot>>`]. Construct via
+/// Opaque Python handle to an [`Arc<dyn JobStateStore<TssrunJobSnapshot>>`]. Construct via
 /// the `in_memory_state_store` / `file_system_state_store` factories and
 /// pass the result to ``TssrunManager(cmd, store=...)``.
 ///
@@ -134,7 +134,7 @@ fn file_log_sink<'py>(
     frozen
 )]
 #[derive(Clone)]
-pub struct PyJobStateStore(pub Arc<dyn JobStateStore<JobHandleSnapshot>>);
+pub struct PyJobStateStore(pub Arc<dyn JobStateStore<TssrunJobSnapshot>>);
 
 /// Build an in-process, in-memory state store.
 ///
@@ -160,30 +160,30 @@ fn file_system_state_store(dir: PathBuf) -> PyJobStateStore {
     PyJobStateStore(Arc::new(FileSystemStateStore::new(dir)))
 }
 
-// ---------- JobHandle ----------
+// ---------- TssrunJobHandle ----------
 
-/// Python view onto a [`JobHandle`].
+/// Python view onto a [`TssrunJobHandle`].
 ///
 /// Holds two pieces of state with **deliberately different sharing**:
 ///
 /// - `rx`: a cloned `watch::Receiver` over the snapshot. Snapshot getters
 ///   (`pid`, `jobid`, `node`, `sent_env`, `is_running`, `exit_code`) read
-///   from this receiver synchronously — no JobHandle mutex, so they are
+///   from this receiver synchronously — no TssrunJobHandle mutex, so they are
 ///   not blocked by an in-flight `wait()` (issue H1 in the original
 ///   review).
-/// - `inner`: a `Mutex<JobHandle>` that exists solely so `wait()` can
+/// - `inner`: a `Mutex<TssrunJobHandle>` that exists solely so `wait()` can
 ///   `.take()` the join handle once. Snapshot getters never touch it.
 #[pyclass(
     name = "TssrunJobHandle",
     module = "slurm_async_runner._slurm_async_runner_core.tssrun"
 )]
 pub struct PyTssrunJobHandle {
-    rx: watch::Receiver<JobHandleSnapshot>,
-    inner: Arc<tokio::sync::Mutex<JobHandle>>,
+    rx: watch::Receiver<TssrunJobSnapshot>,
+    inner: Arc<tokio::sync::Mutex<TssrunJobHandle>>,
 }
 
 impl PyTssrunJobHandle {
-    fn from_handle(handle: JobHandle) -> Self {
+    fn from_handle(handle: TssrunJobHandle) -> Self {
         let rx = handle.watch();
         Self {
             rx,
