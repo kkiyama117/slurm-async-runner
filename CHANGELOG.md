@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 2 P5)
+
+- **`SbatchCmd::array_spec: Option<SlurmArraySpec>`** — wires SLURM
+  `--array` (`-a`). Reuses `crate::entities::slurm::SlurmArraySpec`. Python:
+  `PySbatchCmd(..., array_spec=SlurmArraySpec.parse("0-3"))`.
+- **`SbatchJobSnapshot::{array_jobid, array_task_id}`** — two new
+  `#[serde(default)] Option<...>` fields persisted in the snapshot JSON.
+  `None` for single jobs; `Some(master)` / `Some(idx)` for array tasks.
+  Legacy snapshots without these fields decode to `None`.
+- **`SbatchManager::spawn_array(array_spec)`** — submits a single
+  `sbatch --array=<spec>` invocation, parses the master jobid, and
+  persists one snapshot per task. Returns `Vec<SbatchJobHandle>` in
+  declaration order.
+- **`SbatchManager::attach_array_jobid(master_jobid)`** — returns
+  `Vec<SbatchJobHandle>` for every task snapshot of an array submission,
+  sorted by `array_task_id` ascending.
+- **`SbatchAttachError`** — new typed enum replacing `anyhow::Error` on
+  attach paths. Variants: `NotFound { key }`,
+  `KindMismatch { expected, got }`, `MultipleMatch { jobid, count }`,
+  `Io(#[from] anyhow::Error)`. `attach_jobid` on an array master jobid
+  now returns `MultipleMatch` instead of silently resolving to one task.
+- **`resolve_log_path` extended tokens** — `%A` (master jobid alias),
+  `%a` (array task index), `%u` (`USER` env), `%N` (`HOSTNAME` env,
+  spawn-time best-effort). Existing `%j` / `%x` preserved byte-for-byte.
+- **`expand_array_indices(&SlurmArraySpec) -> Vec<u32>`** — enumerates
+  every task index in a spec, used internally by `spawn_array`.
+- **`JobStateStore::find_all_by_jobid(jobid) -> Result<Vec<S>>`** — new
+  default-impl trait method.
+- **`PySbatchJobHandle.array_jobid` / `array_task_id` getters**.
+
+### Notes
+
+- Array-task-aware `refresh()` (per-task `squeue -j <master>_<idx>`
+  filter) is **deferred to Phase 3**. In P5 each
+  `SbatchJobHandle.refresh()` on an array-task handle still queries
+  by master jobid, so the observed state reflects the master summary
+  rather than the specific task. Per-task log read works correctly
+  because `resolve_log_path` expands `%a`.
+
 ### Added (Phase 2 P4)
 
 - **`crate::entities::slurm::SlurmSignalSpec`** + **`SignalIdent`** — new
