@@ -11,8 +11,9 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use crate::entities::slurm::{
-    JobTimeLimit, MailTypeInput, ResourceSpec, SlurmDependency, SlurmSignalSpec,
+    JobTimeLimit, MailTypeInput, ResourceSpec, SlurmArraySpec, SlurmDependency, SlurmSignalSpec,
 };
+use crate::py_export::entities::slurm::sbatch_options::array_spec::PySlurmArraySpec;
 use crate::py_export::entities::slurm::sbatch_options::config::PyMailTypeInput;
 use crate::py_export::entities::slurm::sbatch_options::dependency::PySlurmDependency;
 use crate::py_export::entities::slurm::sbatch_options::signal::PySlurmSignalSpec;
@@ -54,6 +55,7 @@ impl PySbatchCmd {
         mail_user = None,
         mail_types = None,
         signal = None,
+        array_spec = None,
     ))]
     fn new(
         script: PathBuf,
@@ -73,6 +75,7 @@ impl PySbatchCmd {
         mail_user: Option<String>,
         mail_types: Option<PyMailTypeInput>,
         signal: Option<PySlurmSignalSpec>,
+        array_spec: Option<PySlurmArraySpec>,
     ) -> PyResult<Self> {
         let mut cmd = SbatchCmd::new(script);
         cmd.sbatch_bin = sbatch_bin;
@@ -95,6 +98,7 @@ impl PySbatchCmd {
         cmd.mail_user = mail_user;
         cmd.mail_types = mail_types.map(<PyMailTypeInput as Into<MailTypeInput>>::into);
         cmd.signal = signal.map(<PySlurmSignalSpec as Into<SlurmSignalSpec>>::into);
+        cmd.array_spec = array_spec.map(<PySlurmArraySpec as Into<SlurmArraySpec>>::into);
         Ok(Self(cmd))
     }
 
@@ -142,6 +146,31 @@ impl PySbatchManager {
         })
     }
 
+    fn spawn_array<'py>(
+        &self,
+        py: Python<'py>,
+        array_spec: PySlurmArraySpec,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mgr = self.0.clone();
+        future_into_py(py, async move {
+            let handles = mgr
+                .spawn_array(array_spec.into())
+                .await
+                .map_err(|e| match e {
+                    SbatchSpawnError::SubmittedButUnpersisted { jobid, source } => {
+                        PyRuntimeError::new_err(format!(
+                            "submitted but unpersisted: jobid={jobid}, source={source}"
+                        ))
+                    }
+                    other => PyRuntimeError::new_err(other.to_string()),
+                })?;
+            Ok(handles
+                .into_iter()
+                .map(PySbatchJobHandle)
+                .collect::<Vec<_>>())
+        })
+    }
+
     fn attach_uuid<'py>(&self, py: Python<'py>, uuid: String) -> PyResult<Bound<'py, PyAny>> {
         let mgr = self.0.clone();
         let u = uuid::Uuid::parse_str(&uuid).map_err(py_err)?;
@@ -166,6 +195,21 @@ impl PySbatchManager {
             Ok(PySbatchJobHandle(h))
         })
     }
+
+    fn attach_array_jobid<'py>(
+        &self,
+        py: Python<'py>,
+        master_jobid: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mgr = self.0.clone();
+        future_into_py(py, async move {
+            let handles = mgr.attach_array_jobid(master_jobid).await.map_err(py_err)?;
+            Ok(handles
+                .into_iter()
+                .map(PySbatchJobHandle)
+                .collect::<Vec<_>>())
+        })
+    }
 }
 
 // ---------- SbatchJobHandle ----------
@@ -188,6 +232,16 @@ impl PySbatchJobHandle {
     #[getter]
     fn jobid(&self) -> Option<u64> {
         self.0.jobid()
+    }
+
+    #[getter]
+    fn array_jobid(&self) -> Option<u64> {
+        self.0.array_jobid()
+    }
+
+    #[getter]
+    fn array_task_id(&self) -> Option<u32> {
+        self.0.array_task_id()
     }
 
     #[getter]

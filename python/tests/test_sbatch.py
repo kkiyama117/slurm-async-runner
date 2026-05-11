@@ -153,3 +153,70 @@ def test_sbatch_cmd_signal_kwarg(tmp_path):
     argv = cmd.build_argv()
     i = argv.index("--signal")
     assert argv[i + 1] == "USR1@60"
+
+
+def test_sbatch_cmd_array_spec_kwarg(tmp_path):
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmArraySpec,
+    )
+
+    job = tmp_path / "job.sh"
+    job.write_text("#!/usr/bin/env bash\necho hi\n")
+    cmd = SbatchCmd(str(job), array_spec=SlurmArraySpec.parse("0-3"))
+    argv = cmd.build_argv()
+    i = argv.index("-a")
+    assert argv[i + 1] == "0-3"
+
+
+@pytest.mark.skipif(not _have_bash(), reason="bash required")
+def test_spawn_array_with_bash_fake_sbatch(tmp_path: Path):
+    fake_sbatch = tmp_path / "fake_sbatch"
+    fake_sbatch.write_text('#!/usr/bin/env bash\necho "Submitted batch job 88888"\n')
+    fake_sbatch.chmod(0o755)
+    job_script = tmp_path / "job.sh"
+    job_script.write_text("#!/usr/bin/env bash\necho hello\n")
+    job_script.chmod(0o755)
+
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmArraySpec,
+    )
+
+    cmd = SbatchCmd(str(job_script), sbatch_bin=str(fake_sbatch))
+    state_dir = tmp_path / "state"
+    mgr = SbatchManager(cmd, state_dir=str(state_dir))
+
+    async def go():
+        handles = await mgr.spawn_array(SlurmArraySpec.parse("0-2"))
+        return [(h.jobid, h.array_task_id) for h in handles]
+
+    result = asyncio.run(go())
+    assert len(result) == 3
+    assert all(jobid == 88888 for jobid, _ in result)
+    assert [t for _, t in result] == [0, 1, 2]
+
+
+@pytest.mark.skipif(not _have_bash(), reason="bash required")
+def test_attach_array_jobid_round_trips(tmp_path: Path):
+    fake_sbatch = tmp_path / "fake_sbatch"
+    fake_sbatch.write_text('#!/usr/bin/env bash\necho "Submitted batch job 99001"\n')
+    fake_sbatch.chmod(0o755)
+    job_script = tmp_path / "job.sh"
+    job_script.write_text("#!/usr/bin/env bash\necho hi\n")
+    job_script.chmod(0o755)
+
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmArraySpec,
+    )
+
+    cmd = SbatchCmd(str(job_script), sbatch_bin=str(fake_sbatch))
+    state_dir = tmp_path / "state"
+    mgr = SbatchManager(cmd, state_dir=str(state_dir))
+
+    async def go():
+        await mgr.spawn_array(SlurmArraySpec.parse("0-1"))
+        return await mgr.attach_array_jobid(99001)
+
+    handles = asyncio.run(go())
+    assert len(handles) == 2
+    assert handles[0].array_task_id == 0
+    assert handles[1].array_task_id == 1
