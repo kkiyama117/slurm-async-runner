@@ -254,7 +254,7 @@ Phase 2 で sbatch / tssrun の handle が「コア 5 sync getter (`uuid` /
 | 型 / trait | 役割 |
 |---|---|
 | `JobHandleCommon` trait | 5 sync getter + `snapshot()` / `watch()` + `async fn refresh() / wait_terminal()` を associated `type Snapshot: JobSnapshot` 経由で表現。`SbatchJobHandle` / `TssrunJobHandle` の両方が impl |
-| `DynJobHandleCommon` trait | associated type を `serde_json::Value` に flatten した object-safe 版。`Vec<Arc<dyn DynJobHandleCommon>>` で sbatch + tssrun handle を混ぜて持てる |
+| `DynJobHandleCommon` trait | associated type を `serde_json::Value` に flatten した object-safe 版。公開メソッドは 5 sync getter + `kind() -> &'static str` + `snapshot_json()` + `async refresh_json() -> Result<serde_json::Value>` のみ。`watch::Receiver<S>` と `wait_terminal()` は dyn 経路に乗らないため **本体 trait からのみアクセス可能**（dashboard 用途では `refresh_json()` を手動 polling）。`Vec<Arc<dyn DynJobHandleCommon>>` で sbatch + tssrun handle を混ぜて持てる |
 | `DynHandleAdapter<H>` + `into_dyn(handle) -> Arc<dyn DynJobHandleCommon>` | 明示的な type-erasure コンストラクタ。**blanket impl を提供しない** ことで Phase 1 で発生した E0034 ambiguity を回避（Phase 1 handover §4） |
 
 設計判断:
@@ -373,7 +373,7 @@ PR #5 までは `gaussian_job_shared._core.entities.slurm.status` から
   を経由すること（blanket impl は意図的に提供していない、§3.6 参照）。
 - **`TssrunManager` のフィールドは `pub(crate)`**。`with_state_dir` /
   `with_state_store` / `with_log_sink` ビルダー以外で書き換えると、
-  既に走っている `JobHandle` には反映されません（後から store を
+  既に走っている `TssrunJobHandle` には反映されません（後から store を
   切り替えても既存ハンドルは spawn 時にクローンした旧 `Arc<dyn
   JobStateStore>` に書き続ける）。
 - **デフォルトはプロセス内 in-memory ストア**。`TssrunManager::new` だけ

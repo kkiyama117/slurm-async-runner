@@ -191,8 +191,14 @@ The full snapshot surface:
 | Owner-only | Returns | Notes |
 |---|---|---|
 | `await handle.wait()` | `int \| None` | `int` = exit code; `None` = killed by signal (SLURM time-limit kill, OOM, etc.). Raises `RuntimeError` on attached / already-waited handles. |
-| `await handle.refresh()` | `TssrunJobSnapshot` | Re-reads persisted snapshot. Available on attached handles too. |
-| `await handle.wait_terminal(poll_interval_secs)` | `TssrunJobSnapshot` | Polls via `refresh()` until `is_finished()` flips. Mirrors `SbatchJobHandle::wait_terminal`. |
+| `await handle.refresh()` | `None` | Re-reads persisted snapshot and broadcasts it. Read the updated state via the sync getters above. Available on attached handles too. |
+| `await handle.wait_terminal(poll_interval_secs)` | `None` | Polls via `refresh()` until `is_finished()` flips. Mirrors `SbatchJobHandle::wait_terminal`. Read the terminal `exit_code` via the sync getter after the await resolves. |
+
+> Rust's `TssrunJobHandle::refresh` / `wait_terminal` return
+> `Result<TssrunJobSnapshot>` — the Python pyo3 wrappers intentionally
+> drop the snapshot return so Python callers go through the lock-free
+> getters / `JobHandleCommon` Protocol contract instead of two parallel
+> read paths.
 
 ### Cross-process attach
 

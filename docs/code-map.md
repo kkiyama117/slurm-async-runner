@@ -65,7 +65,9 @@ slurm-async-runner2/
 │   │   │                  # uuid/jobid/is_running/is_finished/exit_code が sync 化
 │   │   ├── sbatch.rs      # PySbatchCmd / PySbatchManager / PySbatchJobHandle /
 │   │   │                  # PyFinishedInfo (Phase 2)
-│   │   └── entities/      # SLURM 語彙の pyclass (status / sbatch_options / signal)
+│   │   └── entities/      # SLURM 語彙の pyclass (status / sbatch_options)
+│   │                      # signal.rs は sbatch_options 内の Rust 分割で、
+│   │                      # SlurmSignalSpec は sbatch_options 名前空間に統合露出
 │   └── bin/
 │       └── stub_gen.rs    # pyo3-stub-gen を起動して .pyi を再生成
 │
@@ -177,7 +179,7 @@ slurm-async-runner2/
 | `sbatch.rs` | `slurm_async_runner._slurm_async_runner_core.sbatch` | Phase 2 で追加。`SbatchCmd` / `SbatchManager` / `SbatchJobHandle` / `FinishedInfo`。`run` / `cancel` などは `future_into_py` で coroutine 化。 5 つの共通 sync getter (`uuid` / `jobid` / `is_running` / `is_finished` / `exit_code`) を tssrun と同じシグネチャで提供 |
 | `entities/slurm/status.rs` | `slurm_async_runner._slurm_async_runner_core.entities.slurm.status` | `JobStatus` / `JobState` / `JobReason` の pyclass。PR #5 で `gaussian_job_shared` から本クレートに移管された SLURM 語彙の正本 |
 | `entities/slurm/sbatch_options.rs` | `slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options` | `ResourceSpec` / `ResourceSpecCPU` / `ResourceSpecGPU` / `JobTimeLimit` / `JobPartition` / `Memory` / `MemoryUnit` / `ArraySpec` / `SlurmDependency` / `MailTypeInput` ほか sbatch オプション系の pyclass |
-| `entities/slurm/sbatch_options/signal.rs` | `slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options.signal` | `SlurmSignalSpec` (Phase 2 P4) |
+| `entities/slurm/sbatch_options/signal.rs` | (Python 上は独立 submodule を持たず、`SlurmSignalSpec` は親 `sbatch_options` 名前空間に直接 add される) | `SlurmSignalSpec` の pyclass impl (Phase 2 P4)。Rust 上だけのファイル分割 |
 
 ### 2.5 stub 生成 (`src/bin/stub_gen.rs`)
 
