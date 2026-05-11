@@ -18,8 +18,8 @@ use crate::py_export::entities::slurm::sbatch_options::config::PyMailTypeInput;
 use crate::py_export::entities::slurm::sbatch_options::dependency::PySlurmDependency;
 use crate::py_export::entities::slurm::sbatch_options::signal::PySlurmSignalSpec;
 use crate::sbatch::cmd::SbatchCmd;
-use crate::sbatch::error::SbatchSpawnError;
-use crate::sbatch::handle::SbatchJobHandle;
+use crate::sbatch::error::{SbatchCancelError, SbatchRunError, SbatchSpawnError};
+use crate::sbatch::handle::{FinishedInfo, SbatchJobHandle};
 use crate::sbatch::manager::SbatchManager;
 
 // ---------- SbatchCmd ----------
@@ -106,6 +106,44 @@ impl PySbatchCmd {
         self.0
             .build_argv()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+// ---------- FinishedInfo ----------
+
+#[pyclass(
+    name = "FinishedInfo",
+    module = "slurm_async_runner._slurm_async_runner_core.sbatch",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub struct PyFinishedInfo(pub FinishedInfo);
+
+#[pymethods]
+impl PyFinishedInfo {
+    #[getter]
+    fn final_state(&self) -> String {
+        self.0.final_state.as_token().to_string()
+    }
+
+    #[getter]
+    fn exit_code(&self) -> Option<i32> {
+        self.0.exit_code
+    }
+
+    #[getter]
+    fn finished_at(&self) -> String {
+        self.0.finished_at.to_rfc3339()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FinishedInfo(state={}, exit_code={:?}, finished_at={})",
+            self.0.final_state.as_token(),
+            self.0.exit_code,
+            self.0.finished_at.to_rfc3339()
+        )
     }
 }
 
@@ -208,6 +246,32 @@ impl PySbatchManager {
                 .into_iter()
                 .map(PySbatchJobHandle)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mgr = self.0.clone();
+        future_into_py(py, async move {
+            let finished = mgr.run().await.map_err(|e| match e {
+                SbatchRunError::ArrayNotSupported => {
+                    pyo3::exceptions::PyValueError::new_err(e.to_string())
+                }
+                other => PyRuntimeError::new_err(other.to_string()),
+            })?;
+            Ok(PyFinishedInfo(finished))
+        })
+    }
+
+    fn cancel<'py>(&self, py: Python<'py>, jobid: u64) -> PyResult<Bound<'py, PyAny>> {
+        let mgr = self.0.clone();
+        future_into_py(py, async move {
+            mgr.cancel(jobid).await.map_err(|e| match e {
+                SbatchCancelError::Scancel { exit_code, stdout } => {
+                    PyRuntimeError::new_err(format!("scancel failed (exit={exit_code}): {stdout}"))
+                }
+                SbatchCancelError::Other(err) => PyRuntimeError::new_err(err.to_string()),
+            })?;
+            Ok(())
         })
     }
 }
@@ -374,6 +438,8 @@ pub mod inner_module {
 
     const PYTHON_MODULE_NAME: &str = "slurm_async_runner._slurm_async_runner_core.sbatch";
 
+    #[pymodule_export]
+    use super::PyFinishedInfo;
     #[pymodule_export]
     use super::PySbatchCmd;
     #[pymodule_export]
