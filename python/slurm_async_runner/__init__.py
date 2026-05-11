@@ -1,5 +1,4 @@
 from typing import Protocol, runtime_checkable
-from uuid import UUID
 
 from slurm_async_runner import _slurm_async_runner_core as _core
 
@@ -17,6 +16,13 @@ else:
 # return type is widened to `object`. Use `isinstance(h, JobHandleCommon)`
 # (runtime_checkable) to accept either `TssrunJobHandle` or
 # `SbatchJobHandle` without importing both concrete pyclass names.
+#
+# Phase 3 P5: the per-backend call shape now matches the Protocol — both
+# `SbatchJobHandle` and `TssrunJobHandle` expose `uuid` / `jobid` as
+# sync `@property` getters and `is_running` / `is_finished` /
+# `exit_code` as sync methods. The async-shape equivalents on tssrun
+# (`uuid_async` etc.) are kept for callers that wired against the
+# pre-P5 contract but are intentionally NOT mirrored in the Protocol.
 # ────────────────────────────────────────────────────────────────────
 
 
@@ -28,12 +34,21 @@ class JobHandleCommon(Protocol):
     for ``isinstance(h, JobHandleCommon)`` checks when accepting either
     backend.
 
-    ``runtime_checkable`` only inspects method *names*, not signatures,
-    so the structural check passes for both pyo3-backed handles despite
-    Python's lack of associated types.
+    The 5 sync members read lock-free off each backend's local snapshot
+    cache and are safe to call concurrently with an in-flight
+    ``refresh`` / ``wait_terminal``. ``refresh`` and ``wait_terminal``
+    are genuinely async (they re-query the persistent store and/or
+    SLURM).
+
+    ``runtime_checkable`` only inspects member *names*, not signatures —
+    the structural type check still passes for both pyo3 backends, and
+    after Phase 3 P5 the signatures are also accurate at static-type
+    check time.
     """
 
-    def uuid(self) -> UUID: ...
+    @property
+    def uuid(self) -> str: ...
+    @property
     def jobid(self) -> int | None: ...
     def is_running(self) -> bool: ...
     def is_finished(self) -> bool: ...

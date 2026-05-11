@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 3 P5 — Python Protocol parity (sync getters for `TssrunJobHandle`)
+
+- **Breaking on the unreleased Phase 3 branch**: `TssrunJobHandle.uuid` / `jobid` / `is_running` / `is_finished` / `exit_code` on the pyo3 wrapper are now **sync** — they read lock-free off the local `watch::Receiver` and never had any tokio runtime work to wait on. The previous `future_into_py` wrappers were bogus overhead and made the new `slurm_async_runner.JobHandleCommon` Protocol structurally incorrect (sbatch was sync, tssrun was async; the Protocol could not honestly span both). Direct call sites change from `await h.uuid` → `h.uuid`, `await h.is_running()` → `h.is_running()`, etc.
+- **Backward-compatible escape hatch**: each converted member also gains an `*_async` getter/method (`uuid_async`, `jobid_async`, `is_running_async`, `is_finished_async`, `exit_code_async`) that preserves the pre-P5 await-style contract. Callers that wired against the old shape can migrate at their leisure by either dropping the `await` or renaming to the `_async` member. The `*_async` shapes are intentionally NOT mirrored in the `JobHandleCommon` Protocol — the Protocol is the canonical sync contract.
+- **Protocol updated**: `python/slurm_async_runner/__init__.py:JobHandleCommon` now declares `uuid` / `jobid` as `@property` and `is_running` / `is_finished` / `exit_code` as sync methods. After P5 the structural type check `isinstance(h, JobHandleCommon)` AND the static-type signatures both match the actual pyo3 call shape on both backends. Dropped the unused `from uuid import UUID` import (M1 from the PR #7 review).
+- **Tests**: `python/tests/test_protocol.py` adds `test_tssrun_jobhandle_call_shape_matches_protocol` exercising the real sync call shape against a constructed handle, so the pre-P5 `runtime_checkable`-name-only false positive cannot reappear silently. `python/tests/test_tssrun.py` and `scripts/test_tssrun_live.py` migrated to the sync shape; one site in `test_tssrun.py` also covers `jobid_async` to keep that contract green.
+- Resolves PR #7 review HIGH H1 (Protocol signature mismatch) + MEDIUM M1 (dead `UUID` import).
+
 ### Phase 3 P4 — type-erased `DynJobHandleCommon` + Python `Protocol`
 
 - **`crate::handle::DynJobHandleCommon`** — object-safe companion to `JobHandleCommon`. Snapshot is exposed as `serde_json::Value` to flatten the associated type. Carries a static `kind() -> &'static str` discriminator that matches `JobSnapshot::kind()`.

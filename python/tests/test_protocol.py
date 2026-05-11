@@ -69,3 +69,37 @@ def test_tssrun_jobhandle_instance_satisfies_protocol() -> None:
             await handle.wait()
 
     asyncio.run(run())
+
+
+def test_tssrun_jobhandle_call_shape_matches_protocol() -> None:
+    """Phase 3 P5 regression: every Protocol-declared sync member must
+    actually be sync on a real TssrunJobHandle instance.
+
+    Pre-P5 the Protocol declared sync signatures while the pyo3 binding
+    wrapped each getter in ``future_into_py`` — ``isinstance`` passed
+    (name-only) but ``h.uuid()`` raised ``TypeError`` at runtime. Exercise
+    the real call shape here so the contract drift can't reappear silently.
+    """
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "ok.sh"
+            script.write_text("#!/bin/bash\nexit 0\n")
+            script.chmod(0o755)
+            cmd = TssrunCmd(program=script, tssrun_bin="bash")
+            manager = TssrunManager(cmd)
+            handle = await manager.spawn()
+            try:
+                # Properties — accessed without parentheses, no await.
+                assert isinstance(handle.uuid, str)
+                # ``jobid`` may be None pre-banner; type is what matters here.
+                assert handle.jobid is None or isinstance(handle.jobid, int)
+                # Methods — called with parentheses, no await.
+                assert isinstance(handle.is_running(), bool)
+                assert isinstance(handle.is_finished(), bool)
+                # ``exit_code`` is None until the child exits.
+                assert handle.exit_code() is None or isinstance(handle.exit_code(), int)
+            finally:
+                await handle.wait()
+
+    asyncio.run(run())
