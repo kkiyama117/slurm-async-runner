@@ -163,7 +163,7 @@ slurm-async-runner2/
 | `mod.rs` | サブモジュール宣言と概要 doc-comment |
 | `cmd.rs` | `SbatchCmd { sbatch_bin, job_name, partition, time_limit, output, error, env, cwd, no_requeue, comment, signal, dependency, mail_user, mail_types, array_spec, ... }`, `SbatchCmd::build_argv`。値型はすべて `entities::slurm::sbatch_options::*` |
 | `parse.rs` | `parse_submitted_jobid` (sbatch 出力), `parse_qgroup_l_line`, `parse_sacct_exit_code` ほか |
-| `handle.rs` | `SbatchJobSnapshot { uuid, jobid, kind="sbatch", last_observed_state, array_jobid, array_task_id, finished, left_active_listing, ... }`, `SbatchJobHandle::{watch, snapshot, uuid, jobid, is_running, is_finished, exit_code, array_jobid, array_task_id, refresh, refresh_with_sacct, wait_terminal, log_lines, read_log_to_end}`, `SbatchLifecycle`, `FinishedInfo`, `LogStream { Stdout, Stderr }` |
+| `handle.rs` | `SbatchJobSnapshot { uuid, jobid, kind="sbatch", last_observed_state, array_task_id, finished, left_active_listing, ... }`, `SbatchJobHandle::{watch, snapshot, uuid, jobid, is_running, is_finished, exit_code, array_task_id, refresh, refresh_with_sacct, wait_terminal, log_lines, read_log_to_end}`, `SbatchLifecycle`, `FinishedInfo`, `LogStream { Stdout, Stderr }`。Phase 3 (#8 B1) で `array_jobid` フィールドと getter を削除（`array_task_id.is_some()` が単発/array task の唯一の discriminator） |
 | `store.rs` | sbatch 固有 store ラッパ |
 | `manager.rs` | `SbatchAttachKey`, `SbatchManager::{new, with_dispatcher, with_state_dir, with_poll_interval, spawn, spawn_array, run, cancel, attach_uuid, attach_jobid, attach_array_jobid, attach_file, find_all_by_jobid}` |
 | `error.rs` | `SbatchSpawnError`, `SbatchRunError`, `SbatchCancelError`, `SbatchAttachError` (`#[non_exhaustive]` typed enum 群) |

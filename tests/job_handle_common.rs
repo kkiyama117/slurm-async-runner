@@ -112,7 +112,6 @@ fn finished_sbatch_snapshot(uuid: Uuid, jobid: u64) -> SbatchJobSnapshot {
     SbatchJobSnapshot {
         uuid,
         jobid,
-        array_jobid: None,
         array_task_id: None,
         argv: vec!["sbatch".into(), "/tmp/job.sh".into()],
         sent_env: HashMap::new(),

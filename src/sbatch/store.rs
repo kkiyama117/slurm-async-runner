@@ -29,7 +29,6 @@ mod tests {
         SbatchJobSnapshot {
             uuid: Uuid::now_v7(),
             jobid,
-            array_jobid: None,
             array_task_id: None,
             argv: vec!["sbatch".into()],
             sent_env: HashMap::new(),
@@ -57,27 +56,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn array_task_fields_roundtrip_via_fs_store() {
+    async fn array_task_id_roundtrips_via_fs_store() {
         let tmp = tempfile::tempdir().unwrap();
         let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
         let mut s = snap(12345);
-        s.array_jobid = Some(12345);
         s.array_task_id = Some(7);
         store.save(&s).await.unwrap();
         let loaded = store.load(s.uuid).await.unwrap().unwrap();
-        assert_eq!(loaded.array_jobid, Some(12345));
         assert_eq!(loaded.array_task_id, Some(7));
     }
 
     #[tokio::test]
-    async fn array_task_fields_default_to_none_for_legacy_snapshot() {
+    async fn array_task_id_defaults_to_none_for_legacy_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
         let s = snap(42);
         store.save(&s).await.unwrap();
         let loaded = store.load(s.uuid).await.unwrap().unwrap();
-        assert_eq!(loaded.array_jobid, None);
         assert_eq!(loaded.array_task_id, None);
+    }
+
+    /// Forward-compat check: Phase 2 snapshots on disk contain
+    /// `array_jobid: <N>` from when the field was still mirrored. Phase
+    /// 3 dropped the field. Because `SbatchJobSnapshot` does NOT set
+    /// `#[serde(deny_unknown_fields)]`, the surplus key must be
+    /// silently ignored.
+    #[tokio::test]
+    async fn legacy_array_jobid_field_is_ignored_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uuid = Uuid::now_v7();
+        let path = tmp.path().join(format!("{uuid}.json"));
+        let raw = serde_json::json!({
+            "kind": "sbatch",
+            "uuid": uuid.to_string(),
+            "jobid": 77777u64,
+            "array_jobid": 77777u64,
+            "array_task_id": 3,
+            "argv": ["sbatch"],
+            "sent_env": {},
+            "script_path": "/w/job.sh",
+            "submitted_at": "2026-05-11T12:00:00Z",
+            "log": { "output_template": null, "error_template": null },
+            "lifecycle": {
+                "last_observed_state": null,
+                "last_observed_at": null,
+                "left_active_listing": false,
+                "finished": null
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
+        let loaded = store.load(uuid).await.unwrap().unwrap();
+        assert_eq!(loaded.jobid, 77777);
+        assert_eq!(loaded.array_task_id, Some(3));
     }
 
     #[tokio::test]

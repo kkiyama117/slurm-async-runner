@@ -216,7 +216,7 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
 | 型 | 役割 |
 |---|---|
 | `SbatchCmd` (`src/sbatch/cmd.rs`) | `sbatch` argv の Spec ビルダー。`--dependency` / `--mail-user` / `--mail-type` / `--no-requeue` / `--signal` / `--comment` / `--array` / `--export` などを typed フィールドで保持し、`build_argv()` を提供 |
-| `SbatchJobSnapshot` (`src/sbatch/handle.rs`) | Serde 対応の状態。`uuid`（UUID v7）/ `jobid` / `last_observed_state` / `array_jobid` / `array_task_id` / `finished` (`FinishedInfo`) を保持。`kind = "sbatch"` で tssrun と区別される |
+| `SbatchJobSnapshot` (`src/sbatch/handle.rs`) | Serde 対応の状態。`uuid`（UUID v7）/ `jobid` / `last_observed_state` / `array_task_id` / `finished` (`FinishedInfo`) を保持。`kind = "sbatch"` で tssrun と区別される。Phase 3 (#8 B1) で `array_jobid` フィールドは削除（旧 Phase 2 JSON は `deny_unknown_fields` 未指定により silently 無視されて読み込める）|
 | `SbatchJobHandle` (`src/sbatch/handle.rs`) | 子プロセスを持たない handle。`refresh()` で `qgroup -l → squeue` チェーン、`refresh_with_sacct()` で sacct を呼んで `exit_code` を確定、`wait_terminal()` で polling、`log_lines` / `read_log_to_end` で stdout/stderr のテール読み |
 | `SbatchManager` (`src/sbatch/manager.rs`) | `Arc<dyn DynJobDispatcher>` + `JobStateStore<SbatchJobSnapshot>` を保持。`spawn` / `spawn_array` / `run` / `cancel` / `attach_uuid` / `attach_jobid` / `attach_array_jobid` / `attach_file` を提供 |
 | `SbatchSpawnError` / `SbatchRunError` / `SbatchCancelError` / `SbatchAttachError` (`src/sbatch/error.rs`) | `#[non_exhaustive]` typed enum。`anyhow::Error` への型崩しを避ける（Phase 2 final review HIGH issue から） |

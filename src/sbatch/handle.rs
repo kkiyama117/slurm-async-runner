@@ -26,19 +26,18 @@ pub struct SbatchJobSnapshot {
     pub uuid: Uuid,
     pub jobid: u64,
 
-    /// Master jobid of the array submission (the `<N>` from `Submitted batch
-    /// job <N>` when `--array=...` was passed). `None` for single (non-array)
-    /// jobs. For array tasks this is redundant with [`Self::jobid`] (both
-    /// hold the master); the explicit field makes attach paths able to
-    /// distinguish array tasks from singles without inspecting
-    /// `array_task_id`.
-    #[serde(default)]
-    pub array_jobid: Option<u64>,
-
     /// Per-task index within the array (e.g. `0`, `1`, `4` for `-a 0-1,4`).
-    /// `None` for single (non-array) jobs. Array task identity is
-    /// `(array_jobid, array_task_id)` — SLURM also prints this as
-    /// `<master>_<idx>` in `squeue -t`.
+    /// `None` for single (non-array) jobs — this is the sole discriminator
+    /// between array tasks and singles (the `jobid` field stores the master
+    /// jobid for array tasks too, so it cannot be used to distinguish).
+    /// SLURM prints array task identity as `<master>_<idx>` in
+    /// `squeue -t`.
+    ///
+    /// Phase 3 (#8 B1) removed the previously-mirrored `array_jobid`
+    /// field — old Phase 2 on-disk JSON files containing `array_jobid:
+    /// <N>` still load fine because this struct does not set
+    /// `#[serde(deny_unknown_fields)]`; the surplus field is silently
+    /// discarded. New writes omit it.
     #[serde(default)]
     pub array_task_id: Option<u32>,
 
@@ -218,10 +217,6 @@ impl SbatchJobHandle {
 
     pub fn jobid(&self) -> Option<u64> {
         Some(self.0.snapshot_tx.borrow().jobid)
-    }
-
-    pub fn array_jobid(&self) -> Option<u64> {
-        self.snapshot().array_jobid
     }
 
     pub fn array_task_id(&self) -> Option<u32> {
@@ -473,7 +468,6 @@ mod tests {
         SbatchJobSnapshot {
             uuid: Uuid::now_v7(),
             jobid,
-            array_jobid: None,
             array_task_id: None,
             argv: vec!["sbatch".into(), "/w/job.sh".into()],
             sent_env: HashMap::from([("FOO".into(), "bar".into())]),

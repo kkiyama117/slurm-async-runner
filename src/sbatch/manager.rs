@@ -97,7 +97,6 @@ impl SbatchManager {
         let snapshot = SbatchJobSnapshot {
             uuid,
             jobid,
-            array_jobid: None,
             array_task_id: None,
             argv,
             sent_env: self.cmd.env.clone(),
@@ -129,8 +128,8 @@ impl SbatchManager {
     ///
     /// All returned snapshots share the same master `jobid` (from sbatch's
     /// `Submitted batch job <N>` line) and the same `argv`, but each has a
-    /// distinct `uuid` and `array_task_id`. The `array_jobid` field also
-    /// holds the master jobid for every task.
+    /// distinct `uuid` and `array_task_id`. `array_task_id.is_some()` is
+    /// the sole discriminator between array tasks and singles.
     ///
     /// `array_spec` overrides any value already on `self.cmd.array_spec`.
     /// Returns the handles in `expand_array_indices` order (declaration
@@ -179,7 +178,6 @@ impl SbatchManager {
             let snapshot = SbatchJobSnapshot {
                 uuid: Uuid::now_v7(),
                 jobid: master_jobid,
-                array_jobid: Some(master_jobid),
                 array_task_id: Some(idx),
                 argv: argv.clone(),
                 sent_env: cmd.env.clone(),
@@ -551,7 +549,6 @@ mod tests {
         for (i, h) in handles.iter().enumerate() {
             let snap = h.snapshot();
             assert_eq!(snap.jobid, 50000);
-            assert_eq!(snap.array_jobid, Some(50000));
             assert_eq!(snap.array_task_id, Some(i as u32));
             for (j, other) in handles.iter().enumerate() {
                 if i != j {
