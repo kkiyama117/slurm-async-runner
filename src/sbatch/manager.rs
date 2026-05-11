@@ -95,6 +95,84 @@ impl SbatchManager {
         ))
     }
 
+    /// Submit an array job in a single `sbatch --array=<spec>` invocation,
+    /// then persist one snapshot per task and return one handle per task.
+    ///
+    /// All returned snapshots share the same master `jobid` (from sbatch's
+    /// `Submitted batch job <N>` line) and the same `argv`, but each has a
+    /// distinct `uuid` and `array_task_id`. The `array_jobid` field also
+    /// holds the master jobid for every task.
+    ///
+    /// `array_spec` overrides any value already on `self.cmd.array_spec`.
+    /// Returns the handles in `expand_array_indices` order (declaration
+    /// order — not numerical sort if the spec was e.g. `5,0-2`).
+    pub async fn spawn_array(
+        &self,
+        array_spec: crate::entities::slurm::SlurmArraySpec,
+    ) -> Result<Vec<SbatchJobHandle>, SbatchSpawnError> {
+        use crate::sbatch::parse::expand_array_indices;
+        let task_indices = expand_array_indices(&array_spec);
+        assert!(
+            !task_indices.is_empty(),
+            "SlurmArraySpec FromStr guarantees non-empty indices"
+        );
+
+        let mut cmd = self.cmd.clone();
+        cmd.array_spec = Some(array_spec);
+        let argv = cmd.build_argv()?;
+
+        let (exit_code, stdout) = self
+            .dispatcher
+            .capture(&argv)
+            .await
+            .map_err(SbatchSpawnError::Other)?;
+        if exit_code != 0 {
+            return Err(SbatchSpawnError::SubmitFailed { exit_code, stdout });
+        }
+        let master_jobid =
+            parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
+                stdout: stdout.clone(),
+            })?;
+
+        let script_path = std::path::absolute(&cmd.script)
+            .with_context(|| format!("absolutize {}", cmd.script.display()))
+            .map_err(SbatchSpawnError::Other)?;
+
+        let mut handles = Vec::with_capacity(task_indices.len());
+        for idx in task_indices {
+            let snapshot = SbatchJobSnapshot {
+                uuid: Uuid::now_v7(),
+                jobid: master_jobid,
+                array_jobid: Some(master_jobid),
+                array_task_id: Some(idx),
+                argv: argv.clone(),
+                sent_env: cmd.env.clone(),
+                script_path: script_path.clone(),
+                chdir: cmd.chdir.clone(),
+                partition: cmd.partition.clone(),
+                job_name: cmd.job_name.clone(),
+                submitted_at: Utc::now(),
+                log: LogPathSpec {
+                    output_template: cmd.output.clone(),
+                    error_template: cmd.error.clone(),
+                },
+                lifecycle: SbatchLifecycle::default(),
+            };
+            self.store.save(&snapshot).await.map_err(|source| {
+                SbatchSpawnError::SubmittedButUnpersisted {
+                    jobid: master_jobid,
+                    source,
+                }
+            })?;
+            handles.push(SbatchJobHandle::new(
+                snapshot,
+                self.store.clone(),
+                self.dispatcher.clone(),
+            ));
+        }
+        Ok(handles)
+    }
+
     pub async fn attach(&self, key: SbatchAttachKey) -> Result<SbatchJobHandle, SbatchAttachError> {
         let key_repr = format!("{key:?}");
         let snapshot = match key {
@@ -284,5 +362,61 @@ mod tests {
         assert!(path.exists());
         let attached = mgr.attach_file(&path).await.unwrap();
         assert_eq!(attached.jobid(), Some(55));
+    }
+
+    #[tokio::test]
+    async fn spawn_array_creates_one_snapshot_per_task() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::ok(50000));
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SbatchManager::new(cmd)
+            .with_state_dir(tmp.path())
+            .with_dispatcher(dispatcher);
+
+        let spec: SlurmArraySpec = "0-3".parse().unwrap();
+        let handles = mgr.spawn_array(spec).await.unwrap();
+
+        assert_eq!(handles.len(), 4);
+        for (i, h) in handles.iter().enumerate() {
+            let snap = h.snapshot();
+            assert_eq!(snap.jobid, 50000);
+            assert_eq!(snap.array_jobid, Some(50000));
+            assert_eq!(snap.array_task_id, Some(i as u32));
+            for (j, other) in handles.iter().enumerate() {
+                if i != j {
+                    assert_ne!(h.uuid(), other.uuid());
+                }
+            }
+        }
+
+        let count = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .map(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(count, 4);
+    }
+
+    #[tokio::test]
+    async fn spawn_array_returns_submit_failed_on_nonzero_exit() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let dispatcher = into_dyn(CannedSbatch::failed());
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        let spec: SlurmArraySpec = "0-2".parse().unwrap();
+        let Err(err) = mgr.spawn_array(spec).await else {
+            panic!("spawn_array should fail");
+        };
+        assert!(matches!(
+            err,
+            SbatchSpawnError::SubmitFailed { exit_code: 1, .. }
+        ));
     }
 }
