@@ -282,12 +282,31 @@ impl SbatchManager {
     pub async fn run(
         &self,
     ) -> Result<crate::sbatch::handle::FinishedInfo, crate::sbatch::error::SbatchRunError> {
+        use crate::sbatch::error::SbatchRunError;
         if self.cmd.array_spec.is_some() {
-            return Err(crate::sbatch::error::SbatchRunError::ArrayNotSupported);
+            return Err(SbatchRunError::ArrayNotSupported);
         }
-        // Spawn + wait + sacct chain is added in Task 4. Provide a temporary
-        // panic so the guard test can pass while the full path is unimplemented.
-        unimplemented!("run() body lands in Task 4")
+        let handle = self.spawn().await?;
+        let jobid = handle.snapshot().jobid;
+        handle
+            .wait_terminal(self.poll_interval)
+            .await
+            .map_err(SbatchRunError::Wait)?;
+        let snap = handle
+            .refresh_with_sacct()
+            .await
+            .map_err(SbatchRunError::Sacct)?;
+        let finished = snap
+            .lifecycle
+            .finished
+            .ok_or(SbatchRunError::MissingFinished { jobid })?;
+        match finished.final_state {
+            crate::JobState::Completed => Ok(finished),
+            other => Err(SbatchRunError::JobFailed {
+                state: other,
+                exit_code: finished.exit_code,
+            }),
+        }
     }
 
     /// Send `scancel <jobid>`. Idempotent at the SLURM side — sending
@@ -641,5 +660,66 @@ mod tests {
             other => panic!("expected ArrayNotSupported, got {other:?}"),
         }
         assert!(recorder.seen().is_empty(), "spawn must not be called");
+    }
+
+    /// Dispatcher that routes by argv[0]:
+    /// - "sbatch": returns canned spawn output
+    /// - "qgroup": returns canned qgroup output (CMP / RUN / empty)
+    /// - "squeue": returns canned squeue output
+    /// - "sacct":  returns canned sacct output (pipe-separated)
+    /// - any other: (0, "")
+    struct RunCannedDispatcher {
+        sbatch: Mutex<(i32, String)>,
+        qgroup: Mutex<String>,
+        squeue: Mutex<String>,
+        sacct: Mutex<String>,
+    }
+    impl RunCannedDispatcher {
+        fn new(sbatch_stdout: &str, qgroup: &str, sacct: &str) -> Self {
+            Self {
+                sbatch: Mutex::new((0, sbatch_stdout.to_string())),
+                qgroup: Mutex::new(qgroup.to_string()),
+                squeue: Mutex::new(String::new()),
+                sacct: Mutex::new(sacct.to_string()),
+            }
+        }
+    }
+    impl JobDispatcher for RunCannedDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+            let out = match argv[0].as_str() {
+                "sbatch" => {
+                    let (e, s) = self.sbatch.lock().unwrap().clone();
+                    return Ok((e, s));
+                }
+                "qgroup" => self.qgroup.lock().unwrap().clone(),
+                "squeue" => self.squeue.lock().unwrap().clone(),
+                "sacct" => self.sacct.lock().unwrap().clone(),
+                _ => String::new(),
+            };
+            Ok((0, out))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_happy_path_returns_finished_info_with_exit_code_zero() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        // sbatch returns jobid 4242. qgroup misses (empty) so the active
+        // listing is left immediately, allowing `refresh_with_sacct` to
+        // call sacct, which reports COMPLETED exit 0:0.
+        let dispatcher = into_dyn(RunCannedDispatcher::new(
+            "Submitted batch job 4242\n",
+            "",
+            "4242|COMPLETED|None|0:0\n",
+        ));
+        let mgr = SbatchManager::new(cmd)
+            .with_dispatcher(dispatcher)
+            .with_poll_interval(std::time::Duration::from_millis(1));
+
+        let finished = mgr.run().await.expect("run should succeed");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
     }
 }
