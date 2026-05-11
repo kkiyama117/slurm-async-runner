@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase 2 P3)
+
+- **`SbatchSpawnError::InvalidExportKey { key }`** and
+  **`SbatchSpawnError::InvalidExportValue { key, value }`** —
+  `SbatchCmd::build_argv()` now rejects any `env` entry whose key or value
+  contains `,` or `=` (SLURM's in-band separators on the `--export` payload).
+  Valid pairs round-trip unchanged. Python: `cmd.build_argv()` raises
+  `RuntimeError` whose message contains the offending key (and value, for
+  value errors).
+- **`SbatchCmd::build_argv` return type** is now
+  `Result<Vec<String>, SbatchSpawnError>` (was `anyhow::Result<Vec<String>>`).
+  Absolutize/I-O errors flow through the existing
+  `SbatchSpawnError::Other(#[from] anyhow::Error)` variant, so external
+  callers using `?` against `SbatchSpawnError` are unaffected.
+
 ### Added (Phase 2 P2)
 
 - **`SbatchCmd::dependency: Option<SlurmDependency>`** — emits `["-d", dep.to_string()]`.
