@@ -26,6 +26,22 @@ pub struct SbatchJobSnapshot {
     pub uuid: Uuid,
     pub jobid: u64,
 
+    /// Master jobid of the array submission (the `<N>` from `Submitted batch
+    /// job <N>` when `--array=...` was passed). `None` for single (non-array)
+    /// jobs. For array tasks this is redundant with [`Self::jobid`] (both
+    /// hold the master); the explicit field makes attach paths able to
+    /// distinguish array tasks from singles without inspecting
+    /// `array_task_id`.
+    #[serde(default)]
+    pub array_jobid: Option<u64>,
+
+    /// Per-task index within the array (e.g. `0`, `1`, `4` for `-a 0-1,4`).
+    /// `None` for single (non-array) jobs. Array task identity is
+    /// `(array_jobid, array_task_id)` — SLURM also prints this as
+    /// `<master>_<idx>` in `squeue -t`.
+    #[serde(default)]
+    pub array_task_id: Option<u32>,
+
     pub argv: Vec<String>,
     pub sent_env: HashMap<String, String>,
     pub script_path: PathBuf,
@@ -378,6 +394,8 @@ mod tests {
         SbatchJobSnapshot {
             uuid: Uuid::now_v7(),
             jobid,
+            array_jobid: None,
+            array_task_id: None,
             argv: vec!["sbatch".into(), "/w/job.sh".into()],
             sent_env: HashMap::from([("FOO".into(), "bar".into())]),
             script_path: PathBuf::from("/w/job.sh"),

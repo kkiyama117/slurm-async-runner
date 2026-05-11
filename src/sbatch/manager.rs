@@ -68,6 +68,8 @@ impl SbatchManager {
         let snapshot = SbatchJobSnapshot {
             uuid,
             jobid,
+            array_jobid: None,
+            array_task_id: None,
             argv,
             sent_env: self.cmd.env.clone(),
             script_path,
