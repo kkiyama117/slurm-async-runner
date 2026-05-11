@@ -46,6 +46,46 @@ pub enum SbatchAttachError {
     Io(#[from] anyhow::Error),
 }
 
+/// Errors that can occur during a blocking submit-and-wait `run()` call.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum SbatchRunError {
+    #[error("spawn failed: {0}")]
+    Spawn(#[from] SbatchSpawnError),
+
+    #[error("wait_terminal io error: {0}")]
+    Wait(anyhow::Error),
+
+    #[error("sacct refresh failed: {0}")]
+    Sacct(anyhow::Error),
+
+    #[error("sacct returned but finished info was not populated for jobid={jobid}")]
+    MissingFinished { jobid: u64 },
+
+    #[error("job ended in non-success terminal state: {state:?}, exit_code={exit_code:?}")]
+    JobFailed {
+        state: crate::JobState,
+        exit_code: Option<i32>,
+    },
+
+    #[error(
+        "array submission is not supported by run(); use spawn_array() instead \
+         and await tasks individually"
+    )]
+    ArrayNotSupported,
+}
+
+/// Errors that can occur while sending `scancel <jobid>`.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum SbatchCancelError {
+    #[error("scancel failed (exit={exit_code}): {stdout}")]
+    Scancel { exit_code: i32, stdout: String },
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +142,51 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("FOO"), "expected key in message, got: {msg}");
         assert!(msg.contains("a=b"), "expected value in message, got: {msg}");
+    }
+
+    #[test]
+    fn run_error_array_not_supported_displays_helpful_message() {
+        let e = SbatchRunError::ArrayNotSupported;
+        let msg = e.to_string();
+        assert!(
+            msg.contains("array"),
+            "expected 'array' in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("spawn_array"),
+            "should point user at spawn_array, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_error_job_failed_carries_state_and_exit_code() {
+        let e = SbatchRunError::JobFailed {
+            state: crate::JobState::Failed,
+            exit_code: Some(2),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("Failed"), "state should appear, got: {msg}");
+        assert!(msg.contains('2'), "exit code should appear, got: {msg}");
+    }
+
+    #[test]
+    fn run_error_from_spawn_error_preserves_variant() {
+        let inner = SbatchSpawnError::SubmitFailed {
+            exit_code: 1,
+            stdout: "boom".into(),
+        };
+        let e: SbatchRunError = inner.into();
+        assert!(matches!(e, SbatchRunError::Spawn(_)));
+    }
+
+    #[test]
+    fn cancel_error_scancel_carries_exit_and_stdout() {
+        let e = SbatchCancelError::Scancel {
+            exit_code: 1,
+            stdout: "scancel: error: invalid job id specified".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("scancel"));
+        assert!(msg.contains("invalid job id specified"));
     }
 }
