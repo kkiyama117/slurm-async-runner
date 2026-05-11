@@ -308,7 +308,7 @@ impl TssrunJobHandle {
             .load(uuid)
             .await?
             .ok_or_else(|| anyhow!("uuid {uuid} not found in store"))?;
-        let _ = self.snapshot_tx.send(snap.clone());
+        self.snapshot_tx.send_replace(snap.clone());
         Ok(snap)
     }
 

@@ -347,7 +347,7 @@ impl SbatchJobHandle {
                 snap.lifecycle.last_observed_at = Some(now);
             }
             inner.store.save(&snap).await?;
-            let _ = inner.snapshot_tx.send(snap.clone());
+            inner.snapshot_tx.send_replace(snap.clone());
             return Ok(snap);
         }
 
@@ -356,7 +356,7 @@ impl SbatchJobHandle {
             snap.lifecycle.last_observed_state = Some(status.clone());
             snap.lifecycle.last_observed_at = Some(now);
             inner.store.save(&snap).await?;
-            let _ = inner.snapshot_tx.send(snap.clone());
+            inner.snapshot_tx.send_replace(snap.clone());
             return Ok(snap);
         }
 
@@ -365,14 +365,14 @@ impl SbatchJobHandle {
             snap.lifecycle.last_observed_state = Some(status.clone());
             snap.lifecycle.last_observed_at = Some(now);
             inner.store.save(&snap).await?;
-            let _ = inner.snapshot_tx.send(snap.clone());
+            inner.snapshot_tx.send_replace(snap.clone());
             return Ok(snap);
         }
 
         snap.lifecycle.left_active_listing = true;
         snap.lifecycle.last_observed_at = Some(now);
         inner.store.save(&snap).await?;
-        let _ = inner.snapshot_tx.send(snap.clone());
+        inner.snapshot_tx.send_replace(snap.clone());
         Ok(snap)
     }
 
@@ -444,7 +444,7 @@ impl SbatchJobHandle {
             finished_at: chrono::Utc::now(),
         });
         inner.store.save(&snap).await?;
-        let _ = inner.snapshot_tx.send(snap.clone());
+        inner.snapshot_tx.send_replace(snap.clone());
         Ok(snap)
     }
 
@@ -738,6 +738,32 @@ mod tests {
         let after = h.refresh_with_sacct().await.unwrap();
         assert!(after.lifecycle.finished.is_none());
         assert_eq!(canned.sacct_calls(), 0);
+    }
+
+    /// Idempotency: once `finished` is populated and re-readable from the
+    /// watch channel (requires `send_replace`, not `send`), subsequent
+    /// `refresh_with_sacct` calls must short-circuit and not re-invoke
+    /// sacct. Regression guard for the live KUDPC failure where every
+    /// call burned a sacct invocation because the watch channel never
+    /// updated due to receiver_count == 0.
+    #[tokio::test]
+    async fn refresh_with_sacct_is_idempotent_when_finished_already_set() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned =
+            std::sync::Arc::new(CannedDispatcher::new("", "", "12345|COMPLETED|None|0:0\n"));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let _first = h.refresh_with_sacct().await.unwrap();
+        assert_eq!(canned.sacct_calls(), 1);
+        let _second = h.refresh_with_sacct().await.unwrap();
+        assert_eq!(
+            canned.sacct_calls(),
+            1,
+            "second call must not re-invoke sacct (idempotency via send_replace)",
+        );
     }
 
     /// Regression: when qgroup -l reports a *terminal* state (FINI / CMP
