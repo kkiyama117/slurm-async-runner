@@ -21,6 +21,7 @@ __all__ = [
     "SbatchCmd",
     "SbatchManager",
     "SbatchJobHandle",
+    "FinishedInfo",
 ]
 
 @final
@@ -109,6 +110,23 @@ class SbatchJobHandle:
         ...
 
 @final
+class FinishedInfo:
+    """Outcome of a finished sbatch job. Returned by ``SbatchManager.run``.
+
+    ``final_state`` is the SLURM state string (e.g. ``"COMPLETED"``, ``"FAILED"``).
+    ``exit_code`` is the conventional Unix exit code: ``None`` if not resolvable,
+    ``128 + signum`` if killed by signal.
+    ``finished_at`` is an RFC3339 timestamp string.
+    """
+
+    @property
+    def final_state(self) -> builtins.str: ...
+    @property
+    def exit_code(self) -> builtins.int | None: ...
+    @property
+    def finished_at(self) -> builtins.str: ...
+
+@final
 class SbatchManager:
     """Spawn / attach orchestrator. Holds a [`SbatchCmd`] and an optional state dir."""
 
@@ -131,3 +149,18 @@ class SbatchManager:
     def attach_array_jobid(
         self, master_jobid: builtins.int
     ) -> Awaitable[builtins.list[SbatchJobHandle]]: ...
+    def run(self) -> Awaitable[FinishedInfo]:
+        """Submit one job, block until terminal state, return ``FinishedInfo``.
+
+        Raises ``ValueError`` if ``cmd.array_spec`` is set — use ``spawn_array``
+        for array submissions. Raises ``RuntimeError`` for spawn / wait / sacct
+        failures or non-success terminal states.
+        """
+        ...
+
+    def cancel(self, jobid: builtins.int) -> Awaitable[None]:
+        """Send ``scancel <jobid>``. Idempotent on the SLURM side.
+
+        Raises ``RuntimeError`` if scancel itself reports a non-zero exit.
+        """
+        ...
