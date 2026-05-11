@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::dispatcher::{DynJobDispatcher, TokioDispatcher, into_dyn};
 use crate::sbatch::cmd::SbatchCmd;
-use crate::sbatch::error::{SbatchAttachError, SbatchSpawnError};
+use crate::sbatch::error::{SbatchAttachError, SbatchCancelError, SbatchSpawnError};
 use crate::sbatch::handle::{
     LogPathSpec, SbatchAttachKey, SbatchJobHandle, SbatchJobSnapshot, SbatchLifecycle,
 };
@@ -21,6 +21,7 @@ pub struct SbatchManager {
     cmd: SbatchCmd,
     store: Arc<dyn JobStateStore<SbatchJobSnapshot>>,
     dispatcher: Arc<dyn DynJobDispatcher>,
+    poll_interval: std::time::Duration,
 }
 
 impl SbatchManager {
@@ -29,6 +30,7 @@ impl SbatchManager {
             cmd,
             store: Arc::new(InMemoryStateStore::<SbatchJobSnapshot>::new()),
             dispatcher: into_dyn(TokioDispatcher),
+            poll_interval: std::time::Duration::from_secs(30),
         }
     }
 
@@ -44,6 +46,14 @@ impl SbatchManager {
 
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn DynJobDispatcher>) -> Self {
         self.dispatcher = dispatcher;
+        self
+    }
+
+    /// Override the polling cadence used by `run()` between `wait_terminal`
+    /// iterations. Default is 30 s, chosen to keep KUDPC squeue load low.
+    /// Tests typically use 1–10 ms.
+    pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
+        self.poll_interval = dur;
         self
     }
 
@@ -256,6 +266,22 @@ impl SbatchManager {
             .into_iter()
             .map(|snap| SbatchJobHandle::new(snap, self.store.clone(), self.dispatcher.clone()))
             .collect())
+    }
+
+    /// Send `scancel <jobid>`. Idempotent at the SLURM side — sending
+    /// scancel to a terminal job returns exit 0. Returns
+    /// `SbatchCancelError::Scancel` if scancel itself reports a non-zero exit.
+    pub async fn cancel(&self, jobid: u64) -> Result<(), SbatchCancelError> {
+        let argv = vec!["scancel".to_string(), jobid.to_string()];
+        let (exit_code, stdout) = self
+            .dispatcher
+            .capture(&argv)
+            .await
+            .map_err(SbatchCancelError::Other)?;
+        if exit_code != 0 {
+            return Err(SbatchCancelError::Scancel { exit_code, stdout });
+        }
+        Ok(())
     }
 }
 
@@ -493,6 +519,84 @@ mod tests {
                 assert_eq!(count, 2);
             }
             other => panic!("expected MultipleMatch, got {other:?}"),
+        }
+    }
+
+    /// Dispatcher that records every captured argv and returns canned exit/stdout.
+    struct RecordingDispatcher {
+        responses: Mutex<std::collections::VecDeque<(i32, String)>>,
+        seen: Mutex<Vec<Vec<String>>>,
+    }
+    impl RecordingDispatcher {
+        fn new(responses: Vec<(i32, String)>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+        fn seen(&self) -> Vec<Vec<String>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    impl JobDispatcher for RecordingDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+            self.seen.lock().unwrap().push(argv.to_vec());
+            let resp = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((0, String::new()));
+            Ok(resp)
+        }
+    }
+
+    /// Reuse pattern from handle.rs: Arc-wrapped dispatcher so the test
+    /// keeps a handle to inspect `seen()` after the manager calls capture.
+    struct MoveRecording(std::sync::Arc<RecordingDispatcher>);
+    impl JobDispatcher for MoveRecording {
+        async fn run(&self, argv: &[String]) -> Result<i32> {
+            self.0.run(argv).await
+        }
+        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+            self.0.capture(argv).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_invokes_scancel_with_jobid() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![(0, String::new())]));
+        let dispatcher = into_dyn(MoveRecording(recorder.clone()));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        mgr.cancel(12345).await.expect("cancel should succeed");
+
+        let seen = recorder.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0][0], "scancel");
+        assert_eq!(seen[0][1], "12345");
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_scancel_error_on_nonzero_exit() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![(
+            1,
+            "scancel: error: Invalid job id".to_string(),
+        )]));
+        let dispatcher = into_dyn(MoveRecording(recorder));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        match mgr.cancel(99).await {
+            Err(SbatchCancelError::Scancel { exit_code, stdout }) => {
+                assert_eq!(exit_code, 1);
+                assert!(stdout.contains("Invalid job id"));
+            }
+            other => panic!("expected Scancel error, got {other:?}"),
         }
     }
 }
