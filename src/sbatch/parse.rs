@@ -88,6 +88,38 @@ pub(crate) fn parse_sacct_exit_code(field: &str) -> Option<i32> {
     }
 }
 
+/// Enumerate every task index covered by a `SlurmArraySpec`.
+///
+/// `max_concurrent` (the `%N` suffix) is deliberately ignored — it
+/// constrains runtime concurrency at SLURM, not the set of tasks
+/// submitted. Indices are returned in declaration order (`Vec` order).
+#[allow(dead_code)]
+pub(crate) fn expand_array_indices(spec: &crate::entities::slurm::SlurmArraySpec) -> Vec<u32> {
+    use crate::entities::slurm::ArrayIndex;
+    let mut out = Vec::new();
+    for entry in &spec.indices {
+        match *entry {
+            ArrayIndex::Single(i) => out.push(i),
+            ArrayIndex::Range { start, end } => {
+                for i in start..=end {
+                    out.push(i);
+                }
+            }
+            ArrayIndex::Stepped { start, end, step } => {
+                let mut i = start;
+                while i <= end {
+                    out.push(i);
+                    match i.checked_add(step) {
+                        Some(next) => i = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +275,44 @@ Submitted batch job 67890
         assert_eq!(parse_sacct_exit_code(":0"), None);
         assert_eq!(parse_sacct_exit_code("0:"), None);
         assert_eq!(parse_sacct_exit_code("0"), None);
+    }
+
+    // ---- expand_array_indices ----
+
+    #[test]
+    fn expand_single_value() {
+        let spec: crate::entities::slurm::SlurmArraySpec = "5".parse().unwrap();
+        assert_eq!(expand_array_indices(&spec), vec![5]);
+    }
+
+    #[test]
+    fn expand_simple_range() {
+        let spec: crate::entities::slurm::SlurmArraySpec = "0-3".parse().unwrap();
+        assert_eq!(expand_array_indices(&spec), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn expand_stepped_range_even() {
+        let spec: crate::entities::slurm::SlurmArraySpec = "0-8:2".parse().unwrap();
+        assert_eq!(expand_array_indices(&spec), vec![0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn expand_stepped_range_odd_endpoint() {
+        // 0-10:4 -> 0, 4, 8 (10 NOT included since (10-0)%4 != 0)
+        let spec: crate::entities::slurm::SlurmArraySpec = "0-10:4".parse().unwrap();
+        assert_eq!(expand_array_indices(&spec), vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn expand_mixed_entries_preserves_order() {
+        let spec: crate::entities::slurm::SlurmArraySpec = "0,2,5-7".parse().unwrap();
+        assert_eq!(expand_array_indices(&spec), vec![0, 2, 5, 6, 7]);
+    }
+
+    #[test]
+    fn expand_ignores_max_concurrent() {
+        let spec: crate::entities::slurm::SlurmArraySpec = "0-3%2".parse().unwrap();
+        assert_eq!(expand_array_indices(&spec), vec![0, 1, 2, 3]);
     }
 }
