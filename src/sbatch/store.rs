@@ -29,6 +29,8 @@ mod tests {
         SbatchJobSnapshot {
             uuid: Uuid::now_v7(),
             jobid,
+            array_jobid: None,
+            array_task_id: None,
             argv: vec!["sbatch".into()],
             sent_env: HashMap::new(),
             script_path: PathBuf::from("/w/job.sh"),
@@ -52,6 +54,30 @@ mod tests {
         let path = tmp.path().join(format!("{}.json", s.uuid));
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"kind\": \"sbatch\""));
+    }
+
+    #[tokio::test]
+    async fn array_task_fields_roundtrip_via_fs_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
+        let mut s = snap(12345);
+        s.array_jobid = Some(12345);
+        s.array_task_id = Some(7);
+        store.save(&s).await.unwrap();
+        let loaded = store.load(s.uuid).await.unwrap().unwrap();
+        assert_eq!(loaded.array_jobid, Some(12345));
+        assert_eq!(loaded.array_task_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn array_task_fields_default_to_none_for_legacy_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: FileSystemStateStore<SbatchJobSnapshot> = FileSystemStateStore::new(tmp.path());
+        let s = snap(42);
+        store.save(&s).await.unwrap();
+        let loaded = store.load(s.uuid).await.unwrap().unwrap();
+        assert_eq!(loaded.array_jobid, None);
+        assert_eq!(loaded.array_task_id, None);
     }
 
     #[tokio::test]
