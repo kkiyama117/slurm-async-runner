@@ -268,6 +268,28 @@ impl SbatchManager {
             .collect())
     }
 
+    /// Submit a single sbatch job, block until terminal state, return
+    /// `FinishedInfo`. See spec §6 for the full design rationale.
+    ///
+    /// **Not for array submissions.** Use `spawn_array` for those —
+    /// run() returns `Err(SbatchRunError::ArrayNotSupported)` when
+    /// `cmd.array_spec.is_some()`.
+    ///
+    /// Timeout: caller wraps with `tokio::time::timeout(dur, mgr.run())`.
+    /// On timeout, the caller is responsible for calling `mgr.cancel(jobid)`
+    /// if they want to stop the SLURM-side job; the timeout itself only
+    /// drops the future.
+    pub async fn run(
+        &self,
+    ) -> Result<crate::sbatch::handle::FinishedInfo, crate::sbatch::error::SbatchRunError> {
+        if self.cmd.array_spec.is_some() {
+            return Err(crate::sbatch::error::SbatchRunError::ArrayNotSupported);
+        }
+        // Spawn + wait + sacct chain is added in Task 4. Provide a temporary
+        // panic so the guard test can pass while the full path is unimplemented.
+        unimplemented!("run() body lands in Task 4")
+    }
+
     /// Send `scancel <jobid>`. Idempotent at the SLURM side — sending
     /// scancel to a terminal job returns exit 0. Returns
     /// `SbatchCancelError::Scancel` if scancel itself reports a non-zero exit.
@@ -598,5 +620,26 @@ mod tests {
             }
             other => panic!("expected Scancel error, got {other:?}"),
         }
+    }
+
+    use crate::sbatch::error::SbatchRunError;
+
+    #[tokio::test]
+    async fn run_rejects_array_spec_before_spawn() {
+        use crate::entities::slurm::SlurmArraySpec;
+
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.array_spec = Some("0-2".parse::<SlurmArraySpec>().unwrap());
+
+        // Recorder must remain unused — guard fires before spawn touches sbatch.
+        let recorder = std::sync::Arc::new(RecordingDispatcher::new(vec![]));
+        let dispatcher = into_dyn(MoveRecording(recorder.clone()));
+        let mgr = SbatchManager::new(cmd).with_dispatcher(dispatcher);
+
+        match mgr.run().await {
+            Err(SbatchRunError::ArrayNotSupported) => {}
+            other => panic!("expected ArrayNotSupported, got {other:?}"),
+        }
+        assert!(recorder.seen().is_empty(), "spawn must not be called");
     }
 }
