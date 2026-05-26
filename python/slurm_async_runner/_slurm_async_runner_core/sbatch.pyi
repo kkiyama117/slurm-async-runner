@@ -44,6 +44,7 @@ class SbatchCmd:
         args: builtins.list[builtins.str] | None = None,
         no_requeue: builtins.bool = False,
         comment: builtins.str | None = None,
+        nice: builtins.int | None = None,
         dependency: "SlurmDependency | None" = None,
         mail_user: builtins.str | None = None,
         mail_types: "MailTypeInput | None" = None,
