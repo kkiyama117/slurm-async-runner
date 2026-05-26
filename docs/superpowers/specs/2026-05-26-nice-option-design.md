@@ -27,6 +27,27 @@ A first-class option is the only clean route.
   explicit integer so behaviour is unambiguous. `v=0` is a valid no-op
   adjustment and is still emitted.
 
+## KUDPC compatibility (verified)
+
+`--nice` is **accepted by the KUDPC sbatch wrapper**. Two checks:
+
+1. **Documentation (denylist model):** the KUDPC manual enumerates a "ジョブ投入時
+   に使用できないオプション" (options that cannot be used) list. `--priority`
+   (absolute priority, privileged) **is** on that list; `--nice` (relative
+   adjustment, user-facing) **is not**. Options absent from the denylist pass
+   through the wrapper.
+2. **Live `--test-only` check (2026-05-26):**
+   ```
+   sbatch -p gr10641a --rsc p=1:t=1:c=1 -t 0:01:00 --nice=100 --test-only <script>
+   → sbatch: Job 7597283 to start at 2026-05-26T14:55:15 using 8 processors
+     on nodes xa0004 in partition gr10641a   (exit 0, no error)
+   ```
+   The wrapper validated the submission with `--nice=100` and reported a start
+   slot with no "invalid/unrecognized option" error, confirming acceptance.
+
+Sources: [KUDPC batch manual](https://web.kudpc.kyoto-u.ac.jp/manual/ja/run/batch),
+[KUDPC job tips](https://web.kudpc.kyoto-u.ac.jp/manual/ja/run/tips).
+
 ## Scope & Decisions
 
 - **Type:** `Option<i32>` (signed; SLURM's range fits inside `i32`).
