@@ -63,6 +63,13 @@ pub struct SbatchCmd {
     /// `--comment` flag value. When `Some`, emitted as `--comment <value>`.
     pub comment: Option<String>,
 
+    /// `--nice` scheduling-priority adjustment. When `Some`, emitted as the
+    /// single token `--nice=<v>` so negative values are not parsed as a
+    /// separate flag. Positive lowers priority, negative raises it (negative
+    /// requires privilege). Pass-through: out-of-range values are left for
+    /// SLURM to reject.
+    pub nice: Option<i32>,
+
     pub script: PathBuf,
     pub args: Vec<String>,
 }
@@ -86,6 +93,7 @@ impl SbatchCmd {
             env: HashMap::new(),
             no_requeue: false,
             comment: None,
+            nice: None,
             script: script.into(),
             args: Vec::new(),
         }
@@ -155,6 +163,9 @@ impl SbatchCmd {
         if let Some(c) = &self.comment {
             argv.push("--comment".to_string());
             argv.push(c.clone());
+        }
+        if let Some(n) = self.nice {
+            argv.push(format!("--nice={n}"));
         }
         argv.push(absolutize(&self.script)?);
         argv.extend(self.args.iter().cloned());
@@ -316,6 +327,46 @@ mod tests {
         let cmd = SbatchCmd::new("/w/job.sh");
         let argv = cmd.build_argv().unwrap();
         assert!(!argv.iter().any(|a| a == "--comment"));
+    }
+
+    #[test]
+    fn nice_emits_single_token() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.nice = Some(100);
+        let argv = cmd.build_argv().unwrap();
+        assert!(
+            argv.iter().any(|a| a == "--nice=100"),
+            "expected --nice=100 token, got argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn nice_zero_is_emitted() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.nice = Some(0);
+        let argv = cmd.build_argv().unwrap();
+        assert!(
+            argv.iter().any(|a| a == "--nice=0"),
+            "expected --nice=0 (explicit no-op), got argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn nice_negative_value_is_single_token() {
+        let mut cmd = SbatchCmd::new("/w/job.sh");
+        cmd.nice = Some(-5);
+        let argv = cmd.build_argv().unwrap();
+        assert!(
+            argv.iter().any(|a| a == "--nice=-5"),
+            "expected single token --nice=-5, got argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn nice_omitted_when_none() {
+        let cmd = SbatchCmd::new("/w/job.sh");
+        let argv = cmd.build_argv().unwrap();
+        assert!(!argv.iter().any(|a| a.starts_with("--nice")));
     }
 
     #[test]
