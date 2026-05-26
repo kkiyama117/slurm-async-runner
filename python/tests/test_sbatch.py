@@ -94,6 +94,26 @@ def test_sbatch_cmd_comment_kwarg(tmp_path):
     assert argv[i + 1] == "phase 2 smoke"
 
 
+def test_sbatch_cmd_nice_kwarg(tmp_path):
+    """nice kwarg should produce the single token --nice=<v> in argv."""
+    job = tmp_path / "job.sh"
+    job.write_text("#!/bin/sh\necho hi\n")
+
+    cmd = SbatchCmd(str(job), nice=100)
+    argv = cmd.build_argv()
+    assert "--nice=100" in argv
+
+
+def test_sbatch_cmd_nice_omitted_when_absent(tmp_path):
+    """No nice kwarg should produce no --nice flag."""
+    job = tmp_path / "job.sh"
+    job.write_text("#!/bin/sh\necho hi\n")
+
+    cmd = SbatchCmd(str(job))
+    argv = cmd.build_argv()
+    assert not any(a.startswith("--nice") for a in argv)
+
+
 def test_sbatch_cmd_dependency_kwarg(tmp_path):
     from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
         SlurmDependency,
