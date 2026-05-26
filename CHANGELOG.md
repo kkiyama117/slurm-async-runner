@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`nice` option on `SbatchCmd` / `SlurmJobConfig`** (issue #13). Emits
+  `--nice=<v>` (single token, so negative values pass through) to adjust SLURM
+  scheduling priority — positive lowers priority, negative raises it. Verified
+  accepted by the KUDPC sbatch wrapper. `SlurmJobConfig.nice` is a config field
+  only (not auto-wired to argv).
+
 ## [v1.0.0] - 2026-05-12
 
 ### KUDPC live correctness fixes — watch updates, qgroup `FINI`/`FAIL`, sacct gating
