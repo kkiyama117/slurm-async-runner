@@ -51,6 +51,7 @@ impl PySbatchCmd {
         args = None,
         no_requeue = false,
         comment = None,
+        nice = None,
         dependency = None,
         mail_user = None,
         mail_types = None,
@@ -71,6 +72,7 @@ impl PySbatchCmd {
         args: Option<Vec<String>>,
         no_requeue: bool,
         comment: Option<String>,
+        nice: Option<i32>,
         dependency: Option<PySlurmDependency>,
         mail_user: Option<String>,
         mail_types: Option<PyMailTypeInput>,
@@ -94,6 +96,7 @@ impl PySbatchCmd {
         cmd.args = args.unwrap_or_default();
         cmd.no_requeue = no_requeue;
         cmd.comment = comment;
+        cmd.nice = nice;
         cmd.dependency = dependency.map(<PySlurmDependency as Into<SlurmDependency>>::into);
         cmd.mail_user = mail_user;
         cmd.mail_types = mail_types.map(<PyMailTypeInput as Into<MailTypeInput>>::into);
