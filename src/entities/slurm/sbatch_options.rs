@@ -214,6 +214,13 @@ pub struct SlurmJobConfig {
     /// p=PROCS:t=THREADSc=CORES:m=MEMORY (or g=GPU)
     #[serde(default)]
     pub resource_spec: Option<ResourceSpec>,
+
+    /// `--nice` scheduling-priority adjustment (signed). Config-envelope field
+    /// for parity with [`crate::sbatch::cmd::SbatchCmd`]; it is NOT auto-wired
+    /// to argv (mirrors the other `SlurmJobConfig` fields — there is no
+    /// `SlurmJobConfig -> SbatchCmd` conversion).
+    #[serde(default)]
+    pub nice: Option<i32>,
 }
 
 #[cfg(test)]
@@ -292,5 +299,36 @@ mod tests {
             seconds_before_end: None,
         };
         assert_eq!(s.to_string(), "15");
+    }
+
+    #[test]
+    fn slurm_job_config_nice_roundtrips_through_json() {
+        let cfg = SlurmJobConfig {
+            partition: "gr10641a".to_string(),
+            time_limit: None,
+            log_stdout: None,
+            log_stderr: None,
+            comment: None,
+            job_name: None,
+            array_spec: None,
+            dependency: None,
+            mail_user: None,
+            mail_types: None,
+            resource_spec: None,
+            nice: Some(100),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: SlurmJobConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nice, Some(100));
+    }
+
+    #[test]
+    fn slurm_job_config_nice_defaults_to_none_when_absent() {
+        // `nice` carries #[serde(default)]; absent key deserializes to None.
+        // `comment` and `dependency` lack a serde default, so the minimal
+        // document must still carry them (as null).
+        let json = r#"{"partition":"gr10641a","comment":null,"dependency":null}"#;
+        let cfg: SlurmJobConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.nice, None);
     }
 }

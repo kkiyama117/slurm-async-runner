@@ -193,6 +193,7 @@ impl PySlurmJobConfig {
             mail_user,
             mail_types: mail_types.map(|v| v.0),
             resource_spec: resource_spec.map(|v| v.0),
+            nice: None,
         })
     }
 
