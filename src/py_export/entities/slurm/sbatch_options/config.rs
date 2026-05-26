@@ -166,6 +166,7 @@ impl PySlurmJobConfig {
         mail_user=None,
         mail_types=None,
         resource_spec=None,
+        nice=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -180,6 +181,7 @@ impl PySlurmJobConfig {
         mail_user: Option<String>,
         mail_types: Option<PyMailTypeInput>,
         resource_spec: Option<PyResourceSpec>,
+        nice: Option<i32>,
     ) -> Self {
         Self(inner::SlurmJobConfig {
             partition,
@@ -193,7 +195,7 @@ impl PySlurmJobConfig {
             mail_user,
             mail_types: mail_types.map(|v| v.0),
             resource_spec: resource_spec.map(|v| v.0),
-            nice: None,
+            nice,
         })
     }
 
@@ -305,6 +307,16 @@ impl PySlurmJobConfig {
     #[setter]
     fn set_resource_spec(&mut self, v: Option<PyResourceSpec>) {
         self.0.resource_spec = v.map(|v| v.0);
+    }
+
+    #[getter]
+    fn nice(&self) -> Option<i32> {
+        self.0.nice
+    }
+
+    #[setter]
+    fn set_nice(&mut self, v: Option<i32>) {
+        self.0.nice = v;
     }
 
     fn __repr__(&self) -> String {
