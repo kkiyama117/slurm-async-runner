@@ -381,3 +381,22 @@ def test_cancel_raises_runtime_error_on_nonzero_exit(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="scancel"):
         asyncio.run(go())
+
+
+def test_slurm_job_config_nice_kwarg_and_property():
+    """SlurmJobConfig should accept nice= in its constructor and expose it via the property."""
+    from slurm_async_runner._slurm_async_runner_core.entities.slurm.sbatch_options import (
+        SlurmJobConfig,
+    )
+
+    cfg = SlurmJobConfig("gr10641a", nice=100)
+    assert cfg.nice == 100
+
+    cfg.nice = -5
+    assert cfg.nice == -5
+
+    cfg.nice = None
+    assert cfg.nice is None
+
+    # default when omitted
+    assert SlurmJobConfig("gr10641a").nice is None
