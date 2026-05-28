@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-05-28
+
 ### Added
 
 - **`nice` option on `SbatchCmd` / `SlurmJobConfig`** (issue #13). Emits
@@ -14,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scheduling priority — positive lowers priority, negative raises it. Verified
   accepted by the KUDPC sbatch wrapper. `SlurmJobConfig.nice` is a config field
   only (not auto-wired to argv).
+
+### Docs
+
+- **README**: unified `TssrunCmd` and `SbatchCmd` sections into a parallel
+  5-subsection layout for easier side-by-side comparison.
 
 ## [v1.0.0] - 2026-05-12
 

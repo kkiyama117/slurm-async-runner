@@ -383,6 +383,17 @@ tssrun (which is setuid).
 
 `CHANGELOG.md` の `[Unreleased]` セクションに変更を追記し、
 適切なタイミングで `[X.Y.Z]` セクションへ昇格させます。
-Wheel ビルドと PyPI 公開は `.github/workflows/CI.yml` が tag push 時に
-manylinux ホイールと sdist を作成して配布する想定。
-（リリース手順の詳細は CI.yml を参照してください。）
+Wheel ビルドは `.github/workflows/CI.yml` がブランチ push 時に
+manylinux ホイールと sdist を作成し、
+`.github/workflows/release.yml` が `v*` タグ push 時に同じ matrix で
+ホイール + sdist を作成し **GitHub Releases** にアセットとして
+アップロードします（PyPI には配信しません）。
+
+リリース手順:
+
+1. `CHANGELOG.md` の `[Unreleased]` を `[vX.Y.Z]` に昇格してコミット。
+2. `gh release create vX.Y.Z --title vX.Y.Z --notes "..."` で空のリリース
+   を作成（リリースノートは CHANGELOG の該当節をそのまま貼る）。
+3. `git tag vX.Y.Z && git push origin vX.Y.Z` でタグを push。
+4. `release.yml` がタグ push をトリガーに wheel を全プラットフォーム
+   分ビルドし、作成済みのリリースに自動アップロード。

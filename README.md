@@ -406,8 +406,10 @@ cargo run --bin stub_gen && uv run ruff format python/
 ```
 
 The CI pipeline runs all of the above on every push and PR; see
-[`.github/workflows/test.yml`](.github/workflows/test.yml). Wheel building +
-PyPI publishing is in [`.github/workflows/CI.yml`](.github/workflows/CI.yml).
+[`.github/workflows/test.yml`](.github/workflows/test.yml). Wheel building
+across platforms runs in [`.github/workflows/CI.yml`](.github/workflows/CI.yml),
+and tag-triggered releases upload wheels + sdist to **GitHub Releases** (not
+PyPI) via [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ### Pre-commit hooks (local autofix)
 
