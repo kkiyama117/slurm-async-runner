@@ -119,7 +119,8 @@ slurm-async-runner2/
 │
 └── .github/workflows/
     ├── test.yml           # PR/push 時の cargo + pytest CI
-    └── CI.yml             # wheel ビルド + PyPI 配信
+    ├── CI.yml             # wheel ビルド (push to main/develop)
+    └── release.yml        # v* タグで wheel + sdist を GitHub Releases へ
 ```
 
 ## 2. ファイル別の責務
@@ -224,7 +225,8 @@ pyfunction、および `#[gen_stub_pyclass]` を付けた pyclass）の型スタ
 | ファイル | トリガー | やること |
 |---|---|---|
 | `test.yml` | push to main/master, PR, manual | nightly toolchain + Python 3.12 で `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test --lib` / `maturin develop` / `pytest` / `ruff check` / `ruff format --check` |
-| `CI.yml` | （wheel ビルド + PyPI 公開のフロー） | manylinux wheel と sdist を作って PyPI へ |
+| `CI.yml` | push to main/develop, PR, manual | linux (manylinux x86_64) と windows (x64) で wheel をビルドして smoke 用にアーティファクト化 (publish は行わない) |
+| `release.yml` | `v*` タグ push, manual | manylinux (x86_64, aarch64) + musllinux x86_64 + windows (x64, arm64) + macos arm64 (macos-latest) + sdist をビルドし、タグ名のリリースに **GitHub Releases** アセットとしてアップロード (PyPI には publish しない) |
 
 ## 3. 「○○ をいじりたい」逆引き表
 
