@@ -4,18 +4,18 @@ from slurm_async_runner import _slurm_async_runner_core as _core
 
 if hasattr(_core, "__doc__"):
     __doc__ = _core.__doc__
-if hasattr(_core, "__all__"):
-    __all__ = list(_core.__all__)
-else:
-    __all__ = []
+
+__all__ = [*getattr(_core, "__all__", []), "JobHandleCommon"]
 
 
 # ────────────────────────────────────────────────────────────────────
 # Phase 3 P4: duck-typed Protocol mirror of the Rust `JobHandleCommon`
-# trait. Python lacks Rust's associated types, so the snapshot accessor
-# return type is widened to `object`. Use `isinstance(h, JobHandleCommon)`
-# (runtime_checkable) to accept either `TssrunJobHandle` or
-# `SbatchJobHandle` without importing both concrete pyclass names.
+# trait. The Rust trait's associated-`Snapshot` returns have no Python
+# equivalent — both pyo3 wrappers return None from `refresh` /
+# `wait_terminal` and expose state via the sync getters instead. Use
+# `isinstance(h, JobHandleCommon)` (runtime_checkable) to accept either
+# `TssrunJobHandle` or `SbatchJobHandle` without importing both
+# concrete pyclass names.
 #
 # Phase 3 P5: the per-backend call shape now matches the Protocol — both
 # `SbatchJobHandle` and `TssrunJobHandle` expose `uuid` / `jobid` as
@@ -52,8 +52,7 @@ class JobHandleCommon(Protocol):
     def is_running(self) -> bool: ...
     def is_finished(self) -> bool: ...
     def exit_code(self) -> int | None: ...
-    async def refresh(self) -> object: ...
-    async def wait_terminal(self, poll_interval_secs: float) -> object: ...
-
-
-__all__.append("JobHandleCommon")
+    # Both pyo3 wrappers return None (the Rust snapshot return is
+    # intentionally dropped — read state via the sync getters above).
+    async def refresh(self) -> None: ...
+    async def wait_terminal(self, poll_interval_secs: float) -> None: ...

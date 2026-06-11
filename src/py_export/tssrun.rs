@@ -312,6 +312,11 @@ impl PyTssrunJobHandle {
     /// Python — read the terminal snapshot through the existing getters
     /// (``exit_code`` / ``is_finished``) once this future resolves.
     ///
+    /// The handle mutex is held only for each individual ``refresh``
+    /// round-trip, never across the inter-poll sleep — a concurrent
+    /// ``wait()`` / ``refresh()`` on the same handle is not starved for
+    /// the (potentially minutes-long) duration of this wait.
+    ///
     /// Raises ``RuntimeError`` if no store is wired on this handle or the
     /// store loses the record for this handle's uuid.
     #[pyo3(signature = (poll_interval_secs))]
@@ -321,14 +326,21 @@ impl PyTssrunJobHandle {
         poll_interval_secs: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let rx = self.rx.clone();
         future_into_py(py, async move {
-            inner
-                .lock()
-                .await
-                .wait_terminal(std::time::Duration::from_secs_f64(poll_interval_secs))
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(())
+            let interval = std::time::Duration::from_secs_f64(poll_interval_secs);
+            loop {
+                inner
+                    .lock()
+                    .await
+                    .refresh()
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                if rx.borrow().finished.is_some() {
+                    return Ok(());
+                }
+                tokio::time::sleep(interval).await;
+            }
         })
     }
 }

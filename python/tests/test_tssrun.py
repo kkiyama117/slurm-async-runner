@@ -7,6 +7,8 @@ import asyncio
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from slurm_async_runner._slurm_async_runner_core.tssrun import (
     ResourceSpec,
     TssrunCmd,
@@ -114,9 +116,17 @@ def test_h1_snapshot_getters_do_not_block_on_inflight_wait() -> None:
             # concurrently with snapshot polls.
             wait_fut = asyncio.ensure_future(h.wait())
             try:
-                # Give the salloc: lines time to be parsed but stay well
-                # below the 0.4s sleep so wait() is still in flight.
-                await asyncio.sleep(0.1)
+                # Wait until the salloc: banner has actually been parsed
+                # (event-based poll of the lock-free getter, not a fixed
+                # sleep — a loaded CI machine cannot outrun the parser).
+                # Normally resolves in milliseconds, well below the 0.4s
+                # child sleep, so wait() is still in flight.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 5.0
+                while h.jobid is None:
+                    if loop.time() > deadline:
+                        pytest.fail("salloc: banner was not parsed within 5s")
+                    await asyncio.sleep(0.01)
                 assert not wait_fut.done(), "wait() should still be in flight"
 
                 # Each of these must return within a fraction of a second.
@@ -127,7 +137,12 @@ def test_h1_snapshot_getters_do_not_block_on_inflight_wait() -> None:
                 # an event-loop hop. ``pid`` is still async (not in the
                 # JobHandleCommon Protocol) so it keeps the legacy
                 # await-style shape.
-                pid = await asyncio.wait_for(asyncio.ensure_future(h.pid), timeout=0.2)
+                try:
+                    pid = await asyncio.wait_for(
+                        asyncio.ensure_future(h.pid), timeout=0.2
+                    )
+                except TimeoutError:
+                    pytest.fail("pid getter blocked behind an in-flight wait()")
                 running = h.is_running()
                 jobid = h.jobid
 

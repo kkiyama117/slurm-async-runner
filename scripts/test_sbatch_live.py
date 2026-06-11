@@ -24,13 +24,8 @@ from pathlib import Path
 from slurm_async_runner._slurm_async_runner_core.sbatch import SbatchCmd, SbatchManager
 
 
-def _env(name: str, default: str | None = None) -> str | None:
-    val = os.environ.get(name)
-    return val if val is not None else default
-
-
 def _have_sbatch() -> bool:
-    return shutil.which(_env("SBATCH_LIVE_BIN", "sbatch") or "sbatch") is not None
+    return shutil.which(os.environ.get("SBATCH_LIVE_BIN", "sbatch")) is not None
 
 
 def _write_job(job_dir: Path, script_body: str) -> Path:
@@ -54,10 +49,10 @@ async def _run_one_case(
 
     Returns True on pass, False on fail (caller aggregates).
     """
-    bin_path = _env("SBATCH_LIVE_BIN", "sbatch") or "sbatch"
-    queue = _env("SBATCH_LIVE_QUEUE")
-    time_limit = _env("SBATCH_LIVE_TIME_LIMIT", "0:01:00")
-    rsc = _env("SBATCH_LIVE_RSC")
+    bin_path = os.environ.get("SBATCH_LIVE_BIN", "sbatch")
+    queue = os.environ.get("SBATCH_LIVE_QUEUE")
+    time_limit = os.environ.get("SBATCH_LIVE_TIME_LIMIT", "0:01:00")
+    rsc = os.environ.get("SBATCH_LIVE_RSC")
 
     job_path = _write_job(job_dir, script_body)
 
@@ -120,10 +115,8 @@ async def _run_live() -> int:
         print("SKIP: sbatch not on PATH; run on a kudpc / SLURM node.")
         return 0
 
-    timeout_s = float(_env("SBATCH_LIVE_TIMEOUT", "180") or "180")
-    poll_interval_s = float(_env("SBATCH_LIVE_POLL_INTERVAL", "10") or "10")
-
-    state_dir = Path(tempfile.mkdtemp(prefix="sbatch-live-"))
+    timeout_s = float(os.environ.get("SBATCH_LIVE_TIMEOUT", "180"))
+    poll_interval_s = float(os.environ.get("SBATCH_LIVE_POLL_INTERVAL", "10"))
 
     success_script = (
         "#!/usr/bin/env bash\n"
@@ -139,37 +132,43 @@ async def _run_live() -> int:
         "exit 7\n"
     )
 
-    results: list[tuple[str, bool]] = []
-    with tempfile.TemporaryDirectory(prefix="sbatch-live-success-") as job_dir_ok:
-        ok = await _run_one_case(
-            state_dir=state_dir,
-            job_dir=Path(job_dir_ok),
-            label="success",
-            script_body=success_script,
-            expected_exit_code=0,
-            timeout_s=timeout_s,
-            poll_interval_s=poll_interval_s,
-        )
-        results.append(("success", ok))
+    # Not a TemporaryDirectory context manager because both cases share it;
+    # the finally below guarantees cleanup even when a case raises.
+    state_dir = Path(tempfile.mkdtemp(prefix="sbatch-live-"))
+    try:
+        results: list[tuple[str, bool]] = []
+        with tempfile.TemporaryDirectory(prefix="sbatch-live-success-") as job_dir_ok:
+            ok = await _run_one_case(
+                state_dir=state_dir,
+                job_dir=Path(job_dir_ok),
+                label="success",
+                script_body=success_script,
+                expected_exit_code=0,
+                timeout_s=timeout_s,
+                poll_interval_s=poll_interval_s,
+            )
+            results.append(("success", ok))
 
-    with tempfile.TemporaryDirectory(prefix="sbatch-live-failure-") as job_dir_fail:
-        ok = await _run_one_case(
-            state_dir=state_dir,
-            job_dir=Path(job_dir_fail),
-            label="failure",
-            script_body=failure_script,
-            expected_exit_code=7,
-            timeout_s=timeout_s,
-            poll_interval_s=poll_interval_s,
-        )
-        results.append(("failure", ok))
+        with tempfile.TemporaryDirectory(prefix="sbatch-live-failure-") as job_dir_fail:
+            ok = await _run_one_case(
+                state_dir=state_dir,
+                job_dir=Path(job_dir_fail),
+                label="failure",
+                script_body=failure_script,
+                expected_exit_code=7,
+                timeout_s=timeout_s,
+                poll_interval_s=poll_interval_s,
+            )
+            results.append(("failure", ok))
 
-    failed = [name for name, passed in results if not passed]
-    if failed:
-        print(f"FAIL: cases failed: {', '.join(failed)}")
-        return 1
-    print("PASS (all cases)")
-    return 0
+        failed = [name for name, passed in results if not passed]
+        if failed:
+            print(f"FAIL: cases failed: {', '.join(failed)}")
+            return 1
+        print("PASS (all cases)")
+        return 0
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
 
 
 def main() -> int:

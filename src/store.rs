@@ -6,9 +6,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
@@ -66,11 +64,19 @@ impl<S: JobSnapshot> InMemoryStateStore<S> {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Lock the map. A `std::sync::Mutex` is deliberate here: every
+    /// critical section is a synchronous `HashMap` operation with no
+    /// `.await` inside, so the guard can never be held across a yield
+    /// point. Poisoning (a panic while holding the lock) is recovered
+    /// by taking the inner guard — the map itself is always left in a
+    /// consistent state by the operations below.
+    fn lock(&self) -> MutexGuard<'_, HashMap<Uuid, S>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn len(&self) -> usize {
-        self.inner
-            .try_lock()
-            .expect("InMemoryStateStore.len contended; this should not happen in a test/dev store")
-            .len()
+        self.lock().len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -80,19 +86,16 @@ impl<S: JobSnapshot> InMemoryStateStore<S> {
 #[async_trait]
 impl<S: JobSnapshot> JobStateStore<S> for InMemoryStateStore<S> {
     async fn save(&self, snap: &S) -> Result<()> {
-        let mut g = self.inner.lock().await;
-        g.insert(snap.uuid(), snap.clone());
+        self.lock().insert(snap.uuid(), snap.clone());
         Ok(())
     }
 
     async fn load(&self, uuid: Uuid) -> Result<Option<S>> {
-        let g = self.inner.lock().await;
-        Ok(g.get(&uuid).cloned())
+        Ok(self.lock().get(&uuid).cloned())
     }
 
     async fn list(&self) -> Result<Vec<S>> {
-        let g = self.inner.lock().await;
-        Ok(g.values().cloned().collect())
+        Ok(self.lock().values().cloned().collect())
     }
 }
 

@@ -181,7 +181,9 @@ async fn into_dyn_sbatch_preserves_kind_and_getters() {
     assert!(!dyn_h.is_running());
     assert_eq!(dyn_h.exit_code(), Some(0));
 
-    let json = dyn_h.snapshot_json();
+    let json = dyn_h
+        .snapshot_json()
+        .expect("in-tree snapshots always serialize");
     assert!(json.is_object(), "snapshot_json should be a JSON object");
     assert_eq!(
         json.get("uuid").and_then(|v| v.as_str()),
@@ -208,7 +210,9 @@ async fn into_dyn_tssrun_preserves_kind_and_getters() {
     assert_eq!(dyn_h.kind(), "tssrun");
     assert!(dyn_h.is_finished());
 
-    let json = dyn_h.snapshot_json();
+    let json = dyn_h
+        .snapshot_json()
+        .expect("in-tree snapshots always serialize");
     assert!(json.is_object());
     assert_eq!(
         json.get("uuid").and_then(|v| v.as_str()),

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Code-review hardening (issue #15).**
+  - `PyTssrunJobHandle.wait_terminal` no longer holds the handle mutex
+    across the whole polling loop — the lock is taken per `refresh`
+    round-trip, so a concurrent `wait()` / `refresh()` on the same handle
+    is not serialized for the (potentially minutes-long) wait.
+  - `InMemoryStateStore` switched to an internal `std::sync::Mutex`;
+    `len()` / `is_empty()` can no longer panic under lock contention
+    (previously `try_lock().expect(...)`).
+  - `DynJobHandleCommon::snapshot_json` now returns
+    `anyhow::Result<serde_json::Value>` instead of panicking on
+    serialization failure (**breaking** for `dyn` facade callers).
+  - `resolve_log_path` gained an env-free substitution core
+    (`resolve_log_path_with`); its tests no longer mutate process env via
+    `unsafe { env::set_var }` (multi-threaded test-runner race).
+  - `TssrunManager::query_state` doc corrected: `squeue` with `sacct`
+    fallback, not sacct-only.
+  - Python: `JobHandleCommon.refresh` / `wait_terminal` annotated
+    `-> None`; `run_with_jobid_callback(on_spawn)` stub typed
+    `Callable[[int], object]`; `scripts/test_sbatch_live.py` cleans up its
+    `state_dir` on failure; the H1 snapshot-getter regression test is now
+    event-based instead of sleep-based; misc stub / test cleanups.
+
 ## [v1.1.0] - 2026-05-28
 
 ### Added

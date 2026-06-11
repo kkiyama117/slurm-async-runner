@@ -6,7 +6,7 @@
 
 import builtins
 import os
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, final
 
 if TYPE_CHECKING:
@@ -171,7 +171,7 @@ class SbatchManager:
 
     def run_with_jobid_callback(
         self,
-        on_spawn: "builtins.object",
+        on_spawn: Callable[[builtins.int], object],
     ) -> Awaitable[FinishedInfo]:
         """Same as ``run()`` but invokes ``on_spawn(jobid)`` synchronously
         the moment sbatch returns a parseable jobid.

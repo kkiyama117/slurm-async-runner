@@ -19,7 +19,8 @@
 //!   and reads a JSON file directly — useful for ad-hoc debugging
 //!   regardless of which store is configured.
 //! - [`TssrunManager::query_state`] looks up SLURM lifecycle state via
-//!   `sacct` for handles that already parsed a jobid.
+//!   `squeue` (active jobs) with a `sacct` fallback for jobs that have
+//!   left the queue, for handles that already parsed a jobid.
 //!
 //! ## Builder pattern
 //!
@@ -221,7 +222,9 @@ impl TssrunManager {
         }
     }
 
-    /// Look up the SLURM lifecycle state via `sacct`.
+    /// Look up the SLURM lifecycle state via `squeue`, falling back to
+    /// `sacct` for jobs no longer in the active queue (delegates to
+    /// [`runner::query_job_states_batch`]).
     /// Returns a default `JobStatus` when the handle has no parsed jobid.
     pub async fn query_state(&self, handle: &TssrunJobHandle) -> Result<JobStatus> {
         match handle.jobid() {

@@ -46,8 +46,15 @@ def _load_live_module():
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load {_LIVE_SCRIPT}")
     module = importlib.util.module_from_spec(spec)
+    # Register before exec (standard import-system order, so the module can
+    # self-reference), but unregister on failure so a broken half-executed
+    # module is never reused by a later call.
     sys.modules["tssrun_live_runner"] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("tssrun_live_runner", None)
+        raise
     return module
 
 

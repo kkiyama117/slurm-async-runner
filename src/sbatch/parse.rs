@@ -48,6 +48,26 @@ pub fn resolve_log_path(
     array_task_id: Option<u32>,
     job_name: Option<&str>,
 ) -> PathBuf {
+    // `%u` / `%N` read the environment at call time (not spawn time) —
+    // acceptable because neither changes over a process lifetime in
+    // practice. The env reads live here, outside the substitution core,
+    // so tests can cover `%u` / `%N` without mutating process env.
+    let user = std::env::var("USER").unwrap_or_default();
+    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+    resolve_log_path_with(template, jobid, array_task_id, job_name, &user, &hostname)
+}
+
+/// Environment-free substitution core of [`resolve_log_path`]: `%u` and
+/// `%N` come from the explicit `user` / `hostname` arguments instead of
+/// `std::env`.
+pub(crate) fn resolve_log_path_with(
+    template: &str,
+    jobid: u64,
+    array_task_id: Option<u32>,
+    job_name: Option<&str>,
+    user: &str,
+    hostname: &str,
+) -> PathBuf {
     let mut s = template.to_string();
     // Substitute %A first (master jobid alias) so it does not collide with %a.
     let jobid_str = jobid.to_string();
@@ -59,10 +79,8 @@ pub fn resolve_log_path(
     if let Some(name) = job_name {
         s = s.replace("%x", name);
     }
-    let user = std::env::var("USER").unwrap_or_default();
-    s = s.replace("%u", &user);
-    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
-    s = s.replace("%N", &hostname);
+    s = s.replace("%u", user);
+    s = s.replace("%N", hostname);
     PathBuf::from(s)
 }
 
@@ -212,34 +230,15 @@ Submitted batch job 67890
     }
 
     #[test]
-    fn resolve_substitutes_user_env() {
-        let prev = std::env::var("USER").ok();
-        // SAFETY: single-threaded test, no other threads observing env.
-        unsafe {
-            std::env::set_var("USER", "alice");
-        }
-        let p = resolve_log_path("/home/%u/out-%j.log", 999, None, None);
+    fn resolve_substitutes_user() {
+        let p = resolve_log_path_with("/home/%u/out-%j.log", 999, None, None, "alice", "");
         assert_eq!(p, PathBuf::from("/home/alice/out-999.log"));
-        // SAFETY: restore previous USER.
-        match prev {
-            Some(v) => unsafe { std::env::set_var("USER", v) },
-            None => unsafe { std::env::remove_var("USER") },
-        }
     }
 
     #[test]
-    fn resolve_substitutes_hostname_env() {
-        let prev = std::env::var("HOSTNAME").ok();
-        // SAFETY: single-threaded test.
-        unsafe {
-            std::env::set_var("HOSTNAME", "loginnode");
-        }
-        let p = resolve_log_path("%N-%j.out", 42, None, None);
+    fn resolve_substitutes_hostname() {
+        let p = resolve_log_path_with("%N-%j.out", 42, None, None, "", "loginnode");
         assert_eq!(p, PathBuf::from("loginnode-42.out"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HOSTNAME", v) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
     }
 
     // ---- parse_sacct_exit_code ----
