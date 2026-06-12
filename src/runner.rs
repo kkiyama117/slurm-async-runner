@@ -16,8 +16,30 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::dispatcher::{JobDispatcher, TokioDispatcher};
+use crate::dispatcher::{CaptureOutput, JobDispatcher, TokioDispatcher};
 use crate::{JobReason, JobState, JobStatus};
+
+/// Fail with a uniform `` `{tool}` exited with {code}: {stderr} `` error
+/// when a query subprocess reports a nonzero exit. Callers decide what a
+/// nonzero exit *means* first (see [`squeue_reports_vanished`]) and only
+/// route genuine failures here.
+fn ensure_query_success(tool: &str, out: &CaptureOutput) -> anyhow::Result<()> {
+    if out.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`{tool}` exited with {}: {}",
+        out.exit_code,
+        out.stderr.trim()
+    )
+}
+
+/// squeue exits non-zero with `Invalid job id specified` on stderr when
+/// every queried jobid has left the queue (KUDPC purges terminated jobs
+/// immediately). That is a *vanish* signal, not a failure.
+fn squeue_reports_vanished(out: &CaptureOutput) -> bool {
+    out.exit_code != 0 && out.stderr.contains("Invalid job id specified")
+}
 
 /// Bulk-query SLURM for the `(state, reason)` of every jobid in the input.
 /// Default-flavored wrapper around [`query_job_states_batch_with`] that
@@ -52,8 +74,14 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
         "-o".to_string(),
         "%i %T %r".to_string(),
     ];
-    let (_, squeue_out) = dispatcher.capture(&squeue_argv).await?;
-    let active = parse_squeue(stdout_section(&squeue_out));
+    let squeue_out = dispatcher.capture(&squeue_argv).await?;
+    let active = if squeue_reports_vanished(&squeue_out) {
+        // Every queried id has left the queue — fall through to sacct.
+        HashMap::new()
+    } else {
+        ensure_query_success("squeue", &squeue_out)?;
+        parse_squeue(&squeue_out.stdout)
+    };
 
     let missing: Vec<u64> = unique
         .iter()
@@ -73,8 +101,11 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
             "-o".to_string(),
             "JobID,State,Reason".to_string(),
         ];
-        let (_, sacct_out) = dispatcher.capture(&sacct_argv).await?;
-        parse_sacct(stdout_section(&sacct_out))
+        let sacct_out = dispatcher.capture(&sacct_argv).await?;
+        // sacct returns exit 0 + empty stdout for unknown jobids;
+        // a nonzero exit is a genuine failure.
+        ensure_query_success("sacct", &sacct_out)?;
+        parse_sacct(&sacct_out.stdout)
     };
 
     Ok(merge_results(jobids, &active, &history))
@@ -111,8 +142,14 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
         "-o".to_string(),
         "%i %T %r".to_string(),
     ];
-    let (_, squeue_out) = dispatcher.capture(&squeue_argv).await?;
-    let active = parse_squeue(stdout_section(&squeue_out));
+    let squeue_out = dispatcher.capture(&squeue_argv).await?;
+    let active = if squeue_reports_vanished(&squeue_out) {
+        // Every queried id has left the queue — fall through to sacct.
+        HashMap::new()
+    } else {
+        ensure_query_success("squeue", &squeue_out)?;
+        parse_squeue(&squeue_out.stdout)
+    };
 
     let missing: Vec<u64> = unique
         .iter()
@@ -132,8 +169,11 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
             "-o".to_string(),
             "JobID,State,Reason,ExitCode".to_string(),
         ];
-        let (_, sacct_out) = dispatcher.capture(&sacct_argv).await?;
-        parse_sacct_with_exit_code(stdout_section(&sacct_out))
+        let sacct_out = dispatcher.capture(&sacct_argv).await?;
+        // sacct returns exit 0 + empty stdout for unknown jobids;
+        // a nonzero exit is a genuine failure.
+        ensure_query_success("sacct", &sacct_out)?;
+        parse_sacct_with_exit_code(&sacct_out.stdout)
     };
 
     let mut out: HashMap<u64, JobOutcome> = HashMap::with_capacity(jobids.len());
@@ -162,33 +202,6 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
 }
 
 // ---------------------------------------------------------------- helpers
-
-/// Return only the stdout section of a [`JobDispatcher::capture`] output.
-///
-/// Production `capture` implementations (see
-/// [`crate::dispatcher::TokioDispatcher`]) merge the child's stderr after
-/// stdout with a standalone `[stderr]` marker line so that submit-style
-/// callers can surface diagnostics. Query parsers must never treat that
-/// section as data rows: e.g. `squeue -j` for a vanished jobid prints
-/// `slurm_load_jobs error: Invalid job id specified` on stderr, and
-/// [`parse_squeue_array_task`] would otherwise read the marker line as a
-/// state token (`JobState::Unknown`), keeping `wait_terminal` polling
-/// forever. Every `query_*` helper in this module therefore strips the
-/// `[stderr]` section before parsing.
-pub(crate) fn stdout_section(text: &str) -> &str {
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        // Tolerate a CRLF-terminated marker line (`[stderr]\r\n`) even
-        // though `TokioDispatcher` always injects the marker with a bare
-        // `\n` — defensive against transports that rewrite line endings.
-        let trimmed = line.strip_suffix('\n').unwrap_or(line);
-        if trimmed.strip_suffix('\r').unwrap_or(trimmed) == "[stderr]" {
-            return &text[..offset];
-        }
-        offset += line.len();
-    }
-    text
-}
 
 fn dedupe_preserving_order(ids: &[u64]) -> Vec<u64> {
     let mut seen = HashSet::with_capacity(ids.len());
@@ -394,8 +407,12 @@ pub async fn query_job_states_via_qgroup_with<D: JobDispatcher>(
         return Ok(HashMap::new());
     }
     let argv = vec!["qgroup".to_string(), "-l".to_string()];
-    let (_, stdout) = dispatcher.capture(&argv).await?;
-    let all = parse_qgroup_l(stdout_section(&stdout));
+    let out = dispatcher.capture(&argv).await?;
+    // A nonzero qgroup exit is an error here; the refresh caller
+    // (`SbatchJobHandle::refresh`) converts any qgroup `Err` into a
+    // warn + miss + squeue fallback.
+    ensure_query_success("qgroup", &out)?;
+    let all = parse_qgroup_l(&out.stdout);
     let wanted: HashSet<u64> = jobids.iter().copied().collect();
     Ok(all
         .into_iter()
@@ -422,8 +439,13 @@ pub async fn query_job_states_squeue_only_with<D: JobDispatcher>(
         "-o".to_string(),
         "%i %T %r".to_string(),
     ];
-    let (_, out) = dispatcher.capture(&argv).await?;
-    Ok(parse_squeue(stdout_section(&out)))
+    let out = dispatcher.capture(&argv).await?;
+    if squeue_reports_vanished(&out) {
+        // Every queried id has left the queue — report an empty listing.
+        return Ok(HashMap::new());
+    }
+    ensure_query_success("squeue", &out)?;
+    Ok(parse_squeue(&out.stdout))
 }
 
 /// Query a single array task by its SLURM `<master>_<idx>` key via
@@ -453,8 +475,13 @@ pub async fn query_array_task_state_with<D: JobDispatcher>(
         "-o".to_string(),
         "%T %r".to_string(),
     ];
-    let (_, out) = dispatcher.capture(&argv).await?;
-    Ok(parse_squeue_array_task(stdout_section(&out)))
+    let out = dispatcher.capture(&argv).await?;
+    if squeue_reports_vanished(&out) {
+        // The task has left the queue — the vanish signal, not a failure.
+        return Ok(None);
+    }
+    ensure_query_success("squeue", &out)?;
+    Ok(parse_squeue_array_task(&out.stdout))
 }
 
 /// Per-task heavyweight finalizer. Issues `sacct -P -n -j <master>_<idx>`
@@ -484,8 +511,11 @@ pub async fn query_array_task_outcome_with<D: JobDispatcher>(
         "-o".to_string(),
         "JobID,State,Reason,ExitCode".to_string(),
     ];
-    let (_, out) = dispatcher.capture(&argv).await?;
-    Ok(parse_sacct_array_task_with_exit_code(stdout_section(&out)))
+    let out = dispatcher.capture(&argv).await?;
+    // sacct returns exit 0 + empty stdout for unknown jobids; a nonzero
+    // exit is a genuine failure.
+    ensure_query_success("sacct", &out)?;
+    Ok(parse_sacct_array_task_with_exit_code(&out.stdout))
 }
 
 /// Parse a single-row `squeue -o "%T %r"` output for one array task.
@@ -580,6 +610,16 @@ pub(crate) fn merge_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatcher::CaptureOutput;
+
+    /// stdout-only success [`CaptureOutput`] — the common canned shape.
+    fn cap_ok(stdout: &str) -> CaptureOutput {
+        CaptureOutput {
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
 
     // ---- parse_squeue ----
 
@@ -732,14 +772,14 @@ mod tests {
             async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
                 unimplemented!()
             }
-            async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
                 let bin = argv[0].as_str();
                 let out = if bin == "squeue" {
-                    "12345 RUNNING None\n".to_string()
+                    "12345 RUNNING None\n"
                 } else {
-                    String::new()
+                    ""
                 };
-                Ok((0, out))
+                Ok(cap_ok(out))
             }
         }
         let m = query_job_states_with_exit_code_with(&D, &[12345])
@@ -757,10 +797,10 @@ mod tests {
             async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
                 unimplemented!()
             }
-            async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
                 let bin = argv[0].as_str();
                 let out = if bin == "squeue" {
-                    String::new()
+                    ""
                 } else if bin == "sacct" {
                     let format_idx = argv.iter().position(|a| a == "-o").unwrap();
                     assert!(
@@ -768,11 +808,11 @@ mod tests {
                         "sacct argv must include ExitCode column, got: {:?}",
                         argv
                     );
-                    "12345|COMPLETED|None|0:0\n".to_string()
+                    "12345|COMPLETED|None|0:0\n"
                 } else {
-                    String::new()
+                    ""
                 };
-                Ok((0, out))
+                Ok(cap_ok(out))
             }
         }
         let m = query_job_states_with_exit_code_with(&D, &[12345])
@@ -790,9 +830,9 @@ mod tests {
             async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
                 unimplemented!()
             }
-            async fn capture(&self, _argv: &[String]) -> anyhow::Result<(i32, String)> {
+            async fn capture(&self, _argv: &[String]) -> anyhow::Result<CaptureOutput> {
                 // Both squeue and sacct return empty — id 99999 is unknown to both
-                Ok((0, String::new()))
+                Ok(CaptureOutput::default())
             }
         }
         let m = query_job_states_with_exit_code_with(&D, &[99999])
@@ -883,22 +923,31 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             panic!("PanicDispatcher.run called")
         }
-        async fn capture(&self, _argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, _argv: &[String]) -> Result<CaptureOutput> {
             panic!("PanicDispatcher.capture called")
         }
     }
 
     struct MockCapture {
         expected_argv: Vec<String>,
-        stdout: String,
+        output: CaptureOutput,
+    }
+    impl MockCapture {
+        /// stdout-only success mock — the common case.
+        fn ok(expected_argv: Vec<String>, stdout: &str) -> Self {
+            Self {
+                expected_argv,
+                output: cap_ok(stdout),
+            }
+        }
     }
     impl JobDispatcher for MockCapture {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             panic!("not used")
         }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
             assert_eq!(argv, self.expected_argv.as_slice());
-            Ok((0, self.stdout.clone()))
+            Ok(self.output.clone())
         }
     }
 
@@ -929,10 +978,7 @@ queue user 1 RUN 1 1 1M 0:0:1(0:1:0)
 queue user 2 RUN 1 1 1M 0:0:1(0:1:0)
 queue user 3 RUN 1 1 1M 0:0:1(0:1:0)
 ";
-        let mock = MockCapture {
-            expected_argv: vec!["qgroup".into(), "-l".into()],
-            stdout: stdout.to_string(),
-        };
+        let mock = MockCapture::ok(vec!["qgroup".into(), "-l".into()], stdout);
         let m = super::query_job_states_via_qgroup_with(&mock, &[2])
             .await
             .unwrap();
@@ -1043,49 +1089,6 @@ gr19999b u 5555 CMP 1
         assert_eq!(map.get(&7519511).map(|s| s.state), Some(JobState::Failed));
     }
 
-    // ---- stdout_section ----
-
-    #[test]
-    fn stdout_section_passes_through_marker_free_text() {
-        let text = "12345 RUNNING None\n";
-        assert_eq!(super::stdout_section(text), text);
-        assert_eq!(super::stdout_section(""), "");
-    }
-
-    #[test]
-    fn stdout_section_cuts_at_stderr_marker() {
-        let text = "12345 RUNNING None\n[stderr]\nsqueue: warning: something\n";
-        assert_eq!(super::stdout_section(text), "12345 RUNNING None\n");
-    }
-
-    #[test]
-    fn stdout_section_returns_empty_for_stderr_only_output() {
-        let text = "[stderr]\nslurm_load_jobs error: Invalid job id specified\n";
-        assert_eq!(super::stdout_section(text), "");
-    }
-
-    /// A data row that merely *contains* the marker substring must not be
-    /// cut — only a standalone `[stderr]` line is the dispatcher marker.
-    #[test]
-    fn stdout_section_ignores_inline_marker_substring() {
-        let text = "12345 RUNNING [stderr]-shaped-reason\n67890 PENDING None\n";
-        assert_eq!(super::stdout_section(text), text);
-    }
-
-    /// The marker is still detected when it is the final line without a
-    /// trailing newline, and when the line ending is CRLF.
-    #[test]
-    fn stdout_section_handles_unterminated_and_crlf_marker() {
-        assert_eq!(
-            super::stdout_section("12345 RUNNING None\n[stderr]"),
-            "12345 RUNNING None\n"
-        );
-        assert_eq!(
-            super::stdout_section("12345 RUNNING None\r\n[stderr]\r\nerr\r\n"),
-            "12345 RUNNING None\r\n"
-        );
-    }
-
     // ---- parse_squeue_array_task ----
 
     #[test]
@@ -1153,8 +1156,8 @@ gr19999b u 5555 CMP 1
 
     #[tokio::test]
     async fn query_array_task_state_uses_master_underscore_idx_squeue_key() {
-        let mock = MockCapture {
-            expected_argv: vec![
+        let mock = MockCapture::ok(
+            vec![
                 "squeue".into(),
                 "-h".into(),
                 "-j".into(),
@@ -1162,8 +1165,8 @@ gr19999b u 5555 CMP 1
                 "-o".into(),
                 "%T %r".into(),
             ],
-            stdout: "RUNNING None\n".into(),
-        };
+            "RUNNING None\n",
+        );
         let s = super::query_array_task_state_with(&mock, 12345, 3)
             .await
             .unwrap()
@@ -1173,8 +1176,8 @@ gr19999b u 5555 CMP 1
 
     #[tokio::test]
     async fn query_array_task_state_returns_none_when_squeue_reports_no_row() {
-        let mock = MockCapture {
-            expected_argv: vec![
+        let mock = MockCapture::ok(
+            vec![
                 "squeue".into(),
                 "-h".into(),
                 "-j".into(),
@@ -1182,48 +1185,124 @@ gr19999b u 5555 CMP 1
                 "-o".into(),
                 "%T %r".into(),
             ],
-            stdout: String::new(),
-        };
+            "",
+        );
         let r = super::query_array_task_state_with(&mock, 99999, 0)
             .await
             .unwrap();
         assert!(r.is_none());
     }
 
-    /// Regression: once the array master has left squeue entirely, SLURM
-    /// prints `slurm_load_jobs error: Invalid job id specified` on stderr
-    /// and exits 1. `TokioDispatcher::capture` merges that into the
-    /// returned text as `"[stderr]\n…"`. The parser must not read the
-    /// marker (or any stderr line) as a state row — the task has
-    /// vanished, so the query must report `None`. Previously the marker
-    /// line parsed as `JobState::Unknown`, `left_active_listing` never
-    /// flipped, and `wait_terminal` polled forever.
+    // ---- failure classification (vanish vs. transient) ----
+
+    /// Mock that always returns the same canned [`CaptureOutput`]
+    /// regardless of argv — for classification tests where only the
+    /// exit_code/stderr combination matters.
+    struct FixedCapture(CaptureOutput);
+    impl JobDispatcher for FixedCapture {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            panic!("not used")
+        }
+        async fn capture(&self, _argv: &[String]) -> Result<CaptureOutput> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn vanished_squeue() -> CaptureOutput {
+        CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "slurm_load_jobs error: Invalid job id specified\n".into(),
+        }
+    }
+
+    fn transient_squeue() -> CaptureOutput {
+        CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "slurm_load_jobs error: Socket timed out on send/recv operation\n".into(),
+        }
+    }
+
+    /// KUDPC purges terminated jobs from the queue immediately, so squeue
+    /// exits non-zero with `Invalid job id specified` once every queried
+    /// jobid has left the queue. That is the *vanish* signal, not a
+    /// failure — per-task query reports `None`.
     #[tokio::test]
-    async fn query_array_task_state_returns_none_for_stderr_only_output() {
-        let mock = MockCapture {
-            expected_argv: vec![
-                "squeue".into(),
-                "-h".into(),
-                "-j".into(),
-                "12345_3".into(),
-                "-o".into(),
-                "%T %r".into(),
-            ],
-            stdout: "[stderr]\nslurm_load_jobs error: Invalid job id specified\n".into(),
-        };
+    async fn query_array_task_state_treats_invalid_jobid_failure_as_vanished() {
+        let mock = FixedCapture(vanished_squeue());
         let r = super::query_array_task_state_with(&mock, 12345, 3)
             .await
             .unwrap();
+        assert!(r.is_none(), "vanished jobid must map to None, got {r:?}");
+    }
+
+    /// Same vanish signal on the batch squeue-only helper: empty map, no
+    /// error.
+    #[tokio::test]
+    async fn query_squeue_only_treats_invalid_jobid_failure_as_empty() {
+        let mock = FixedCapture(vanished_squeue());
+        let m = super::query_job_states_squeue_only_with(&mock, &[12345])
+            .await
+            .unwrap();
+        assert!(m.is_empty(), "vanished jobids must map to empty, got {m:?}");
+    }
+
+    /// A transient controller failure (`Socket timed out`) is NOT a
+    /// vanish — it must surface as an error naming the tool and carrying
+    /// the stderr text, never as a silent empty listing.
+    #[tokio::test]
+    async fn query_array_task_state_propagates_transient_squeue_failure() {
+        let mock = FixedCapture(transient_squeue());
+        let err = super::query_array_task_state_with(&mock, 12345, 3)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("squeue"), "tool name expected, got: {msg}");
         assert!(
-            r.is_none(),
-            "stderr-only output means the task vanished, got {r:?}"
+            msg.contains("Socket timed out"),
+            "stderr text expected, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_squeue_only_propagates_transient_squeue_failure() {
+        let mock = FixedCapture(transient_squeue());
+        let err = super::query_job_states_squeue_only_with(&mock, &[12345])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("squeue"), "tool name expected, got: {msg}");
+        assert!(
+            msg.contains("Socket timed out"),
+            "stderr text expected, got: {msg}"
+        );
+    }
+
+    /// sacct returns exit 0 + empty stdout for unknown jobids; a nonzero
+    /// exit is a genuine failure and must propagate.
+    #[tokio::test]
+    async fn query_array_task_outcome_propagates_sacct_failure() {
+        let mock = FixedCapture(CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "sacct: error: slurmdbd is unresponsive\n".into(),
+        });
+        let err = super::query_array_task_outcome_with(&mock, 12345, 3)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sacct"), "tool name expected, got: {msg}");
+        assert!(
+            msg.contains("slurmdbd is unresponsive"),
+            "stderr text expected, got: {msg}"
         );
     }
 
     #[tokio::test]
     async fn query_array_task_outcome_uses_master_underscore_idx_sacct_key() {
-        let mock = MockCapture {
-            expected_argv: vec![
+        let mock = MockCapture::ok(
+            vec![
                 "sacct".into(),
                 "-P".into(),
                 "-n".into(),
@@ -1232,8 +1311,8 @@ gr19999b u 5555 CMP 1
                 "-o".into(),
                 "JobID,State,Reason,ExitCode".into(),
             ],
-            stdout: "12345_3|COMPLETED|None|0:0\n".into(),
-        };
+            "12345_3|COMPLETED|None|0:0\n",
+        );
         let oc = super::query_array_task_outcome_with(&mock, 12345, 3)
             .await
             .unwrap()

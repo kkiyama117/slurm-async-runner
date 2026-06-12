@@ -344,6 +344,12 @@ fn new(
 - 「リストに居ない」は「終わった」を意味しない。終端の確定は terminal
   状態の観測のみを根拠にすること（vanish は再試行のトリガーにすぎない）。
 - 根本原因は query ヘルパーが exit code / stderr を捨てて「一時失敗」と
-  「消失」を融合していること。`capture` の戻りを
-  `{ exit_code, stdout, stderr }` に構造化する改善が残タスク
-  （[stderr] マーカー結合の廃止とセット）。
+  「消失」を融合していること。同日中に `capture` の戻りを
+  `CaptureOutput { exit_code, stdout, stderr }` に構造化して解決した:
+  `[stderr]` マーカー結合と `stdout_section` は廃止（パーサは `.stdout`
+  のみを読むため誤読が構造的に不可能に）、squeue の
+  `Invalid job id specified` (= vanish) とそれ以外の非ゼロ exit
+  (= transient エラー、`refresh()` が Err を伝播) を判別、
+  `wait_terminal` は連続 5 回まで refresh 失敗を warn して耐える。
+  診断用の merged 形式は `CaptureOutput::diagnostic()` としてエラー
+  構築箇所のみで生成する。

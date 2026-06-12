@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Structured subprocess capture (`CaptureOutput`).** The internal
+  `JobDispatcher::capture` API now returns
+  `CaptureOutput { exit_code, stdout, stderr }` instead of merging
+  stderr into stdout behind a `[stderr]` marker line. Query parsers read
+  `.stdout` only — the marker-misread bug class is structurally
+  impossible now — and error diagnostics use
+  `CaptureOutput::diagnostic()` (same merged text as before, so
+  user-facing error messages are unchanged). `runner::stdout_section`
+  is gone.
+- **`refresh()` now distinguishes transient SLURM failures from
+  vanished jobs.** A `squeue`/`sacct` non-zero exit with a stderr other
+  than `Invalid job id specified` (e.g. `Socket timed out` under
+  controller overload) propagates as an error instead of being recorded
+  as a false "left the queue" observation. `Invalid job id specified`
+  still counts as a vanish. **Behavior change**: Python `refresh()` /
+  `refresh_with_sacct()` can now raise `RuntimeError` on controller
+  hiccups — retry on the next poll.
+- **`wait_terminal` tolerates transient refresh failures.** Up to 5
+  consecutive refresh errors are logged (`tracing::warn!`) and polling
+  continues; the 5th consecutive failure propagates. A multi-hour wait
+  no longer dies on a single controller timeout.
+- **`log_lines` reads the file tail via backwards chunked seeks.**
+  Memory is now `O(n × line length)` instead of `O(file size)` — no
+  more whole-file loads (potential OOM) on multi-GB job logs.
+  `read_log_to_end` intentionally keeps whole-file semantics.
+- **State store hardening:** corrupted snapshot files are skipped with
+  a `tracing::warn!` instead of silently vanishing from `list()`;
+  `JobStateStore::delete(uuid)` added (idempotent) for garbage
+  collection; the on-disk envelope now carries `"schema_version": 1`
+  (files without the field load as v1; unsupported versions fail with a
+  clear message).
+
 ### Fixed
 
 - **`refresh_with_sacct` no longer stamps a non-terminal `FinishedInfo`

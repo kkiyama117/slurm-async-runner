@@ -77,21 +77,22 @@ impl SbatchManager {
 
     pub async fn spawn(&self) -> Result<SbatchJobHandle, SbatchSpawnError> {
         let argv = self.cmd.build_argv()?;
-        let (exit_code, stdout) = self
+        let out = self
             .dispatcher
             .capture(&argv)
             .await
             .map_err(SbatchSpawnError::Other)?;
-        if exit_code != 0 {
+        if !out.success() {
             return Err(SbatchSpawnError::SubmitFailed {
-                exit_code,
-                output: stdout,
+                exit_code: out.exit_code,
+                output: out.diagnostic(),
             });
         }
-        let jobid =
-            parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
-                stdout: stdout.clone(),
-            })?;
+        let jobid = parse_submitted_jobid(&out.stdout).ok_or_else(|| {
+            SbatchSpawnError::JobidParseError {
+                stdout: out.stdout.clone(),
+            }
+        })?;
 
         let uuid = Uuid::now_v7();
         let script_path = std::path::absolute(&self.cmd.script)
@@ -155,21 +156,22 @@ impl SbatchManager {
         cmd.array_spec = Some(array_spec);
         let argv = cmd.build_argv()?;
 
-        let (exit_code, stdout) = self
+        let out = self
             .dispatcher
             .capture(&argv)
             .await
             .map_err(SbatchSpawnError::Other)?;
-        if exit_code != 0 {
+        if !out.success() {
             return Err(SbatchSpawnError::SubmitFailed {
-                exit_code,
-                output: stdout,
+                exit_code: out.exit_code,
+                output: out.diagnostic(),
             });
         }
-        let master_jobid =
-            parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
-                stdout: stdout.clone(),
-            })?;
+        let master_jobid = parse_submitted_jobid(&out.stdout).ok_or_else(|| {
+            SbatchSpawnError::JobidParseError {
+                stdout: out.stdout.clone(),
+            }
+        })?;
 
         let script_path = std::path::absolute(&cmd.script)
             .with_context(|| format!("absolutize {}", cmd.script.display()))
@@ -387,15 +389,15 @@ impl SbatchManager {
     /// fake-scancel script.
     pub async fn cancel(&self, jobid: u64) -> Result<(), SbatchCancelError> {
         let argv = vec![self.scancel_bin.clone(), jobid.to_string()];
-        let (exit_code, stdout) = self
+        let out = self
             .dispatcher
             .capture(&argv)
             .await
             .map_err(SbatchCancelError::Other)?;
-        if exit_code != 0 {
+        if !out.success() {
             return Err(SbatchCancelError::Scancel {
-                exit_code,
-                output: stdout,
+                exit_code: out.exit_code,
+                output: out.diagnostic(),
             });
         }
         Ok(())
@@ -405,8 +407,18 @@ impl SbatchManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatcher::{JobDispatcher, into_dyn};
+    use crate::dispatcher::{CaptureOutput, JobDispatcher, into_dyn};
     use std::sync::Mutex;
+
+    /// stdout-only [`CaptureOutput`] with the given exit code — the
+    /// common shape for canned test responses.
+    fn cap(exit_code: i32, stdout: &str) -> CaptureOutput {
+        CaptureOutput {
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
 
     struct CannedSbatch {
         stdout: Mutex<String>,
@@ -436,10 +448,10 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             unimplemented!()
         }
-        async fn capture(&self, _argv: &[String]) -> Result<(i32, String)> {
-            Ok((
+        async fn capture(&self, _argv: &[String]) -> Result<CaptureOutput> {
+            Ok(cap(
                 *self.exit.lock().unwrap(),
-                self.stdout.lock().unwrap().clone(),
+                &self.stdout.lock().unwrap(),
             ))
         }
     }
@@ -705,15 +717,15 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             unimplemented!()
         }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
             self.seen.lock().unwrap().push(argv.to_vec());
-            let resp = self
+            let (exit_code, stdout) = self
                 .responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or((0, String::new()));
-            Ok(resp)
+            Ok(cap(exit_code, &stdout))
         }
     }
 
@@ -817,18 +829,18 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             unimplemented!()
         }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
             let out = match argv[0].as_str() {
                 "sbatch" => {
                     let (e, s) = self.sbatch.lock().unwrap().clone();
-                    return Ok((e, s));
+                    return Ok(cap(e, &s));
                 }
                 "qgroup" => self.qgroup.lock().unwrap().clone(),
                 "squeue" => self.squeue.lock().unwrap().clone(),
                 "sacct" => self.sacct.lock().unwrap().clone(),
                 _ => String::new(),
             };
-            Ok((0, out))
+            Ok(cap(0, &out))
         }
     }
 

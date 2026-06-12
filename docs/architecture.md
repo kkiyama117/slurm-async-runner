@@ -137,15 +137,19 @@ sbatch サブシステム（§3.5）は **子プロセスを持たない**ため
 ### 3.2 Runtime 層（プロセス実行抽象）
 
 - `src/dispatcher.rs::JobDispatcher` … `Send + Sync` な trait。
-  `run(argv) -> i32` と `capture(argv) -> (i32, String)` の 2 メソッド。
+  `run(argv) -> i32` と `capture(argv) -> CaptureOutput` の 2 メソッド。
+- `CaptureOutput` … `{ exit_code, stdout, stderr }` の構造化された
+  capture 結果。パーサ群 (`parse_qgroup_l` / `parse_squeue` /
+  `parse_sacct_*` / `parse_submitted_jobid`) は `.stdout` のみを読む
+  ので stderr がデータ行として誤読されることはない。診断用には
+  `.diagnostic()` がレガシーの `"{stdout}\n[stderr]\n{stderr}"` 結合形
+  を生成し、`SbatchSpawnError::SubmitFailed::output` /
+  `SbatchCancelError::Scancel::output` に入る。`exit_code` + `stderr`
+  により `src/runner.rs` が「ジョブ消滅 (`Invalid job id specified`)」
+  と「一時的な SLURM 障害 (`Socket timed out` 等)」を区別する。
 - `TokioDispatcher` … `tokio::process::Command` で実プロセスを起動。
-  `run` 側は stdout/stderr を pipe + 親へ echo、`capture` 側は stdout
-  に加えて **stderr も `[stderr]` マーカー区切りで末尾結合**する
-  （sbatch 失敗時の `sbatch: error: ...` 等の診断メッセージを
-  `SbatchSpawnError::SubmitFailed::output` まで届けるため。`stderr` が
-  空のときは何も付けないので line-based パーサ群 (`parse_qgroup_l` /
-  `parse_squeue` / `parse_sacct_*` / `parse_submitted_jobid`) は
-  非破壊）。
+  `run` 側は stdout/stderr を pipe + 親へ echo、`capture` 側は
+  exit_code / stdout / stderr を分離したまま `CaptureOutput` で返す。
 - `DryRunDispatcher` … プロセスを起動せず argv を `println!` するだけ。
   常に `Ok(0)` を返す。
 - `BackgroundDispatcher` extends `JobDispatcher` … `spawn` を追加。

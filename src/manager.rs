@@ -220,7 +220,7 @@ mod tests {
                 self.received.lock().unwrap().push(argv.to_vec());
                 Ok(42)
             }
-            async fn capture(&self, _argv: &[String]) -> Result<(i32, String)> {
+            async fn capture(&self, _argv: &[String]) -> Result<crate::dispatcher::CaptureOutput> {
                 unimplemented!()
             }
         }
