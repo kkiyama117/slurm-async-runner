@@ -57,7 +57,7 @@ Python の `await` 可能 API として公開する **Rust + Python ハイブリ
 |  | SbatchManager -> SbatchJobHandle (watch スナップショット)|        |
 |  |   - sbatch でキュー投入、子プロセスは持たない              |        |
 |  |   - 単発 refresh()  = qgroup -l → squeue (sacct なし)    |        |
-|  |   - array task refresh() = squeue -j <master>_<idx>     |        |
+|  |   - array task refresh() = squeue -r -j <master>_<idx>  |        |
 |  |     (PR #12、qgroup は per-task では集計しか返さないため) |        |
 |  |   - refresh_with_sacct() / run() のみ sacct 経由         |        |
 |  |   - SlurmDependency / SlurmSignalSpec / MailTypeInput /  |        |
@@ -320,9 +320,11 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    を合成する。これは sbatch サブシステム導入時からの不変条件として固定。
    PR #12 (#8 A5) で array-task の per-task `refresh` を追加: `array_task_id.is_some()`
    の handle は `qgroup -l`（master 集計しか返さない）を skip して
-   `squeue -j <master>_<idx>` (`query_array_task_state_with`) を直叩きする。
-   `refresh_with_sacct()` の array-task branch も同様で `sacct -j <master>_<idx>`
-   (`query_array_task_outcome_with`) を使う。
+   `squeue -h -r -j <master>_<idx> -o "%i %T %r"` (`query_array_task_state_with`)
+   を使う。`refresh_with_sacct()` の array-task branch も同様で
+   `sacct -j <master>_<idx>` (`query_array_task_outcome_with`) を使う。
+   どちらも plain ジョブと同一のバッチ可能 argv 形状なので、
+   設計判断 7 の squeue / sacct キャッシュに plain handle と一緒に合流する。
    **KUDPC `qgroup -l` 互換 (PR #14)**: 詳細行は `QUEUE USER JOBID | STAT
    SUBMIT_AT | RSC:core | PROC CORE MEM ELAPSE` のパイプ区切りレイアウト。
    `parse_qgroup_l` は `|` トークンを skip し、`jobid_str.parse::<u64>() == 0`
@@ -390,10 +392,14 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    問い合わせていないキーに replay すると「行が無い = vanish /
    accounting 行なし」シグナルを捏造するため、未知キーの初回は必ず
    レジストリ全体と合流した live 再バッチになる。array-task クエリ
-   （`<master>_<idx>`）は KUDPC でのバッチ `-j` セマンティクス未検証の
-   ためキャッシュ対象外（squeue バッチ化を実機検証してから実装したのと
-   同じ基準）。TTL = poll_interval、`Duration::ZERO` でキャッシュ・
-   バッチ化とも無効（テスト時の素通し）。
+   （`<master>_<idx>`）も同じバッチに合流する（2026-06-12 KUDPC 実機検証:
+   squeue / sacct とも plain と array キーの混在 `-j` リストを受理し、
+   キー照合可能な per-task 行を返す）。前提は squeue argv の **`-r`**:
+   これが無いと PENDING タスクが `<master>_[0,2]` 集約行に畳まれて
+   キー照合が壊れる（plain ジョブには no-op）。キーの正本は
+   `query_cache::JobKey`（`Plain(u64)` / `ArrayTask`）で、step suffix や
+   集約トークンはパース不能 → 素通し。TTL = poll_interval、
+   `Duration::ZERO` でキャッシュ・バッチ化とも無効（テスト時の素通し）。
 
 ### 3.6 跨 backend handle 抽象（`src/handle.rs`、PR #7）
 

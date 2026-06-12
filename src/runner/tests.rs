@@ -482,25 +482,44 @@ fn parse_qgroup_l_handles_kudpc_pipe_separated_fini_and_fail_rows() {
 
 #[test]
 fn parse_squeue_array_task_extracts_state_and_reason() {
-    // squeue with -o "%T %r" gives just `STATE REASON` per row.
-    let out = "RUNNING None\n";
-    let s = super::parse_squeue_array_task(out).expect("Some");
+    // squeue with -r -o "%i %T %r" gives `KEY STATE REASON` per row.
+    let out = "12345_3 RUNNING None\n";
+    let s = super::parse_squeue_array_task(out, "12345_3").expect("Some");
     assert_eq!(s.state, JobState::Running);
     assert_eq!(s.reason, JobReason::None);
 }
 
 #[test]
 fn parse_squeue_array_task_returns_none_for_empty_output() {
-    assert_eq!(super::parse_squeue_array_task(""), None);
-    assert_eq!(super::parse_squeue_array_task("\n"), None);
+    assert_eq!(super::parse_squeue_array_task("", "12345_3"), None);
+    assert_eq!(super::parse_squeue_array_task("\n", "12345_3"), None);
 }
 
 #[test]
 fn parse_squeue_array_task_carries_pending_reason() {
-    let out = "PENDING Priority\n";
-    let s = super::parse_squeue_array_task(out).expect("Some");
+    let out = "12345_3 PENDING Priority\n";
+    let s = super::parse_squeue_array_task(out, "12345_3").expect("Some");
     assert_eq!(s.state, JobState::Pending);
     assert_eq!(s.reason, JobReason::Priority);
+}
+
+#[test]
+fn parse_squeue_array_task_ignores_rows_for_other_keys() {
+    // Exact-key match: a batched listing shared with plain jobs and
+    // other tasks must never contribute another row's status, and a
+    // missing key must read as "left the queue" (None).
+    let out = "\
+100 RUNNING None
+12345_2 PENDING Priority
+12345_3 RUNNING None
+";
+    let s = super::parse_squeue_array_task(out, "12345_2").expect("Some");
+    assert_eq!(s.state, JobState::Pending);
+    assert_eq!(
+        super::parse_squeue_array_task(out, "12345_9"),
+        None,
+        "a key absent from the listing must resolve to None, never another row"
+    );
 }
 
 // ---- parse_sacct_array_task_with_exit_code ----
@@ -572,16 +591,20 @@ fn parse_sacct_array_task_ignores_rows_for_other_tasks() {
 
 #[tokio::test]
 async fn query_array_task_state_uses_master_underscore_idx_squeue_key() {
+    // The argv must be the batchable summary shape (`-r`, `%i %T %r`) —
+    // any drift silently bypasses the squeue cache (see the shape-sync
+    // invariant in docs/architecture.md §6).
     let mock = MockCapture::ok(
         vec![
             "squeue".into(),
             "-h".into(),
+            "-r".into(),
             "-j".into(),
             "12345_3".into(),
             "-o".into(),
-            "%T %r".into(),
+            "%i %T %r".into(),
         ],
-        "RUNNING None\n",
+        "12345_3 RUNNING None\n",
     );
     let s = super::query_array_task_state_with(&mock, 12345, 3)
         .await
@@ -596,10 +619,11 @@ async fn query_array_task_state_returns_none_when_squeue_reports_no_row() {
         vec![
             "squeue".into(),
             "-h".into(),
+            "-r".into(),
             "-j".into(),
             "99999_0".into(),
             "-o".into(),
-            "%T %r".into(),
+            "%i %T %r".into(),
         ],
         "",
     );
@@ -607,6 +631,55 @@ async fn query_array_task_state_returns_none_when_squeue_reports_no_row() {
         .await
         .unwrap();
     assert!(r.is_none());
+}
+
+// ---- summary-argv shape pinning ----
+//
+// All three bulk query functions must build the exact batchable summary
+// shape the squeue cache recognizes (`-r` included) — any drift silently
+// bypasses the cache (shape-sync invariant, docs/architecture.md §6).
+// MockCapture asserts the full argv byte-for-byte.
+
+fn pinned_summary_argv(csv: &str) -> Vec<String> {
+    vec![
+        "squeue".into(),
+        "-h".into(),
+        "-r".into(),
+        "-j".into(),
+        csv.into(),
+        "-o".into(),
+        "%i %T %r".into(),
+    ]
+}
+
+#[tokio::test]
+async fn query_job_states_batch_builds_the_batchable_summary_argv() {
+    let mock = MockCapture::ok(pinned_summary_argv("100"), "100 RUNNING None\n");
+    let map = super::query_job_states_batch_with(&mock, &[100])
+        .await
+        .unwrap();
+    assert_eq!(map.get(&100).map(|s| s.state), Some(JobState::Running));
+}
+
+#[tokio::test]
+async fn query_job_states_with_exit_code_builds_the_batchable_summary_argv() {
+    let mock = MockCapture::ok(pinned_summary_argv("100"), "100 RUNNING None\n");
+    let map = super::query_job_states_with_exit_code_with(&mock, &[100])
+        .await
+        .unwrap();
+    assert_eq!(
+        map.get(&100).map(|o| o.status.state),
+        Some(JobState::Running)
+    );
+}
+
+#[tokio::test]
+async fn query_job_states_squeue_only_builds_the_batchable_summary_argv() {
+    let mock = MockCapture::ok(pinned_summary_argv("100"), "100 RUNNING None\n");
+    let map = super::query_job_states_squeue_only_with(&mock, &[100])
+        .await
+        .unwrap();
+    assert_eq!(map.get(&100).map(|s| s.state), Some(JobState::Running));
 }
 
 // ---- failure classification (vanish vs. transient) ----

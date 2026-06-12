@@ -27,20 +27,21 @@
 //! exactly what the subset-replay rule guarantees it can only mean
 //! (a key is never served a listing that did not ask about it).
 //!
-//! Scope is deliberately limited to the exit-code query shape
-//! `sacct -P -n -j <u64[,u64…]> -o JobID,State,Reason,ExitCode` issued by
-//! `refresh_with_sacct()`'s single-job path — the burst source described
-//! above. Passed through untouched:
-//! - array-task finalizers (`-j <master>_<idx>`): their key is not a
-//!   `u64`, and mixing array keys into a batched `-j` list is unverified
-//!   on KUDPC (the squeue batching was only built after live
-//!   verification; hold array-key batching to the same bar)
+//! Scope covers the exit-code query shape
+//! `sacct -P -n -j <key[,key…]> -o JobID,State,Reason,ExitCode` issued by
+//! `refresh_with_sacct()` — the burst source described above. Keys are
+//! plain jobids **and** array tasks (`<master>_<idx>`): KUDPC live
+//! verification (2026-06-12, jobids 7815400/7815401) confirmed sacct
+//! accepts both kinds mixed in one `-j` list and answers with per-task
+//! parent rows whose JobID column is exactly the queried key, which the
+//! keyed array-task parser (`parse_sacct_array_task_with_exit_code`)
+//! requires. Passed through untouched:
 //! - the legacy 3-column listing (`-o JobID,State,Reason`) used by the
 //!   one-shot `query_job_states_batch` API: not a polling path, and its
 //!   output shape differs from the cached one
 //! - `sbatch` / `scancel` / everything else: mutating or out of scope
 
-use crate::sbatch::query_cache::{QueryCacheState, QueryCachingDispatcher, QueryShape};
+use crate::sbatch::query_cache::{JobKey, QueryCacheState, QueryCachingDispatcher, QueryShape};
 
 /// The `-o` column list of the batchable exit-code query — must stay in
 /// sync with the argv built in `runner.rs`
@@ -48,19 +49,18 @@ use crate::sbatch::query_cache::{QueryCacheState, QueryCachingDispatcher, QueryS
 const EXIT_CODE_COLUMNS: &str = "JobID,State,Reason,ExitCode";
 
 /// The batchable exit-code query
-/// `sacct -P -n -j <u64[,u64…]> -o JobID,State,Reason,ExitCode`, as a
-/// [`QueryShape`].
+/// `sacct -P -n -j <key[,key…]> -o JobID,State,Reason,ExitCode`, as a
+/// [`QueryShape`]. Keys are plain jobids and array tasks (see [`JobKey`]).
 #[derive(Default)]
 pub(crate) struct SacctExitCodeShape;
 
 impl QueryShape for SacctExitCodeShape {
-    type Key = u64;
+    type Key = JobKey;
 
-    /// Returns the requested jobids iff `argv` is exactly the batchable
-    /// exit-code query. Array-task finalizers fail the key parse (their
-    /// `-j` key `<master>_<idx>` is not a u64) and the legacy 3-column
-    /// listing fails the column check.
-    fn parse(&self, argv: &[String]) -> Option<Vec<u64>> {
+    /// Returns the requested keys iff `argv` is exactly the batchable
+    /// exit-code query. The legacy 3-column listing fails the column
+    /// check; step suffixes and aggregate tokens fail the key parse.
+    fn parse(&self, argv: &[String]) -> Option<Vec<JobKey>> {
         if argv.len() != 7
             || argv[0] != "sacct"
             || argv[1] != "-P"
@@ -71,21 +71,16 @@ impl QueryShape for SacctExitCodeShape {
         {
             return None;
         }
-        argv[4].split(',').map(|t| t.parse::<u64>().ok()).collect()
+        JobKey::parse_csv(&argv[4])
     }
 
-    fn build(&self, batch: &[u64]) -> Vec<String> {
-        let csv = batch
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+    fn build(&self, batch: &[JobKey]) -> Vec<String> {
         vec![
             "sacct".into(),
             "-P".into(),
             "-n".into(),
             "-j".into(),
-            csv,
+            JobKey::build_csv(batch),
             "-o".into(),
             EXIT_CODE_COLUMNS.into(),
         ]
@@ -217,34 +212,61 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// Array-task finalizers and the legacy 3-column listing must pass
-    /// through untouched — see the module doc for why each is excluded.
+    /// Array-task finalizers share the batch with plain finalizers:
+    /// KUDPC-verified (2026-06-12) that sacct accepts the mixed `-j`
+    /// list and answers per-task parent rows the keyed array parser can
+    /// match on.
     #[tokio::test]
-    async fn array_task_and_legacy_column_queries_bypass_the_cache() {
+    async fn array_task_finalizers_join_the_shared_batch() {
         let argvs = Arc::new(Mutex::new(Vec::new()));
         let d = batching(argvs.clone(), Duration::from_secs(60));
 
-        let array: Vec<String> = vec![
-            "sacct".into(),
-            "-P".into(),
-            "-n".into(),
-            "-j".into(),
-            "123_4".into(),
-            "-o".into(),
-            "JobID,State,Reason,ExitCode".into(),
-        ];
-        d.capture(&array).await.unwrap();
-        d.capture(&array).await.unwrap();
+        d.capture(&exit_code_argv("100")).await.unwrap();
+        let out = d.capture(&exit_code_argv("123_4")).await.unwrap();
+        assert_eq!(calls(&argvs), 2);
+        assert_eq!(
+            jlist(&argvs, 1),
+            "100,123_4",
+            "the array key's first sight must re-batch with the plain key"
+        );
+        assert!(out.stdout.contains("123_4|COMPLETED"));
+
+        d.capture(&exit_code_argv("123_4")).await.unwrap();
+        d.capture(&exit_code_argv("100")).await.unwrap();
         assert_eq!(
             calls(&argvs),
             2,
-            "array-task sacct queries must never be coalesced or cached"
+            "both key kinds must replay the shared listing within TTL"
         );
+    }
+
+    /// Subset-replay, array edition: a listing that never asked about an
+    /// array key must not be replayed to it — the absent parent row would
+    /// fabricate "no usable accounting row" for that task. The unseen
+    /// array key must force a live re-batch.
+    #[tokio::test]
+    async fn cached_listing_never_replays_to_an_unqueried_array_key() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = batching(argvs.clone(), Duration::from_secs(60));
+
+        d.capture(&exit_code_argv("100")).await.unwrap();
+        let out = d.capture(&exit_code_argv("200_7")).await.unwrap();
+
         assert_eq!(
-            jlist(&argvs, 0),
-            "123_4",
-            "the array key must reach sacct verbatim, never merged into a batch"
+            calls(&argvs),
+            2,
+            "an unqueried array key must go live, never read the cached listing"
         );
+        assert_eq!(jlist(&argvs, 1), "100,200_7");
+        assert!(out.stdout.contains("200_7|COMPLETED"));
+    }
+
+    /// The legacy 3-column listing must pass through untouched — see the
+    /// module doc for why it is excluded.
+    #[tokio::test]
+    async fn legacy_column_queries_bypass_the_cache() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = batching(argvs.clone(), Duration::from_secs(60));
 
         let legacy: Vec<String> = vec![
             "sacct".into(),
@@ -259,7 +281,7 @@ mod tests {
         d.capture(&legacy).await.unwrap();
         assert_eq!(
             calls(&argvs),
-            4,
+            2,
             "the 3-column listing must never enter the exit-code cache"
         );
     }

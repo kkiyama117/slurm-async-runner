@@ -72,6 +72,7 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
     let squeue_argv = vec![
         "squeue".to_string(),
         "-h".to_string(),
+        "-r".to_string(),
         "-j".to_string(),
         id_csv,
         "-o".to_string(),
@@ -140,6 +141,7 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
     let squeue_argv = vec![
         "squeue".to_string(),
         "-h".to_string(),
+        "-r".to_string(),
         "-j".to_string(),
         id_csv,
         "-o".to_string(),
@@ -437,6 +439,7 @@ pub async fn query_job_states_squeue_only_with<D: JobDispatcher>(
     let argv = vec![
         "squeue".to_string(),
         "-h".to_string(),
+        "-r".to_string(),
         "-j".to_string(),
         csv_join(&unique),
         "-o".to_string(),
@@ -453,7 +456,7 @@ pub async fn query_job_states_squeue_only_with<D: JobDispatcher>(
 
 /// Query a single array task by its SLURM `<master>_<idx>` key via
 /// `squeue`. Returns the task's [`JobStatus`] if squeue still has the
-/// task in the active queue, or `None` if squeue reports no rows for
+/// task in the active queue, or `None` if squeue reports no row for
 /// that key (the task has left the active listing — caller may follow
 /// up with [`query_array_task_outcome_with`] to consult sacct).
 ///
@@ -462,6 +465,13 @@ pub async fn query_job_states_squeue_only_with<D: JobDispatcher>(
 /// returns the array master summary (one row per submission, not per
 /// task), so the per-task refresh path skips qgroup and goes straight
 /// to squeue.
+///
+/// The argv is the same batchable summary shape the plain-job refresh
+/// uses (`squeue -h -r -j <key> -o "%i %T %r"`), so array probes of one
+/// manager share the squeue batch cache with plain handles. `-r` is what
+/// makes the keyed lookup sound: without it squeue collapses PENDING
+/// tasks into one aggregate `<master>_[0,2]` row (KUDPC live-verified
+/// 2026-06-12).
 ///
 /// See spec §5.5 (sbatch Phase 2 design) and issue #8 A5.
 pub async fn query_array_task_state_with<D: JobDispatcher>(
@@ -473,10 +483,11 @@ pub async fn query_array_task_state_with<D: JobDispatcher>(
     let argv = vec![
         "squeue".to_string(),
         "-h".to_string(),
+        "-r".to_string(),
         "-j".to_string(),
-        key,
+        key.clone(),
         "-o".to_string(),
-        "%T %r".to_string(),
+        "%i %T %r".to_string(),
     ];
     let out = dispatcher.capture(&argv).await?;
     if squeue_reports_vanished(&out) {
@@ -484,7 +495,7 @@ pub async fn query_array_task_state_with<D: JobDispatcher>(
         return Ok(None);
     }
     ensure_query_success("squeue", &out)?;
-    Ok(parse_squeue_array_task(&out.stdout))
+    Ok(parse_squeue_array_task(&out.stdout, &key))
 }
 
 /// Per-task heavyweight finalizer. Issues `sacct -P -n -j <master>_<idx>`
@@ -497,6 +508,12 @@ pub async fn query_array_task_state_with<D: JobDispatcher>(
 /// from history, never made it past the controller, …). Step rows
 /// (`<master>_<idx>.batch`, `<master>_<idx>.0`) are filtered out — only
 /// the parent row contributes to the returned outcome.
+///
+/// The argv is the same batchable exit-code shape the plain-job
+/// finalizer uses, so array finalizers of one manager share the sacct
+/// batch cache with plain handles (KUDPC live-verified 2026-06-12 that
+/// sacct accepts mixed plain/array `-j` lists and answers per-task
+/// parent rows).
 ///
 /// See spec §5.5 (sbatch Phase 2 design) and issue #8 A5.
 pub async fn query_array_task_outcome_with<D: JobDispatcher>(
@@ -521,20 +538,29 @@ pub async fn query_array_task_outcome_with<D: JobDispatcher>(
     Ok(parse_sacct_array_task_with_exit_code(&out.stdout, &key))
 }
 
-/// Parse a single-row `squeue -o "%T %r"` output for one array task.
+/// Parse `squeue -h -r -o "%i %T %r"` output for one array task. Returns
+/// the row whose `%i` column equals `key` (the `<master>_<idx>` string
+/// that was queried); rows for any other job or task are silently
+/// skipped. No matching row — including empty output — is the "task has
+/// left the active listing" signal and returns `None`.
 ///
-/// The `%i` column is omitted in the argv because we already know which
-/// task we asked for, and including it would force the parser to also
-/// recognise the `<master>_<idx>` syntax (which is not a `u64`). Empty
-/// output (no row) is the "task has vanished" signal — returns `None`.
+/// The exact-key match is what lets a batched listing (shared with plain
+/// jobs and other tasks through the squeue cache) be consumed safely;
+/// the subset-replay rule of [`crate::sbatch::query_cache`] guarantees
+/// the listing actually asked about `key` whenever this parser sees it.
 ///
 /// Reason is optional; missing reason defaults to [`JobReason::None`].
-pub(crate) fn parse_squeue_array_task(text: &str) -> Option<JobStatus> {
+pub(crate) fn parse_squeue_array_task(text: &str, key: &str) -> Option<JobStatus> {
     for line in text.lines() {
         let mut parts = line.split_whitespace();
-        let state_str = match parts.next() {
-            Some(s) => s,
-            None => continue,
+        let Some(jid_str) = parts.next() else {
+            continue;
+        };
+        if jid_str != key {
+            continue;
+        }
+        let Some(state_str) = parts.next() else {
+            continue;
         };
         let reason_str = parts.next().unwrap_or("");
         return Some(JobStatus {
