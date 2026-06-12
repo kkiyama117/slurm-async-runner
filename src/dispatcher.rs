@@ -12,9 +12,11 @@
 //!   pipes both stdout and stderr, and (for `run`) echoes them after
 //!   the child exits. For `capture`, stderr is appended after stdout
 //!   with a `\n[stderr]\n` marker so failure diagnostics (`sbatch: error:
-//!   …`) reach the caller's error message. Line-based parsers
-//!   (`parse_submitted_jobid`, squeue / sacct / qgroup parsers) are
-//!   unaffected because they ignore lines that don't match their prefix.
+//!   …`) reach the caller's error message. The `query_*` helpers in
+//!   [`crate::runner`] strip the marker line and everything after it
+//!   (`runner::stdout_section`) before parsing, so stderr text is never
+//!   misread as data rows; `parse_submitted_jobid` is prefix-based and
+//!   ignores the section naturally.
 //! - [`DryRunDispatcher`] — testing / dry-run. Prints the argv that
 //!   *would* have been spawned and returns success without touching
 //!   the OS.
@@ -62,8 +64,12 @@ pub trait JobDispatcher: Send + Sync {
     /// rather than being silently dropped.
     ///
     /// Used for `sbatch`, `scancel`, `squeue`, `sacct`, and `qgroup` style
-    /// queries. Their line-based parsers ignore the `[stderr]` marker line
-    /// and any subsequent stderr lines that don't match the expected prefix.
+    /// queries. Consumers that parse the output as data rows must strip
+    /// the `[stderr]` section first — the `query_*` helpers in
+    /// [`crate::runner`] do this via `runner::stdout_section`. Do NOT
+    /// assume a parser will skip stderr lines on its own (regression:
+    /// `parse_squeue_array_task` once read the marker line itself as a
+    /// state token).
     fn capture(&self, argv: &[String]) -> impl Future<Output = Result<(i32, String)>> + Send;
 }
 

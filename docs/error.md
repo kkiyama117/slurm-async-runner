@@ -265,3 +265,48 @@ fn new(
 - `slurm_async_runner/src/py_export/mod.rs`: shared2 由来の pyclass を再 export しない
 - `gaussian-job-shared2/src/entities/.../resource_spec.rs`: `pub fn ResourceSpec::from_parts(...)` を追加
 2026-05-10: Phase C smoke passed (commit a44abe2e863f1f68611ef72797f58151edb5f4ce)
+
+---
+
+# sbatch 監視 regression 3 件: stderr 誤読 / sacct ラグ凍結 / qgroup 不在
+
+> **Status:** 解決済み (2026-06-12)
+> **発見日:** 2026-06-12（「array job の監視が終わらない」という報告のコードレビューで特定）
+
+## 1. 何が起きたか
+
+1. **array task の `wait_terminal` が永久ループ**。array master が squeue から
+   完全に消えると `squeue -j <master>_<idx>` は stderr に
+   `slurm_load_jobs error: Invalid job id specified` を出して exit 1 する。
+   `TokioDispatcher::capture` は stderr を `"[stderr]\n…"` として stdout に
+   マージするため、`parse_squeue_array_task`（jobid 列を持たない `%T %r`
+   パーサ）がマーカー行 `[stderr]` を state トークンとして読み、
+   `JobState::Unknown` の「観測」を返し続けた。`left_active_listing` が
+   立たず、`wait_terminal` は終了せず、`refresh_with_sacct` も early-return
+   して sacct を呼ばなかった。単一ジョブ用 `parse_squeue` は jobid の u64
+   パースで stderr 行を弾くため無事 — array 経路だけの非対称バグ。
+2. **sacct ラグで `FinishedInfo` が `Unknown` のまま凍結**。job が listing
+   から消えた直後に sacct がまだ行を返さないと、`refresh_with_sacct` が
+   `unwrap_or(default)` で `FinishedInfo { final_state: Unknown, exit_code:
+   None }` を確定スタンプし、idempotency short-circuit で以後再解決不能。
+3. **`qgroup` バイナリ不在で `refresh()` 全体が Err**。spawn 失敗が `?` で
+   伝播し、squeue フォールバックに到達しなかった。
+
+## 2. 修正
+
+- `runner::stdout_section`（`[stderr]` マーカー行以降を切り落とす）を追加し、
+  全 `query_*` ヘルパーでパース前に適用。submit 系の診断経路（stderr 全文が
+  必要）は対象外。
+- `refresh_with_sacct` は sacct が使える行を返さない限り `finished` を
+  立てない（次回呼び出しで再試行）。
+- `refresh()` は qgroup の Err を `tracing::warn!` して miss 扱いにし
+  squeue へフォールバック。
+
+## 3. 教訓
+
+- `capture` の stderr マージ契約を前提にできるのは「jobid 等のキー検証を
+  持つパーサ」だけ。キー列を省いたパーサ（`%T %r`）を足すときは
+  `stdout_section` を必ず通すこと。
+- 「観測できなかった」と「Unknown を観測した」を混同しない。捏造した
+  Unknown を永続化すると idempotency ガードと組み合わさって自己修復不能に
+  なる。

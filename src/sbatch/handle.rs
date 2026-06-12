@@ -319,6 +319,8 @@ impl SbatchJobHandle {
 
     /// Lightweight polling: `qgroup -l` → `squeue` fallback. **Never** calls
     /// sacct. If both lookups miss, sets `lifecycle.left_active_listing = true`.
+    /// A failing `qgroup` invocation (e.g. the binary does not exist on
+    /// non-KUDPC clusters) is logged and treated as a miss, not an error.
     ///
     /// For handles produced by `spawn_array` / `attach_array_jobid`
     /// (i.e. `array_task_id.is_some()`), this branches into a per-task
@@ -351,7 +353,22 @@ impl SbatchJobHandle {
             return Ok(snap);
         }
 
-        let qgroup = crate::runner::query_job_states_via_qgroup_with(&view, &[snap.jobid]).await?;
+        // `qgroup` is KUDPC-specific: on clusters without the binary the
+        // spawn itself fails. Treat any qgroup error as a miss (with a
+        // warning so genuine qgroup breakage on KUDPC stays visible) and
+        // fall through to the squeue probe instead of failing the refresh.
+        let qgroup =
+            match crate::runner::query_job_states_via_qgroup_with(&view, &[snap.jobid]).await {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!(
+                        jobid = snap.jobid,
+                        error = %e,
+                        "qgroup -l query failed; treating as a miss and falling back to squeue"
+                    );
+                    HashMap::new()
+                }
+            };
         if let Some(status) = qgroup.get(&snap.jobid) {
             snap.lifecycle.last_observed_state = Some(status.clone());
             snap.lifecycle.last_observed_at = Some(now);
@@ -393,6 +410,11 @@ impl SbatchJobHandle {
     /// `FinishedInfo` reflects the individual task — not the master
     /// summary. Step rows (`.batch`, `.0`, …) are filtered. See spec
     /// §5.5 and issue #8 A5.
+    ///
+    /// If sacct has no usable row yet (accounting flush lag, or the job
+    /// was purged from history), `lifecycle.finished` is left unset so a
+    /// later call can retry — a fabricated `Unknown` outcome is never
+    /// recorded.
     pub async fn refresh_with_sacct(&self) -> anyhow::Result<SbatchJobSnapshot> {
         let mut snap = self.refresh().await?;
         if snap.lifecycle.finished.is_some() {
@@ -436,6 +458,25 @@ impl SbatchJobHandle {
                     exit_code: None,
                 })
         };
+
+        // sacct may lag behind qgroup/squeue (accounting flush delay) or
+        // may have purged the job from history entirely. Both cases yield
+        // no usable row — the queries above synthesize a default outcome
+        // (state Unknown, no exit code). Leave `finished` unset so a later
+        // call can retry once accounting catches up, instead of freezing
+        // the fabricated Unknown outcome behind the idempotency
+        // short-circuit at the top of this method. Callers can detect the
+        // vanished-but-unresolved situation via
+        // `left_active_listing == true && finished.is_none()`.
+        //
+        // This sentinel relies on every sacct query above selecting the
+        // `ExitCode` column: a row that actually exists always yields
+        // `exit_code: Some(_)` (sacct prints `<exit>:<signal>` for every
+        // parent row), so `Unknown + None` can only mean "no usable row".
+        // Keep that column in the argv if the queries are ever reworked.
+        if outcome.status.state == JobState::Unknown && outcome.exit_code.is_none() {
+            return Ok(snap);
+        }
 
         snap.lifecycle.finished = Some(FinishedInfo {
             final_state: outcome.status.state,
@@ -933,6 +974,139 @@ mod tests {
         assert_eq!(finished.final_state, crate::JobState::Completed);
         assert_eq!(finished.exit_code, Some(0));
         assert_eq!(canned.sacct_calls(), 1);
+    }
+
+    /// Regression (stderr-merge misread): once the array master has left
+    /// squeue entirely, `squeue -j <master>_<idx>` prints
+    /// `slurm_load_jobs error: Invalid job id specified` on stderr and
+    /// exits 1; `TokioDispatcher::capture` merges that as
+    /// `"[stderr]\n…"`. The refresh must treat this as "task vanished"
+    /// (`left_active_listing = true`), NOT record the marker line as a
+    /// `JobState::Unknown` observation — the latter kept `wait_terminal`
+    /// polling forever and `refresh_with_sacct` from ever calling sacct.
+    #[tokio::test]
+    async fn refresh_array_task_treats_stderr_only_squeue_as_vanished() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "[stderr]\nslurm_load_jobs error: Invalid job id specified\n",
+            "",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh().await.unwrap();
+        assert!(
+            after.lifecycle.left_active_listing,
+            "stderr-only squeue output must mark the task as vanished, got {:?}",
+            after.lifecycle
+        );
+        assert_eq!(canned.sacct_calls(), 0, "refresh must NOT call sacct");
+    }
+
+    /// Regression (sacct-lag freeze): when the job has vanished from the
+    /// active listings but sacct has no row *yet* (accounting flush lag),
+    /// `refresh_with_sacct` must leave `finished` unset so a later call
+    /// can retry — previously it stamped
+    /// `FinishedInfo { final_state: Unknown, exit_code: None }` and the
+    /// idempotency short-circuit froze that fabricated outcome forever.
+    #[tokio::test]
+    async fn refresh_with_sacct_leaves_finished_unset_until_sacct_reports() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // qgroup & squeue both miss (vanish) AND sacct is still empty.
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(first.lifecycle.left_active_listing);
+        assert!(
+            first.lifecycle.finished.is_none(),
+            "sacct miss must not freeze a fabricated Unknown outcome"
+        );
+
+        // Accounting catches up — the next call must resolve for real.
+        *canned.sacct.lock().unwrap() = "12345|COMPLETED|None|0:0\n".to_string();
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second
+            .lifecycle
+            .finished
+            .expect("finished must resolve once sacct reports the row");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+        assert_eq!(
+            canned.sacct_calls(),
+            2,
+            "each unresolved call retries sacct"
+        );
+    }
+
+    /// Array-task variant of the sacct-lag retry: empty sacct leaves
+    /// `finished` unset; a later call resolves from the per-task row.
+    #[tokio::test]
+    async fn refresh_with_sacct_array_task_retries_after_sacct_lag() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(first.lifecycle.finished.is_none());
+
+        *canned.sacct.lock().unwrap() = "12345_3|COMPLETED|None|0:0\n".to_string();
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second.lifecycle.finished.expect("resolved after lag");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    /// `qgroup` is a KUDPC-ism: on clusters where the binary does not
+    /// exist, spawning it fails with an `Err` (not a nonzero exit).
+    /// `refresh()` must treat that as a qgroup miss and fall back to
+    /// squeue instead of propagating the error to the caller.
+    #[tokio::test]
+    async fn refresh_falls_back_to_squeue_when_qgroup_spawn_fails() {
+        use crate::dispatcher::{JobDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        struct QgroupErrDispatcher;
+        impl JobDispatcher for QgroupErrDispatcher {
+            async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+                unimplemented!()
+            }
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+                match argv[0].as_str() {
+                    "qgroup" => Err(anyhow::anyhow!("failed to spawn `qgroup`")),
+                    "squeue" => Ok((0, "12345 RUNNING None\n".into())),
+                    _ => Ok((0, String::new())),
+                }
+            }
+        }
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(QgroupErrDispatcher);
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h
+            .refresh()
+            .await
+            .expect("qgroup spawn failure must not propagate");
+        assert_eq!(
+            after.lifecycle.last_observed_state.unwrap().state,
+            crate::JobState::Running
+        );
+        assert!(!after.lifecycle.left_active_listing);
     }
 
     /// Per-task tasks of one master submission must observe distinct

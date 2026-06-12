@@ -53,7 +53,7 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
         "%i %T %r".to_string(),
     ];
     let (_, squeue_out) = dispatcher.capture(&squeue_argv).await?;
-    let active = parse_squeue(&squeue_out);
+    let active = parse_squeue(stdout_section(&squeue_out));
 
     let missing: Vec<u64> = unique
         .iter()
@@ -74,7 +74,7 @@ pub async fn query_job_states_batch_with<D: JobDispatcher>(
             "JobID,State,Reason".to_string(),
         ];
         let (_, sacct_out) = dispatcher.capture(&sacct_argv).await?;
-        parse_sacct(&sacct_out)
+        parse_sacct(stdout_section(&sacct_out))
     };
 
     Ok(merge_results(jobids, &active, &history))
@@ -112,7 +112,7 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
         "%i %T %r".to_string(),
     ];
     let (_, squeue_out) = dispatcher.capture(&squeue_argv).await?;
-    let active = parse_squeue(&squeue_out);
+    let active = parse_squeue(stdout_section(&squeue_out));
 
     let missing: Vec<u64> = unique
         .iter()
@@ -133,7 +133,7 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
             "JobID,State,Reason,ExitCode".to_string(),
         ];
         let (_, sacct_out) = dispatcher.capture(&sacct_argv).await?;
-        parse_sacct_with_exit_code(&sacct_out)
+        parse_sacct_with_exit_code(stdout_section(&sacct_out))
     };
 
     let mut out: HashMap<u64, JobOutcome> = HashMap::with_capacity(jobids.len());
@@ -162,6 +162,33 @@ pub async fn query_job_states_with_exit_code_with<D: JobDispatcher>(
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Return only the stdout section of a [`JobDispatcher::capture`] output.
+///
+/// Production `capture` implementations (see
+/// [`crate::dispatcher::TokioDispatcher`]) merge the child's stderr after
+/// stdout with a standalone `[stderr]` marker line so that submit-style
+/// callers can surface diagnostics. Query parsers must never treat that
+/// section as data rows: e.g. `squeue -j` for a vanished jobid prints
+/// `slurm_load_jobs error: Invalid job id specified` on stderr, and
+/// [`parse_squeue_array_task`] would otherwise read the marker line as a
+/// state token (`JobState::Unknown`), keeping `wait_terminal` polling
+/// forever. Every `query_*` helper in this module therefore strips the
+/// `[stderr]` section before parsing.
+pub(crate) fn stdout_section(text: &str) -> &str {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        // Tolerate a CRLF-terminated marker line (`[stderr]\r\n`) even
+        // though `TokioDispatcher` always injects the marker with a bare
+        // `\n` — defensive against transports that rewrite line endings.
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if trimmed.strip_suffix('\r').unwrap_or(trimmed) == "[stderr]" {
+            return &text[..offset];
+        }
+        offset += line.len();
+    }
+    text
+}
 
 fn dedupe_preserving_order(ids: &[u64]) -> Vec<u64> {
     let mut seen = HashSet::with_capacity(ids.len());
@@ -368,7 +395,7 @@ pub async fn query_job_states_via_qgroup_with<D: JobDispatcher>(
     }
     let argv = vec!["qgroup".to_string(), "-l".to_string()];
     let (_, stdout) = dispatcher.capture(&argv).await?;
-    let all = parse_qgroup_l(&stdout);
+    let all = parse_qgroup_l(stdout_section(&stdout));
     let wanted: HashSet<u64> = jobids.iter().copied().collect();
     Ok(all
         .into_iter()
@@ -396,7 +423,7 @@ pub async fn query_job_states_squeue_only_with<D: JobDispatcher>(
         "%i %T %r".to_string(),
     ];
     let (_, out) = dispatcher.capture(&argv).await?;
-    Ok(parse_squeue(&out))
+    Ok(parse_squeue(stdout_section(&out)))
 }
 
 /// Query a single array task by its SLURM `<master>_<idx>` key via
@@ -427,7 +454,7 @@ pub async fn query_array_task_state_with<D: JobDispatcher>(
         "%T %r".to_string(),
     ];
     let (_, out) = dispatcher.capture(&argv).await?;
-    Ok(parse_squeue_array_task(&out))
+    Ok(parse_squeue_array_task(stdout_section(&out)))
 }
 
 /// Per-task heavyweight finalizer. Issues `sacct -P -n -j <master>_<idx>`
@@ -458,7 +485,7 @@ pub async fn query_array_task_outcome_with<D: JobDispatcher>(
         "JobID,State,Reason,ExitCode".to_string(),
     ];
     let (_, out) = dispatcher.capture(&argv).await?;
-    Ok(parse_sacct_array_task_with_exit_code(&out))
+    Ok(parse_sacct_array_task_with_exit_code(stdout_section(&out)))
 }
 
 /// Parse a single-row `squeue -o "%T %r"` output for one array task.
@@ -1016,6 +1043,49 @@ gr19999b u 5555 CMP 1
         assert_eq!(map.get(&7519511).map(|s| s.state), Some(JobState::Failed));
     }
 
+    // ---- stdout_section ----
+
+    #[test]
+    fn stdout_section_passes_through_marker_free_text() {
+        let text = "12345 RUNNING None\n";
+        assert_eq!(super::stdout_section(text), text);
+        assert_eq!(super::stdout_section(""), "");
+    }
+
+    #[test]
+    fn stdout_section_cuts_at_stderr_marker() {
+        let text = "12345 RUNNING None\n[stderr]\nsqueue: warning: something\n";
+        assert_eq!(super::stdout_section(text), "12345 RUNNING None\n");
+    }
+
+    #[test]
+    fn stdout_section_returns_empty_for_stderr_only_output() {
+        let text = "[stderr]\nslurm_load_jobs error: Invalid job id specified\n";
+        assert_eq!(super::stdout_section(text), "");
+    }
+
+    /// A data row that merely *contains* the marker substring must not be
+    /// cut — only a standalone `[stderr]` line is the dispatcher marker.
+    #[test]
+    fn stdout_section_ignores_inline_marker_substring() {
+        let text = "12345 RUNNING [stderr]-shaped-reason\n67890 PENDING None\n";
+        assert_eq!(super::stdout_section(text), text);
+    }
+
+    /// The marker is still detected when it is the final line without a
+    /// trailing newline, and when the line ending is CRLF.
+    #[test]
+    fn stdout_section_handles_unterminated_and_crlf_marker() {
+        assert_eq!(
+            super::stdout_section("12345 RUNNING None\n[stderr]"),
+            "12345 RUNNING None\n"
+        );
+        assert_eq!(
+            super::stdout_section("12345 RUNNING None\r\n[stderr]\r\nerr\r\n"),
+            "12345 RUNNING None\r\n"
+        );
+    }
+
     // ---- parse_squeue_array_task ----
 
     #[test]
@@ -1118,6 +1188,36 @@ gr19999b u 5555 CMP 1
             .await
             .unwrap();
         assert!(r.is_none());
+    }
+
+    /// Regression: once the array master has left squeue entirely, SLURM
+    /// prints `slurm_load_jobs error: Invalid job id specified` on stderr
+    /// and exits 1. `TokioDispatcher::capture` merges that into the
+    /// returned text as `"[stderr]\n…"`. The parser must not read the
+    /// marker (or any stderr line) as a state row — the task has
+    /// vanished, so the query must report `None`. Previously the marker
+    /// line parsed as `JobState::Unknown`, `left_active_listing` never
+    /// flipped, and `wait_terminal` polled forever.
+    #[tokio::test]
+    async fn query_array_task_state_returns_none_for_stderr_only_output() {
+        let mock = MockCapture {
+            expected_argv: vec![
+                "squeue".into(),
+                "-h".into(),
+                "-j".into(),
+                "12345_3".into(),
+                "-o".into(),
+                "%T %r".into(),
+            ],
+            stdout: "[stderr]\nslurm_load_jobs error: Invalid job id specified\n".into(),
+        };
+        let r = super::query_array_task_state_with(&mock, 12345, 3)
+            .await
+            .unwrap();
+        assert!(
+            r.is_none(),
+            "stderr-only output means the task vanished, got {r:?}"
+        );
     }
 
     #[tokio::test]

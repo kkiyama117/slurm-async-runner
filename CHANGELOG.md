@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **sbatch monitoring correctness — stderr misread / sacct-lag freeze /
+  qgroup fallback.**
+  - **Array-task refresh no longer misreads merged stderr as a job
+    state.** `TokioDispatcher::capture` merges the child's stderr after a
+    `[stderr]` marker line; once an array master left squeue entirely
+    (`slurm_load_jobs error: Invalid job id specified` on stderr),
+    `parse_squeue_array_task` read the marker line itself as a state token
+    (`Unknown`), so `left_active_listing` never flipped, `wait_terminal`
+    polled forever, and `refresh_with_sacct` never resolved the exit code.
+    All `runner::query_*` helpers now strip the `[stderr]` section
+    (`runner::stdout_section`) before parsing.
+  - **`refresh_with_sacct` no longer freezes a fabricated `Unknown`
+    outcome when sacct has no row yet** (accounting flush lag, or history
+    purge). `lifecycle.finished` is left unset so a later call retries;
+    callers can detect the vanished-but-unresolved state via
+    `left_active_listing == True and not is_finished()`. **Behavior
+    change**: a single `refresh_with_sacct()` call immediately after the
+    job vanishes may now report `is_finished() == False` until SLURM
+    accounting catches up — poll again instead of assuming one call
+    finalizes (affects `scripts/test_sbatch_live.py`-style usage).
+  - **`refresh()` falls back to squeue when `qgroup` itself fails** (e.g.
+    the binary does not exist on non-KUDPC clusters). The error is logged
+    via `tracing::warn!` and treated as a qgroup miss instead of failing
+    the whole refresh.
+
 - **Code-review hardening (issue #15).**
   - `PyTssrunJobHandle.wait_terminal` no longer holds the handle mutex
     across the whole polling loop — the lock is taken per `refresh`
