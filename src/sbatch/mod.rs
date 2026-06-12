@@ -9,6 +9,8 @@ pub mod handle;
 pub mod manager;
 pub mod parse;
 pub(crate) mod qgroup_cache;
+pub(crate) mod query_cache;
+pub(crate) mod sacct_cache;
 pub(crate) mod squeue_cache;
 pub mod store;
 

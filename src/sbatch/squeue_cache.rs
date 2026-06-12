@@ -7,11 +7,16 @@
 //! exactly like the `qgroup -l` cache one layer above (see
 //! [`crate::sbatch::qgroup_cache`]).
 //!
+//! This module is the squeue instantiation of the generic
+//! [`crate::sbatch::query_cache`] (issue #16 item 3); the TTL slot,
+//! single-flight locking, subset-replay rule and 2 × ttl key registry all
+//! live there. What remains here is the squeue-specific argv shape.
+//!
 //! Live-verified on KUDPC (2026-06-12) before this was built: a multi-id
 //! `squeue -j id1,id2,…` always exits 0 and prints rows for the
 //! still-listed ids only, no matter how many of the queried ids are
 //! already purged (even all of them). A missing row therefore carries the
-//! same meaning as today's single-id "empty listing" / `Invalid job id
+//! same meaning as the single-id "empty listing" / `Invalid job id
 //! specified` outcomes: the job has left the active queue. Callers
 //! already treat "my id is absent from the parsed map" as that vanish
 //! signal and ignore rows for other jobs (keyed lookups in
@@ -19,202 +24,82 @@
 //! serving one shared listing to every handle preserves refresh
 //! semantics bit-for-bit.
 //!
-//! Correctness rule: a cached listing may only be replayed to a request
-//! whose ids are a **subset** of the ids the cached query asked for.
-//! Replaying it to a job the batch never queried would fabricate the
-//! vanish signal for that job (its row is absent because it was never
-//! asked for, not because it left the queue). A new handle's first poll
-//! therefore always goes live — re-batched with every recently-seen id —
-//! and joins the shared listing from the next cycle on.
-//!
-//! The id registry is self-maintaining: each intercepted request stamps
-//! its ids, and ids not requested for 2 × ttl are dropped from future
-//! batches. Handles stop polling once terminal, so their ids age out on
-//! their own; until then a purged id inside the batch is harmless
-//! (rc = 0, simply no row — verified above).
-//!
 //! Scope is deliberately limited to the exact summary-query argv shape:
 //! array-task probes (`squeue -j <master>_<idx> -o "%T %r"`) parse a
 //! single positional row and would mis-read a batched listing, and
-//! `sacct` / `sbatch` / `scancel` are heavyweight or mutating calls where
-//! replaying a stale result would be wrong. All of those pass through
-//! untouched.
+//! `sbatch` / `scancel` are mutating calls where replaying a stale result
+//! would be wrong. All of those pass through untouched (`sacct` exit-code
+//! queries have their own shape — see [`crate::sbatch::sacct_cache`]).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Result;
-use tokio::sync::Mutex as TokioMutex;
-use tokio::time::Instant;
-
-use crate::dispatcher::{CaptureOutput, DynJobDispatcher, JobDispatcher};
+use crate::sbatch::query_cache::{QueryCacheState, QueryCachingDispatcher, QueryShape};
 
 /// The `-o` format of the batchable summary query — must stay in sync
 /// with the argv built in `runner.rs` (`query_job_states_squeue_only_with`
 /// and the two batch query functions).
 const SUMMARY_FORMAT: &str = "%i %T %r";
 
+/// The batchable summary query `squeue -h -j <u64[,u64…]> -o "%i %T %r"`,
+/// as a [`QueryShape`].
+#[derive(Default)]
+pub(crate) struct SqueueSummaryShape;
+
+impl QueryShape for SqueueSummaryShape {
+    type Key = u64;
+
+    /// Returns the requested jobids iff `argv` is exactly the batchable
+    /// summary query. Array-task probes fail twice here (their `-j` key
+    /// `<master>_<idx>` is not a u64 and their format is `%T %r`), and
+    /// anything that is not squeue fails the prefix check.
+    fn parse(&self, argv: &[String]) -> Option<Vec<u64>> {
+        if argv.len() != 6
+            || argv[0] != "squeue"
+            || argv[1] != "-h"
+            || argv[2] != "-j"
+            || argv[4] != "-o"
+            || argv[5] != SUMMARY_FORMAT
+        {
+            return None;
+        }
+        argv[3].split(',').map(|t| t.parse::<u64>().ok()).collect()
+    }
+
+    fn build(&self, batch: &[u64]) -> Vec<String> {
+        let csv = batch
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![
+            "squeue".into(),
+            "-h".into(),
+            "-j".into(),
+            csv,
+            "-o".into(),
+            SUMMARY_FORMAT.into(),
+        ]
+    }
+
+    fn replay_marker(&self) -> &'static str {
+        "(replayed from squeue batch cache)"
+    }
+}
+
 /// Shared cache slot — one per [`crate::sbatch::manager::SbatchManager`],
 /// shared by every handle that manager creates (spawn and attach alike).
-pub(crate) struct SqueueCacheState {
-    ttl: Duration,
-    slot: TokioMutex<Slot>,
-}
-
-#[derive(Default)]
-struct Slot {
-    entry: Option<CachedEntry>,
-    /// jobid → last time some handle asked for it. This is the
-    /// self-maintaining batch registry: ids older than 2 × ttl are
-    /// pruned when the next live query is assembled.
-    recent: HashMap<u64, Instant>,
-}
-
-struct CachedEntry {
-    at: Instant,
-    /// The ids the cached query actually asked squeue about. Replay is
-    /// only allowed for requests whose ids are a subset of this — see
-    /// the module-level correctness rule.
-    ids: HashSet<u64>,
-    /// `Ok`: raw squeue output, any exit code (a single-id batch can
-    /// still exit 1 with `Invalid job id specified`; replaying it as-is
-    /// lets the caller-side vanish classification fire unchanged).
-    /// `Err`: spawn failure message — replayed as an error so every
-    /// handle observes the same outage within one poll cycle instead of
-    /// hammering a struggling controller.
-    result: Result<CaptureOutput, String>,
-}
-
-impl SqueueCacheState {
-    /// `ttl == Duration::ZERO` effectively disables both caching and
-    /// batching: every entry is already expired when read back, and the
-    /// 2 × ttl registry window is also zero so each live query asks for
-    /// exactly the requested ids — byte-for-byte today's behaviour.
-    pub(crate) fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            slot: TokioMutex::new(Slot::default()),
-        }
-    }
-}
+pub(crate) type SqueueCacheState = QueryCacheState<SqueueSummaryShape>;
 
 /// Dispatcher wrapper that serves squeue summary queries from a shared
-/// batched TTL cache; every other argv passes through to `inner`.
-pub(crate) struct SqueueBatchingDispatcher {
-    inner: Arc<dyn DynJobDispatcher>,
-    cache: Arc<SqueueCacheState>,
-}
-
-impl SqueueBatchingDispatcher {
-    /// The only construction path — keeps every wrapper tied to a cache
-    /// that is actually shared (the manager's), never an ad-hoc one.
-    pub(crate) fn new(inner: Arc<dyn DynJobDispatcher>, cache: Arc<SqueueCacheState>) -> Self {
-        Self { inner, cache }
-    }
-}
-
-/// Returns the requested jobids iff `argv` is exactly the batchable
-/// summary query `squeue -h -j <u64[,u64…]> -o "%i %T %r"`. Array-task
-/// probes fail twice here (their `-j` key `<master>_<idx>` is not a u64
-/// and their format is `%T %r`), and anything that is not squeue fails
-/// the prefix check.
-fn parse_summary_query(argv: &[String]) -> Option<Vec<u64>> {
-    if argv.len() != 6
-        || argv[0] != "squeue"
-        || argv[1] != "-h"
-        || argv[2] != "-j"
-        || argv[4] != "-o"
-        || argv[5] != SUMMARY_FORMAT
-    {
-        return None;
-    }
-    argv[3].split(',').map(|t| t.parse::<u64>().ok()).collect()
-}
-
-/// Rebuild the summary-query argv for a (sorted, deduped) batch.
-fn batched_argv(ids: &[u64]) -> Vec<String> {
-    let csv = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-    vec![
-        "squeue".into(),
-        "-h".into(),
-        "-j".into(),
-        csv,
-        "-o".into(),
-        SUMMARY_FORMAT.into(),
-    ]
-}
-
-fn replay(result: &Result<CaptureOutput, String>) -> Result<CaptureOutput> {
-    match result {
-        Ok(out) => Ok(out.clone()),
-        // The suffix deliberately marks the error as a cache replay so an
-        // incident log can tell "squeue spawned and failed just now" apart
-        // from "a failure up to TTL ago is being replayed".
-        Err(msg) => Err(anyhow::anyhow!("{msg} (replayed from squeue batch cache)")),
-    }
-}
-
-impl JobDispatcher for SqueueBatchingDispatcher {
-    async fn run(&self, argv: &[String]) -> Result<i32> {
-        self.inner.run(argv).await
-    }
-
-    async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
-        let Some(requested) = parse_summary_query(argv) else {
-            return self.inner.capture(argv).await;
-        };
-        // The slot lock is held across the inner call on purpose:
-        // concurrent summary queries queue here and the losers are served
-        // from the entry the winner just stored (single-flight). Same
-        // cancellation story as the qgroup cache: dropping the winner's
-        // future releases the lock with the slot unwritten, and the next
-        // waiter simply goes live — graceful degradation, never a
-        // deadlock and never a stale replay.
-        let mut slot = self.cache.slot.lock().await;
-        let now = Instant::now();
-        for id in &requested {
-            slot.recent.insert(*id, now);
-        }
-        if let Some(entry) = slot.entry.as_ref()
-            && entry.at.elapsed() < self.cache.ttl
-            && requested.iter().all(|id| entry.ids.contains(id))
-        {
-            return replay(&entry.result);
-        }
-        // 2 × ttl, not 1 ×: an actively-polling handle re-stamps its id
-        // once per ttl, so a 1 × window would race poll jitter right at
-        // the boundary and keep evicting live subscribers (forcing a
-        // warm-up miss every cycle). Two missed polls means the handle
-        // stopped polling — terminal or dropped — and its id can go.
-        let window = self.cache.ttl.saturating_mul(2);
-        slot.recent.retain(|_, at| at.elapsed() < window);
-        let mut batch: Vec<u64> = slot.recent.keys().copied().collect();
-        // With ttl == ZERO the retain above empties the registry, so the
-        // requested ids must be re-added unconditionally.
-        batch.extend(&requested);
-        batch.sort_unstable();
-        batch.dedup();
-        let fetched = self.inner.capture(&batched_argv(&batch)).await;
-        slot.entry = Some(CachedEntry {
-            at: Instant::now(),
-            ids: batch.into_iter().collect(),
-            result: match &fetched {
-                Ok(out) => Ok(out.clone()),
-                // anyhow::Error is not Clone; keep the full context chain
-                // as a string for replay.
-                Err(e) => Err(format!("{e:#}")),
-            },
-        });
-        fetched
-    }
-}
+/// batched TTL cache; every other argv passes through to the inner
+/// dispatcher.
+pub(crate) type SqueueBatchingDispatcher = QueryCachingDispatcher<SqueueSummaryShape>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatcher::into_dyn;
-    use std::sync::Mutex;
+    use crate::dispatcher::{CaptureOutput, JobDispatcher, into_dyn};
+    use anyhow::Result;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Inner dispatcher that records every `capture` argv and answers a
     /// summary query with one `<id> RUNNING None` row per requested id.
@@ -274,10 +159,7 @@ mod tests {
     }
 
     fn batching(inner: RecordingInner, ttl: Duration) -> SqueueBatchingDispatcher {
-        SqueueBatchingDispatcher {
-            inner: into_dyn(inner),
-            cache: Arc::new(SqueueCacheState::new(ttl)),
-        }
+        SqueueBatchingDispatcher::new(into_dyn(inner), Arc::new(SqueueCacheState::new(ttl)))
     }
 
     fn jlist(argvs: &Arc<Mutex<Vec<Vec<String>>>>, call: usize) -> String {
@@ -386,7 +268,7 @@ mod tests {
         ];
         d.capture(&sacct).await.unwrap();
         d.capture(&sacct).await.unwrap();
-        assert_eq!(calls(&argvs), 4, "sacct must never be coalesced or cached");
+        assert_eq!(calls(&argvs), 4, "sacct must never enter the squeue cache");
     }
 
     #[tokio::test]
@@ -437,7 +319,7 @@ mod tests {
     }
 
     /// The 50 ms inner delay guarantees the second `join!` branch reaches
-    /// `slot.lock().await` while the winner still holds the lock inside
+    /// the slot lock while the winner still holds it inside
     /// `inner.capture` — i.e. the test exercises real lock contention,
     /// not accidental sequential execution.
     #[tokio::test]
@@ -526,12 +408,12 @@ mod tests {
         }
 
         let argvs = Arc::new(Mutex::new(Vec::new()));
-        let d = SqueueBatchingDispatcher {
-            inner: into_dyn(VanishThenRunning {
+        let d = SqueueBatchingDispatcher::new(
+            into_dyn(VanishThenRunning {
                 argvs: argvs.clone(),
             }),
-            cache: Arc::new(SqueueCacheState::new(Duration::from_secs(60))),
-        };
+            Arc::new(SqueueCacheState::new(Duration::from_secs(60))),
+        );
 
         // id 100 is fully purged — its rc = 1 vanish outcome gets cached.
         let vanish = d.capture(&summary_argv("100")).await.unwrap();

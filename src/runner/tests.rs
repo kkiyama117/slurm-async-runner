@@ -514,7 +514,7 @@ fn parse_sacct_array_task_returns_parent_row_skipping_steps() {
 12345_3.batch|COMPLETED|None|0:0
 12345_3.extern|COMPLETED|None|0:0
 ";
-    let oc = super::parse_sacct_array_task_with_exit_code(out).expect("Some");
+    let oc = super::parse_sacct_array_task_with_exit_code(out, "12345_3").expect("Some");
     assert_eq!(oc.status.state, JobState::Completed);
     assert_eq!(oc.exit_code, Some(0));
 }
@@ -522,7 +522,7 @@ fn parse_sacct_array_task_returns_parent_row_skipping_steps() {
 #[test]
 fn parse_sacct_array_task_recovers_nonzero_exit_code() {
     let out = "12345_7|FAILED|NonZeroExitCode|2:0\n";
-    let oc = super::parse_sacct_array_task_with_exit_code(out).expect("Some");
+    let oc = super::parse_sacct_array_task_with_exit_code(out, "12345_7").expect("Some");
     assert_eq!(oc.status.state, JobState::Failed);
     assert_eq!(oc.status.reason, JobReason::NonZeroExitCode);
     assert_eq!(oc.exit_code, Some(2));
@@ -533,12 +533,39 @@ fn parse_sacct_array_task_returns_none_for_only_step_rows() {
     // Defensive: if sacct somehow returns only step rows (purged
     // parent, …), the parser must not synthesize a parent.
     let out = "12345_3.batch|COMPLETED|None|0:0\n";
-    assert_eq!(super::parse_sacct_array_task_with_exit_code(out), None);
+    assert_eq!(
+        super::parse_sacct_array_task_with_exit_code(out, "12345_3"),
+        None
+    );
 }
 
 #[test]
 fn parse_sacct_array_task_returns_none_for_empty_output() {
-    assert_eq!(super::parse_sacct_array_task_with_exit_code(""), None);
+    assert_eq!(
+        super::parse_sacct_array_task_with_exit_code("", "12345_3"),
+        None
+    );
+}
+
+#[test]
+fn parse_sacct_array_task_ignores_rows_for_other_tasks() {
+    // Exact-key match: a listing that contains rows for other tasks
+    // (e.g. a future batched query, or sacct returning the whole array)
+    // must never contribute another task's outcome.
+    let out = "\
+12345_2|FAILED|NonZeroExitCode|2:0
+12345_2.batch|FAILED||2:0
+12345_3|COMPLETED|None|0:0
+12345_3.batch|COMPLETED|None|0:0
+";
+    let oc = super::parse_sacct_array_task_with_exit_code(out, "12345_3").expect("Some");
+    assert_eq!(oc.status.state, JobState::Completed);
+    assert_eq!(oc.exit_code, Some(0));
+    assert_eq!(
+        super::parse_sacct_array_task_with_exit_code(out, "12345_9"),
+        None,
+        "a task absent from the listing must resolve to None, never another task's row"
+    );
 }
 
 // ---- query_array_task_state_with / query_array_task_outcome_with ----
