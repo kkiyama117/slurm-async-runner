@@ -18,7 +18,7 @@
 
 | ファイル | 内容 |
 |---|---|
-| [architecture.md](./architecture.md) | レイヤー設計（spec / runtime / query / tssrun + sbatch サブシステム + `JobHandleCommon` 跨 backend 抽象 (PR #7) + `JobStateStore` 永続化抽象 + UUID v7 primary key）と、なぜこの分割なのか |
+| [architecture.md](./architecture.md) | レイヤー設計（spec / runtime / query / tssrun + sbatch サブシステム + `JobHandleCommon` / `JobManager` 跨 backend 抽象 + refresh 多重化キャッシュ (`query_cache`) + `JobStateStore` 永続化抽象 + UUID v7 primary key）と、なぜこの分割なのか |
 | [code-map.md](./code-map.md) | ディレクトリ・ファイル単位での役割マップ。「この機能はどこにある?」を逆引きする用 |
 | [api-reference.md](./api-reference.md) | `TssrunCmd` / `SbatchCmd` の全フィールド、`LogSink` / `JobStateStore` factory、`FinishedInfo`、cross-process attach の内部メカニクス（ルート README から外した詳細リファレンス） |
 | [process-flow.md](./process-flow.md) | 主要ワークフロー（`run_job` / `query_job_states_batch` / tssrun spawn / attach の 4 種 `AttachKey`）のシーケンス |

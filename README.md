@@ -13,7 +13,10 @@ Two job-submission backends share a common handle contract:
   jobs (`sbatch --array=<spec>` / `--dependency` / `--mail-*` / `--signal`
   / `--no-requeue` / `--comment` / typed export). Polling-based wait via
   `qgroup -l` → `squeue` → `sacct`, idempotent `cancel(jobid)`,
-  `refresh_with_sacct()` for terminal exit-code discovery.
+  `refresh_with_sacct()` for terminal exit-code discovery. Status queries
+  are multiplexed: handles of one manager share single-flight TTL caches
+  (batched `squeue -j` / `sacct -j` lists, one spawn per `poll_interval`),
+  keeping cluster load flat no matter how many handles poll concurrently.
 
 Both expose the same five sync getters (`uuid` / `jobid` / `is_running()` /
 `is_finished()` / `exit_code()`) and async `refresh()` / `wait_terminal()`
@@ -309,8 +312,8 @@ attached handles too.
 
 | Operation | Returns | Notes |
 |---|---|---|
-| `await handle.refresh()` | `None` | Updates snapshot via `qgroup -l` → `squeue` (no `sacct`). Cheap |
-| `await handle.refresh_with_sacct()` | `None` | Opt-in: calls `sacct` to resolve terminal exit-code. Heavier; reserve for terminal queries |
+| `await handle.refresh()` | `None` | Updates snapshot via `qgroup -l` → `squeue` (no `sacct`). Cheap — and shared: handles of one manager serve these probes from single-flight TTL caches (batched `squeue -j id1,id2,…`, one spawn per `poll_interval`) |
+| `await handle.refresh_with_sacct()` | `None` | Opt-in: calls `sacct` to resolve terminal exit-code. Heavier (slurmdbd query); reserve for terminal queries. Also batched across handles of one manager, so N jobs finishing together cost one `sacct` per `poll_interval`, not N |
 | `await handle.wait_terminal(poll_interval_secs)` | `None` | Polls via `refresh()` until `is_finished()`. Read `exit_code()` after the await resolves |
 | `await handle.log_lines(stream, n)` | `list[str]` | Tail `n` lines from stdout (`stream=0`) or stderr (`stream=1`). Empty list if the log file doesn't exist yet. `ValueError` on bad `stream` |
 | `await handle.read_log_to_end(stream)` | `str` | Full contents of the stdout (0) / stderr (1) log. Empty string if not yet created |
