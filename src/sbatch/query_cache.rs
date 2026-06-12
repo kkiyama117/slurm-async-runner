@@ -12,8 +12,8 @@
 //!
 //! - [`crate::sbatch::qgroup_cache`] — `qgroup -l` (global listing, the
 //!   degenerate zero-key shape)
-//! - [`crate::sbatch::squeue_cache`] — `squeue -h -j <ids> -o "%i %T %r"`
-//! - [`crate::sbatch::sacct_cache`] — `sacct -P -n -j <ids> -o
+//! - [`crate::sbatch::squeue_cache`] — `squeue -h -r -j <keys> -o "%i %T %r"`
+//! - [`crate::sbatch::sacct_cache`] — `sacct -P -n -j <keys> -o
 //!   JobID,State,Reason,ExitCode`
 //!
 //! A [`QueryShape`] describes one batchable argv form: how to recognize it
@@ -46,6 +46,64 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant;
 
 use crate::dispatcher::{CaptureOutput, DynJobDispatcher, JobDispatcher};
+
+/// The unit of batching for the keyed squeue/sacct shapes: a plain jobid
+/// or one array task (`<master>_<index>`).
+///
+/// Live-verified on KUDPC 2026-06-12 (jobids 7815400/7815401/7815408/
+/// 7815414): both squeue and sacct accept plain and array-task keys mixed
+/// in one comma-separated `-j` list, sacct answers with per-task parent
+/// rows whose JobID column is exactly `<master>_<index>`, and squeue does
+/// the same **provided `-r` is passed** (without it, PENDING tasks
+/// collapse into one aggregate `<master>_[0,2]` row that defeats keyed
+/// lookups).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum JobKey {
+    Plain(u64),
+    ArrayTask { master: u64, index: u32 },
+}
+
+impl JobKey {
+    /// `"123"` → `Plain`, `"123_4"` → `ArrayTask`. Anything else — step
+    /// suffixes (`123_4.batch`), pending aggregates (`123_[0-2]`), index
+    /// ranges — is `None`, so an argv carrying such a token never matches
+    /// a batchable shape and passes through uncached.
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token.split_once('_') {
+            None => token.parse::<u64>().ok().map(JobKey::Plain),
+            Some((master, index)) => Some(JobKey::ArrayTask {
+                master: master.parse::<u64>().ok()?,
+                index: index.parse::<u32>().ok()?,
+            }),
+        }
+    }
+
+    /// Parse a comma-separated `-j` value; `None` if any token fails.
+    pub(crate) fn parse_csv(csv: &str) -> Option<Vec<JobKey>> {
+        csv.split(',').map(JobKey::parse).collect()
+    }
+
+    /// Join a batch back into the comma-separated `-j` value.
+    pub(crate) fn build_csv(batch: &[JobKey]) -> String {
+        let mut out = String::with_capacity(batch.len() * 8);
+        for (i, key) in batch.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&key.to_string());
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for JobKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobKey::Plain(id) => write!(f, "{id}"),
+            JobKey::ArrayTask { master, index } => write!(f, "{master}_{index}"),
+        }
+    }
+}
 
 /// One batchable argv form. Implementations are zero-sized markers; the
 /// `Default` bound lets [`QueryCacheState::new`] construct them without a
@@ -351,6 +409,30 @@ mod tests {
         assert_eq!(calls(&argvs), 1, "a cached failure must not respawn");
         assert!(!first.to_string().contains("replayed from test cache"));
         assert!(second.to_string().contains("(replayed from test cache)"));
+    }
+
+    #[test]
+    fn job_key_parses_plain_and_array_tokens_and_rejects_the_rest() {
+        assert_eq!(JobKey::parse("123"), Some(JobKey::Plain(123)));
+        assert_eq!(
+            JobKey::parse("123_4"),
+            Some(JobKey::ArrayTask {
+                master: 123,
+                index: 4
+            })
+        );
+        // Step rows, pending aggregates, ranges, and garbage all refuse
+        // to parse — the argv carrying them passes through uncached.
+        for token in ["123_4.batch", "123_[0-2]", "123_", "_4", "x", ""] {
+            assert_eq!(JobKey::parse(token), None, "{token:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn job_key_csv_round_trips() {
+        let keys = JobKey::parse_csv("7,3_1").unwrap();
+        assert_eq!(JobKey::build_csv(&keys), "7,3_1");
+        assert_eq!(JobKey::parse_csv("7,3_1.batch"), None);
     }
 
     #[tokio::test]

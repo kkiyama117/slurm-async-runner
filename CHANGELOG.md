@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Array-task squeue/sacct queries join the shared batch caches.**
+  Per-task probes (`squeue -j <master>_<idx>`) and finalizers
+  (`sacct -j <master>_<idx>`) now share the manager-wide single-flight
+  TTL batch caches with plain-job handles, so N array-task handles
+  polling concurrently cost one squeue and (on finish bursts) one sacct
+  per `poll_interval` instead of N. Live-verified on KUDPC (2026-06-12,
+  jobids 7815400–7815414): both commands accept mixed plain/array `-j`
+  lists and answer keyed per-task rows. The squeue summary argv gains
+  `-r` (plain jobs unaffected; required so PENDING array tasks print one
+  keyed row each instead of an aggregate `<master>_[0,2]` row), and the
+  array probe switched from positional `-o "%T %r"` parsing to the same
+  exact-key `%i` matching the sacct array parser already uses.
+
 ## [v3.0.0] - 2026-06-12
 
 Major release: the tssrun backend's Rust API now returns typed errors

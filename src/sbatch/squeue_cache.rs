@@ -1,11 +1,11 @@
 //! Batching single-flight TTL cache for `squeue` summary queries.
 //!
 //! After a `qgroup -l` miss, every single-job `SbatchJobHandle::refresh()`
-//! issues `squeue -h -j <jobid> -o "%i %T %r"` — one subprocess per handle
-//! per poll cycle. squeue accepts a comma-separated id list on `-j`, so N
-//! handles of the same manager can share one listing per `poll_interval`,
-//! exactly like the `qgroup -l` cache one layer above (see
-//! [`crate::sbatch::qgroup_cache`]).
+//! issues `squeue -h -r -j <key> -o "%i %T %r"` — one subprocess per
+//! handle per poll cycle. squeue accepts a comma-separated key list on
+//! `-j`, so N handles of the same manager can share one listing per
+//! `poll_interval`, exactly like the `qgroup -l` cache one layer above
+//! (see [`crate::sbatch::qgroup_cache`]).
 //!
 //! This module is the squeue instantiation of the generic
 //! [`crate::sbatch::query_cache`] (issue #16 item 3); the TTL slot,
@@ -24,56 +24,58 @@
 //! serving one shared listing to every handle preserves refresh
 //! semantics bit-for-bit.
 //!
-//! Scope is deliberately limited to the exact summary-query argv shape:
-//! array-task probes (`squeue -j <master>_<idx> -o "%T %r"`) parse a
-//! single positional row and would mis-read a batched listing, and
-//! `sbatch` / `scancel` are mutating calls where replaying a stale result
-//! would be wrong. All of those pass through untouched (`sacct` exit-code
-//! queries have their own shape — see [`crate::sbatch::sacct_cache`]).
+//! Scope covers the exact summary-query argv shape, with plain jobids
+//! **and** array-task keys (`<master>_<idx>`) sharing one batch: KUDPC
+//! live verification (2026-06-12, jobids 7815400/7815408/7815414)
+//! confirmed squeue accepts the mixed `-j` list and — provided `-r` is
+//! passed — prints one keyed row per task even while PENDING (without
+//! `-r`, pending tasks collapse into an aggregate `<master>_[0,2]` row
+//! that defeats keyed lookups; `-r` is a no-op for plain jobs). `sbatch`
+//! / `scancel` are mutating calls where replaying a stale result would
+//! be wrong; they and every other argv pass through untouched (`sacct`
+//! exit-code queries have their own shape — see
+//! [`crate::sbatch::sacct_cache`]).
 
-use crate::sbatch::query_cache::{QueryCacheState, QueryCachingDispatcher, QueryShape};
+use crate::sbatch::query_cache::{JobKey, QueryCacheState, QueryCachingDispatcher, QueryShape};
 
 /// The `-o` format of the batchable summary query — must stay in sync
-/// with the argv built in `runner.rs` (`query_job_states_squeue_only_with`
-/// and the two batch query functions).
+/// with the argv built in `runner.rs` (`query_job_states_squeue_only_with`,
+/// `query_array_task_state_with` and the two batch query functions).
 const SUMMARY_FORMAT: &str = "%i %T %r";
 
-/// The batchable summary query `squeue -h -j <u64[,u64…]> -o "%i %T %r"`,
-/// as a [`QueryShape`].
+/// The batchable summary query
+/// `squeue -h -r -j <key[,key…]> -o "%i %T %r"`, as a [`QueryShape`].
+/// Keys are plain jobids and array tasks (see [`JobKey`]).
 #[derive(Default)]
 pub(crate) struct SqueueSummaryShape;
 
 impl QueryShape for SqueueSummaryShape {
-    type Key = u64;
+    type Key = JobKey;
 
-    /// Returns the requested jobids iff `argv` is exactly the batchable
-    /// summary query. Array-task probes fail twice here (their `-j` key
-    /// `<master>_<idx>` is not a u64 and their format is `%T %r`), and
-    /// anything that is not squeue fails the prefix check.
-    fn parse(&self, argv: &[String]) -> Option<Vec<u64>> {
-        if argv.len() != 6
+    /// Returns the requested keys iff `argv` is exactly the batchable
+    /// summary query. Step suffixes and aggregate tokens fail the key
+    /// parse, and anything that is not squeue fails the prefix check.
+    fn parse(&self, argv: &[String]) -> Option<Vec<JobKey>> {
+        if argv.len() != 7
             || argv[0] != "squeue"
             || argv[1] != "-h"
-            || argv[2] != "-j"
-            || argv[4] != "-o"
-            || argv[5] != SUMMARY_FORMAT
+            || argv[2] != "-r"
+            || argv[3] != "-j"
+            || argv[5] != "-o"
+            || argv[6] != SUMMARY_FORMAT
         {
             return None;
         }
-        argv[3].split(',').map(|t| t.parse::<u64>().ok()).collect()
+        JobKey::parse_csv(&argv[4])
     }
 
-    fn build(&self, batch: &[u64]) -> Vec<String> {
-        let csv = batch
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+    fn build(&self, batch: &[JobKey]) -> Vec<String> {
         vec![
             "squeue".into(),
             "-h".into(),
+            "-r".into(),
             "-j".into(),
-            csv,
+            JobKey::build_csv(batch),
             "-o".into(),
             SUMMARY_FORMAT.into(),
         ]
@@ -131,8 +133,8 @@ mod tests {
             if self.fail {
                 anyhow::bail!("No such file or directory (os error 2)")
             }
-            let stdout = if argv.len() == 6 && argv[0] == "squeue" {
-                argv[3]
+            let stdout = if argv.len() == 7 && argv[0] == "squeue" {
+                argv[4]
                     .split(',')
                     .map(|id| format!("{id} RUNNING None\n"))
                     .collect()
@@ -151,6 +153,7 @@ mod tests {
         vec![
             "squeue".into(),
             "-h".into(),
+            "-r".into(),
             "-j".into(),
             csv.into(),
             "-o".into(),
@@ -163,7 +166,7 @@ mod tests {
     }
 
     fn jlist(argvs: &Arc<Mutex<Vec<Vec<String>>>>, call: usize) -> String {
-        argvs.lock().unwrap()[call][3].clone()
+        argvs.lock().unwrap()[call][4].clone()
     }
 
     fn calls(argvs: &Arc<Mutex<Vec<Vec<String>>>>) -> usize {
@@ -235,13 +238,42 @@ mod tests {
         );
     }
 
+    /// Array-task probes share the batch with plain summary queries:
+    /// KUDPC-verified (2026-06-12) that with `-r` squeue prints one keyed
+    /// row per task — even while PENDING — for a mixed `-j` list.
+    #[tokio::test]
+    async fn array_task_probes_join_the_shared_batch() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = batching(RecordingInner::ok(argvs.clone()), Duration::from_secs(60));
+
+        d.capture(&summary_argv("100")).await.unwrap();
+        let out = d.capture(&summary_argv("123_4")).await.unwrap();
+        assert_eq!(calls(&argvs), 2);
+        assert_eq!(
+            jlist(&argvs, 1),
+            "100,123_4",
+            "the array key's first sight must re-batch with the plain key"
+        );
+        assert!(out.stdout.contains("123_4 RUNNING"));
+
+        d.capture(&summary_argv("123_4")).await.unwrap();
+        d.capture(&summary_argv("100")).await.unwrap();
+        assert_eq!(
+            calls(&argvs),
+            2,
+            "both key kinds must replay the shared listing within TTL"
+        );
+    }
+
     #[tokio::test]
     async fn non_summary_argv_bypasses_cache_entirely() {
         let argvs = Arc::new(Mutex::new(Vec::new()));
         let d = batching(RecordingInner::ok(argvs.clone()), Duration::from_secs(60));
 
-        // Array-task probe: `<master>_<idx>` key + `%T %r` format.
-        let array: Vec<String> = vec![
+        // The pre-batching array-probe form (`%T %r`, no `-r`): no longer
+        // built by runner.rs, but if it ever reappears it must pass
+        // through rather than mis-enter the keyed cache.
+        let legacy_array: Vec<String> = vec![
             "squeue".into(),
             "-h".into(),
             "-j".into(),
@@ -249,12 +281,12 @@ mod tests {
             "-o".into(),
             "%T %r".into(),
         ];
-        d.capture(&array).await.unwrap();
-        d.capture(&array).await.unwrap();
+        d.capture(&legacy_array).await.unwrap();
+        d.capture(&legacy_array).await.unwrap();
         assert_eq!(
             calls(&argvs),
             2,
-            "array-task probes must never be coalesced or cached"
+            "the legacy array-probe form must never be coalesced or cached"
         );
 
         let sacct: Vec<String> = vec![

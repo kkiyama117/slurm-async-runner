@@ -186,7 +186,7 @@ slurm-async-runner2/
 | `manager.rs` | `SbatchAttachKey`, `SbatchManager::{new, with_dispatcher, with_state_dir, with_poll_interval, spawn, spawn_array, run, cancel, attach_uuid, attach_jobid, attach_array_jobid, attach_file, find_all_by_jobid}` |
 | `error.rs` | `SbatchSpawnError`, `SbatchRunError`, `SbatchCancelError`, `SbatchAttachError` (`#[non_exhaustive]` typed enum 群) |
 | `query_cache.rs` (issue #16 item 3, PR #19) | generic single-flight TTL バッチキャッシュ: `QueryShape` trait + `QueryCacheState<S>` + `QueryCachingDispatcher<S>`。subset-replay ルールと 2×TTL キーレジストリの正本 |
-| `qgroup_cache.rs` / `squeue_cache.rs` / `sacct_cache.rs` | `QueryShape` の 3 実装 + type alias。qgroup はキーなし縮退形 (v2.0.0)、squeue summary / sacct exit-code は `-j id1,id2,…` バッチ (squeue は v2.0.0、sacct は PR #19)。array-task キーと legacy 3 列 sacct はパススルー |
+| `qgroup_cache.rs` / `squeue_cache.rs` / `sacct_cache.rs` | `QueryShape` の 3 実装 + type alias。qgroup はキーなし縮退形 (v2.0.0)、squeue summary / sacct exit-code は `-j key1,key2,…` バッチ (squeue は v2.0.0、sacct は PR #19)。キーは `query_cache::JobKey`（plain u64 と array-task `<master>_<idx>` が同一バッチに混在、KUDPC 実機検証 2026-06-12）。squeue argv は PENDING 集約回避のため `-r` 必須。legacy 3 列 sacct はパススルー |
 
 ### 2.4 pyo3 公開層 (`src/py_export/`)
 

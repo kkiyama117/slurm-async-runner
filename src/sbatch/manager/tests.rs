@@ -662,7 +662,7 @@ impl JobDispatcher for SqueueFallbackDispatcher {
             }
             "squeue" => {
                 self.squeue_calls.fetch_add(1, Ordering::SeqCst);
-                let rows: String = argv[3]
+                let rows: String = argv[4]
                     .split(',')
                     .map(|id| format!("{id} RUNNING None\n"))
                     .collect();
