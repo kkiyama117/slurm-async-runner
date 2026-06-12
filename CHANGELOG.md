@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v3.0.0] - 2026-06-12
+
+Major release: the tssrun backend's Rust API now returns typed errors
+(breaking for Rust callers; Python behavior is unchanged), the
+cross-backend `JobManager` trait lands, and `refresh_with_sacct()` is
+multiplexed across handles via a generic single-flight TTL batch cache
+(one slurmdbd query per `poll_interval` instead of one per handle).
+
 ### Added
 
 - **Structured errors for the tssrun backend** (issue #16 item 1).
@@ -625,7 +633,8 @@ queries). See **Changed** for the breaking items.
   substitutes the coreutils `true` / `false` / `echo` binaries through
   `SlurmCmd::new(...)`, plus a `MockDispatcher` for argv-plumbing assertions.
 
-[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v3.0.0...HEAD
+[v3.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v2.0.0...v3.0.0
 [v2.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.1.0...v2.0.0
 [v1.1.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/kkiyama117/slurm-async-runner/releases/tag/v1.0.0
