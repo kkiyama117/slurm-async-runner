@@ -245,6 +245,28 @@ impl TssrunManager {
     }
 }
 
+/// [`crate::job_manager::JobManager`] impl — delegates to the inherent
+/// methods; `Pid` / `File` attach stay tssrun-specific (inherent
+/// [`TssrunManager::attach`] with the full [`AttachKey`]).
+#[async_trait::async_trait]
+impl crate::job_manager::JobManager for TssrunManager {
+    type Handle = TssrunJobHandle;
+    type SpawnError = TssrunSpawnError;
+    type AttachError = TssrunAttachError;
+
+    async fn spawn(&self) -> Result<TssrunJobHandle, TssrunSpawnError> {
+        TssrunManager::spawn(self).await
+    }
+
+    async fn attach_uuid(&self, uuid: Uuid) -> Result<TssrunJobHandle, TssrunAttachError> {
+        self.attach(AttachKey::Uuid(uuid)).await
+    }
+
+    async fn attach_jobid(&self, jobid: u64) -> Result<TssrunJobHandle, TssrunAttachError> {
+        self.attach(AttachKey::JobId(jobid)).await
+    }
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -454,5 +454,26 @@ impl SbatchManager {
     }
 }
 
+/// [`crate::job_manager::JobManager`] impl — delegates to the inherent
+/// methods; array spawn/attach, `run`, and `cancel` stay sbatch-specific.
+#[async_trait::async_trait]
+impl crate::job_manager::JobManager for SbatchManager {
+    type Handle = SbatchJobHandle;
+    type SpawnError = SbatchSpawnError;
+    type AttachError = SbatchAttachError;
+
+    async fn spawn(&self) -> Result<SbatchJobHandle, SbatchSpawnError> {
+        SbatchManager::spawn(self).await
+    }
+
+    async fn attach_uuid(&self, uuid: Uuid) -> Result<SbatchJobHandle, SbatchAttachError> {
+        SbatchManager::attach_uuid(self, uuid).await
+    }
+
+    async fn attach_jobid(&self, jobid: u64) -> Result<SbatchJobHandle, SbatchAttachError> {
+        SbatchManager::attach_jobid(self, jobid).await
+    }
+}
+
 #[cfg(test)]
 mod tests;

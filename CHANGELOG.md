@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TssrunWaitError`, `TssrunRefreshError` (all `#[non_exhaustive]`,
   re-exported from the crate root), mirroring the sbatch error family so
   Rust callers can match on failure modes.
+- **`JobManager` trait** (issue #16 item 2) — manager-side companion to
+  `JobHandleCommon`: `spawn` / `attach_uuid` / `attach_jobid` with
+  associated `Handle`, `SpawnError`, `AttachError` types, implemented by
+  both `TssrunManager` and `SbatchManager` (backend-specific entry points
+  such as `spawn_array`, `run`, `cancel`, `attach(AttachKey::Pid|File)`
+  stay inherent). Cross-backend contract test in
+  `tests/job_manager_common.rs`.
 
 ### Changed
 
