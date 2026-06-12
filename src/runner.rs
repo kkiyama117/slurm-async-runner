@@ -11,6 +11,9 @@
 //! plus compact codes plus trailing-context tolerance) and the reason
 //! via `JobReason::parse` (~80 SLURM reason strings plus `Other(String)`
 //! forward-compat).
+//!
+//! The full index of SLURM output formats understood by this crate lives
+//! in [`crate::sbatch::parse`] (issue #16 item 5).
 
 use std::collections::{HashMap, HashSet};
 

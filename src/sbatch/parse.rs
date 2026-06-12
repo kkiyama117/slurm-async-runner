@@ -1,4 +1,21 @@
 //! Pure parsers / formatters for the sbatch module — no I/O.
+//!
+//! # SLURM output-format index (issue #16 item 5)
+//!
+//! Parsers stay in their backend's module (domain cohesion); this list is
+//! the single place to look up "which SLURM output formats do we
+//! understand, and where":
+//!
+//! | Format | Parser |
+//! |---|---|
+//! | `sbatch` submit stdout (`Submitted batch job N…`) | [`parse_submitted_jobid`] (this module) |
+//! | sacct `ExitCode` column (`exit:signal`) | [`parse_sacct_exit_code`] (this module) |
+//! | `-o`/`-e` log path templates (`%j`/`%A`/`%a`/`%x`/`%u`/`%N`) | [`resolve_log_path`] (this module) |
+//! | `--array` spec index expansion | [`expand_array_indices`] (this module) |
+//! | `salloc:` allocation banner (jobid / node) | [`crate::tssrun::parse`] |
+//! | squeue `%i %T %r` rows / sacct `JobID\|State\|Reason` rows | `crate::runner::{parse_squeue, parse_sacct, parse_sacct_with_exit_code}` |
+//! | KUDPC `qgroup -l` listing rows | `crate::sbatch::handle` refresh path |
+//! | state / reason token vocabulary (incl. KUDPC `FINI`/`FAIL` aliases) | [`crate::entities::slurm::status`] |
 
 use std::path::PathBuf;
 
