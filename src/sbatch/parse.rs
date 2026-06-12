@@ -9,9 +9,9 @@
 //! | Format | Parser |
 //! |---|---|
 //! | `sbatch` submit stdout (`Submitted batch job N…`) | [`parse_submitted_jobid`] (this module) |
-//! | sacct `ExitCode` column (`exit:signal`) | [`parse_sacct_exit_code`] (this module) |
+//! | sacct `ExitCode` column (`exit:signal`) | `parse_sacct_exit_code` (this module, crate-private) |
 //! | `-o`/`-e` log path templates (`%j`/`%A`/`%a`/`%x`/`%u`/`%N`) | [`resolve_log_path`] (this module) |
-//! | `--array` spec index expansion | [`expand_array_indices`] (this module) |
+//! | `--array` spec index expansion | `expand_array_indices` (this module, crate-private) |
 //! | `salloc:` allocation banner (jobid / node) | [`crate::tssrun::parse`] |
 //! | squeue `%i %T %r` rows / sacct `JobID\|State\|Reason` rows | `crate::runner::{parse_squeue, parse_sacct, parse_sacct_with_exit_code}` |
 //! | KUDPC `qgroup -l` listing rows | `crate::sbatch::handle` refresh path |
