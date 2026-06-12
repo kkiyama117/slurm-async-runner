@@ -221,6 +221,11 @@ mod tests {
     /// finalizer after the first replays the cached listing — one sacct
     /// spawn per TTL window for the whole array. Per-task keys would
     /// pay a fresh live re-batch for each newly-finishing task.
+    ///
+    /// This test pins the cache-hit behaviour only; that each task then
+    /// extracts its *own* row from the shared listing is the parser's
+    /// job, pinned by `runner::tests::
+    /// query_array_task_outcome_extracts_own_row_from_master_expansion`.
     #[tokio::test]
     async fn staggered_array_finalizers_share_one_master_keyed_spawn() {
         let argvs = Arc::new(Mutex::new(Vec::new()));
