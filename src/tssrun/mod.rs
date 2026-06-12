@@ -45,6 +45,7 @@
 //! for the full design rationale.
 
 pub mod cmd;
+pub mod error;
 pub mod handle;
 pub mod log;
 pub mod manager;

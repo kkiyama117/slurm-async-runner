@@ -42,6 +42,7 @@ pub use dispatcher::{BackgroundDispatcher, SpawnedChild, TokioBackgroundDispatch
 
 // Re-export tssrun public API.
 pub use tssrun::cmd::TssrunCmd;
+pub use tssrun::error::{TssrunAttachError, TssrunRefreshError, TssrunSpawnError, TssrunWaitError};
 // Re-export the SLURM resource/partition/time-limit vocabulary from the crate-local entities module.
 pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,

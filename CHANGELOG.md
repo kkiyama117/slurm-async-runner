@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Structured errors for the tssrun backend** (issue #16 item 1).
+  New `tssrun::error` module with `TssrunSpawnError`, `TssrunAttachError`,
+  `TssrunWaitError`, `TssrunRefreshError` (all `#[non_exhaustive]`,
+  re-exported from the crate root), mirroring the sbatch error family so
+  Rust callers can match on failure modes.
+
+### Changed
+
+- **Rust API (breaking): tssrun signatures return typed errors.**
+  `TssrunManager::spawn`/`spawn_with` → `Result<_, TssrunSpawnError>`,
+  `TssrunManager::attach` → `Result<_, TssrunAttachError>`,
+  `TssrunJobHandle::wait` → `Result<_, TssrunWaitError>`,
+  `TssrunJobHandle::refresh`/`wait_terminal` → `Result<_, TssrunRefreshError>`.
+  The `JobHandleCommon` trait impl still exposes `anyhow::Result`, and
+  error message strings are unchanged, so Python behavior (exception
+  types and messages) is identical.
+
+### CI
+
+- `cargo audit` job (advisory ignores documented in `.cargo/audit.toml`);
+  `pyo3-stub-gen` now pinned to the crates.io 0.22.3 release instead of a
+  moving `branch = "main"` git pin (issue #16 item 6).
+- Stub-drift check: CI regenerates the `.pyi` stubs and fails if the
+  committed ones are stale (issue #16 item 7).
+
 ## [v2.0.0] - 2026-06-12
 
 Major release: monitoring-correctness fixes change observable behavior
