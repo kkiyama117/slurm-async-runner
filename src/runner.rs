@@ -510,7 +510,7 @@ pub async fn query_array_task_outcome_with<D: JobDispatcher>(
         "-P".to_string(),
         "-n".to_string(),
         "-j".to_string(),
-        key,
+        key.clone(),
         "-o".to_string(),
         "JobID,State,Reason,ExitCode".to_string(),
     ];
@@ -518,7 +518,7 @@ pub async fn query_array_task_outcome_with<D: JobDispatcher>(
     // sacct returns exit 0 + empty stdout for unknown jobids; a nonzero
     // exit is a genuine failure.
     ensure_query_success("sacct", &out)?;
-    Ok(parse_sacct_array_task_with_exit_code(&out.stdout))
+    Ok(parse_sacct_array_task_with_exit_code(&out.stdout, &key))
 }
 
 /// Parse a single-row `squeue -o "%T %r"` output for one array task.
@@ -546,25 +546,28 @@ pub(crate) fn parse_squeue_array_task(text: &str) -> Option<JobStatus> {
 }
 
 /// Parse `sacct -P -n -j <master>_<idx> -o "JobID|State|Reason|ExitCode"`
-/// output for one array task. Returns the parent row (without a `.` in
-/// the JobID column); step rows (`<master>_<idx>.batch`, `.0`, …) are
+/// output for one array task. Returns the parent row whose JobID column
+/// equals `key` (the `<master>_<idx>` string that was queried); step rows
+/// (`<master>_<idx>.batch`, `.0`, …) and rows for any other job are
 /// silently skipped.
 ///
-/// The JobID column itself is only used as a discriminator between
-/// parent and step rows — its `<master>_<idx>` value is never parsed as
-/// a number, so we sidestep the "u64 parse failure" that the
-/// summary-mode [`parse_sacct_with_exit_code`] would hit on array task
-/// rows.
-pub(crate) fn parse_sacct_array_task_with_exit_code(text: &str) -> Option<JobOutcome> {
+/// The exact-key match makes the parser safe against listings that
+/// contain rows for more than the queried task (defense in depth today;
+/// a prerequisite for ever batching array-task sacct queries). The
+/// `<master>_<idx>` value is still never parsed as a number, so we
+/// sidestep the "u64 parse failure" that the summary-mode
+/// [`parse_sacct_with_exit_code`] would hit on array task rows.
+pub(crate) fn parse_sacct_array_task_with_exit_code(text: &str, key: &str) -> Option<JobOutcome> {
     use crate::sbatch::parse::parse_sacct_exit_code;
     for line in text.lines() {
         let mut parts = line.splitn(4, '|');
         let Some(jid_str) = parts.next() else {
             continue;
         };
-        // Step rows (`<master>_<idx>.batch` etc.) are filtered out — only
-        // the parent row contributes the canonical state/exit code.
-        if jid_str.contains('.') {
+        // Only the queried task's parent row contributes the canonical
+        // state/exit code. Step rows (`<master>_<idx>.batch` etc.) and
+        // rows for other jobs fail the equality check.
+        if jid_str != key {
             continue;
         }
         let Some(state_str) = parts.next() else {

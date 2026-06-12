@@ -21,6 +21,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such as `spawn_array`, `run`, `cancel`, `attach(AttachKey::Pid|File)`
   stay inherent). Cross-backend contract test in
   `tests/job_manager_common.rs`.
+- **Shared batched `sacct` exit-code cache (refresh multiplexing,
+  part 3).** Handles of the same `SbatchManager` whose jobs finish in a
+  burst now share one batched
+  `sacct -P -n -j id1,id2,… -o JobID,State,Reason,ExitCode` query per
+  `poll_interval` (single-flight TTL cache), instead of one sacct —
+  i.e. one slurmdbd hit — per handle per `refresh_with_sacct()` call.
+  Accounting-lag retries within the TTL replay the cached listing
+  instead of re-querying slurmdbd. The same subset-replay rule as the
+  squeue cache applies, so "no row for my id" can never be fabricated.
+  Array-task finalizers (`-j <master>_<idx>`) and the legacy 3-column
+  listing are never batched or cached. Motivated by the KUDPC manual's
+  request not to repeat status commands mechanically; sacct is the
+  heaviest such command (accounting DB query).
+- **Generic `query_cache` primitive** (issue #16 item 3, internal).
+  The single-flight TTL batch cache behind the `qgroup -l`, squeue and
+  sacct multiplexing is now one generic implementation
+  (`sbatch::query_cache`, parameterized by a `QueryShape`); the three
+  shapes share the TTL slot, single-flight locking, subset-replay rule
+  and 2 × `poll_interval` key-registry aging. No behavior change for
+  the existing qgroup/squeue caches. The array-task sacct parser now
+  requires an exact JobID-column match for the queried
+  `<master>_<idx>` key (defense in depth; prerequisite for ever
+  batching array-task queries).
 
 ### Changed
 

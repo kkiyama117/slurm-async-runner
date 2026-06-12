@@ -15,6 +15,7 @@ use crate::sbatch::handle::{
 };
 use crate::sbatch::parse::parse_submitted_jobid;
 use crate::sbatch::qgroup_cache::{QgroupCacheState, QgroupCachingDispatcher};
+use crate::sbatch::sacct_cache::{SacctBatchingDispatcher, SacctCacheState};
 use crate::sbatch::squeue_cache::{SqueueBatchingDispatcher, SqueueCacheState};
 use crate::store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
 
@@ -40,6 +41,11 @@ pub struct SbatchManager {
     /// through to the squeue probe share one batched `-j id1,id2,…`
     /// listing per poll cycle. See [`crate::sbatch::squeue_cache`].
     squeue_cache: Arc<SqueueCacheState>,
+    /// Shared sacct exit-code batch cache (TTL = `poll_interval`):
+    /// handles whose jobs finish in a burst share one batched slurmdbd
+    /// query per poll cycle instead of issuing one `sacct` each. See
+    /// [`crate::sbatch::sacct_cache`].
+    sacct_cache: Arc<SacctCacheState>,
 }
 
 impl SbatchManager {
@@ -52,19 +58,25 @@ impl SbatchManager {
             scancel_bin: "scancel".to_string(),
             qgroup_cache: Arc::new(QgroupCacheState::new(DEFAULT_POLL_INTERVAL)),
             squeue_cache: Arc::new(SqueueCacheState::new(DEFAULT_POLL_INTERVAL)),
+            sacct_cache: Arc::new(SacctCacheState::new(DEFAULT_POLL_INTERVAL)),
         }
     }
 
     /// Dispatcher handed to handles: `self.dispatcher` with the shared
-    /// `qgroup -l` TTL cache and the squeue batch cache layered in.
-    /// The two wrappers intercept disjoint argv shapes, so their order
-    /// is immaterial. Submission-side calls (`sbatch` in `spawn`,
-    /// `scancel` in `cancel`) keep using `self.dispatcher` directly —
-    /// they never issue either query, and the wrappers pass every other
-    /// argv through untouched anyway.
+    /// `qgroup -l` TTL cache, the squeue batch cache and the sacct batch
+    /// cache layered in. The three wrappers intercept disjoint argv
+    /// shapes, so their order is immaterial. Submission-side calls
+    /// (`sbatch` in `spawn`, `scancel` in `cancel`) keep using
+    /// `self.dispatcher` directly — they never issue any of these
+    /// queries, and the wrappers pass every other argv through untouched
+    /// anyway.
     fn handle_dispatcher(&self) -> Arc<dyn DynJobDispatcher> {
-        let squeue_batched = into_dyn(SqueueBatchingDispatcher::new(
+        let sacct_batched = into_dyn(SacctBatchingDispatcher::new(
             self.dispatcher.clone(),
+            self.sacct_cache.clone(),
+        ));
+        let squeue_batched = into_dyn(SqueueBatchingDispatcher::new(
+            sacct_batched,
             self.squeue_cache.clone(),
         ));
         into_dyn(QgroupCachingDispatcher::new(
@@ -102,16 +114,17 @@ impl SbatchManager {
     /// cannot land inside a single sampling window) and to keep KUDPC
     /// squeue load low. Tests typically use 1–10 ms.
     ///
-    /// Also sets the TTL of the shared `qgroup -l` listing cache and of
-    /// the squeue batch cache to the same duration, so a manual
-    /// `refresh()` is never staler than one poll cycle. Call this
-    /// *before* `spawn`/`attach` — handles created earlier keep the
-    /// caches built from the previous interval.
+    /// Also sets the TTL of the shared `qgroup -l` listing cache, the
+    /// squeue batch cache and the sacct batch cache to the same
+    /// duration, so a manual `refresh()` is never staler than one poll
+    /// cycle. Call this *before* `spawn`/`attach` — handles created
+    /// earlier keep the caches built from the previous interval.
     #[must_use = "with_poll_interval returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
         self.qgroup_cache = Arc::new(QgroupCacheState::new(dur));
         self.squeue_cache = Arc::new(SqueueCacheState::new(dur));
+        self.sacct_cache = Arc::new(SacctCacheState::new(dur));
         self
     }
 
