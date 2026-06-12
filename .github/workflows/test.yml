@@ -94,6 +94,18 @@ jobs:
       - name: ruff format --check
         run: uv run ruff format --check python/
 
+      - name: Stub drift check (regenerate .pyi and diff)
+        # The committed auto-generated stubs must match the current Rust
+        # source. stub_gen emits unformatted output, so normalize with ruff
+        # format (same sequence as the documented regeneration command)
+        # before diffing. The preceding `ruff format --check` already proved
+        # the tree was formatted, so any diff here is stub drift, not
+        # formatting noise.
+        run: |
+          cargo run --bin stub_gen
+          uv run ruff format python/
+          git diff --exit-code python/
+
   audit:
     name: Security advisories (cargo audit)
     runs-on: ubuntu-22.04
