@@ -5,7 +5,6 @@ requires-python = ">=3.12"
 authors = [{ name = "kkiyama117", email = "k.kiyama117@gmail.com" }]
 classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy",
   "Programming Language :: Rust",
 ]
 dynamic = ["version"]
@@ -40,7 +39,7 @@ target-version = "py312"
 "**/*.pyi" = ["F821"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["slurm-async-runner"]
+known-first-party = ["slurm_async_runner"]
 
 [tool.ruff.format]
 quote-style = "double"

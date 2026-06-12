@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`refresh_with_sacct` no longer stamps a non-terminal `FinishedInfo`
+  after a false vanish.** A transient `squeue` failure under controller
+  overload (stderr `Socket timed out`, empty stdout) is indistinguishable
+  from a purge, so `left_active_listing` could flip to `true` while the
+  job was still running; the follow-up sacct query then returned a live
+  `RUNNING|…|0:0` row that slipped past the no-row sentinel and froze
+  `FinishedInfo { final_state: Running, exit_code: Some(0) }` behind the
+  idempotency short-circuit. Now only terminal states (or unrecognized
+  future tokens carrying an exit code) are stamped; a known non-terminal
+  row instead rolls back `left_active_listing`, records the live
+  observation, and normal polling resumes.
+- **`from slurm_async_runner import tssrun / sbatch / …` works.**
+  `__all__` advertised the extension submodules without binding them in
+  the package namespace, so every advertised name raised `ImportError`.
+  The submodules are now re-exported at the top level.
+- **PEP 561 `py.typed` marker added.** Downstream mypy/pyright previously
+  treated the whole package as untyped and ignored every `.pyi` stub.
+- **Stub fixes:** `SbatchCmd.build_argv` and `FinishedInfo.__repr__` were
+  missing from the handwritten `sbatch.pyi`; the PyPy trove classifier
+  (impossible for an abi3 CPython extension) and the hyphenated
+  `known-first-party` entry in `pyproject.toml` were corrected.
+
 - **sbatch monitoring correctness — stderr misread / sacct-lag freeze /
   qgroup fallback.**
   - **Array-task refresh no longer misreads merged stderr as a job

@@ -310,3 +310,40 @@ fn new(
 - 「観測できなかった」と「Unknown を観測した」を混同しない。捏造した
   Unknown を永続化すると idempotency ガードと組み合わさって自己修復不能に
   なる。
+
+---
+
+# sbatch 監視 regression 4 件目: 偽 vanish 後の非 terminal FinishedInfo 凍結 (2026-06-12)
+
+上記 3 件の修正後のフルリポジトリレビューで発見。同族の 4 件目。
+
+## 1. 何が起きたか
+
+1. controller 過負荷時の `squeue` は「stderr に `Socket timed out`、exit 1、
+   **stdout 空**」を返す。query ヘルパーは exit code を捨てるため、これは
+   正常な「ジョブ消失」と区別できず `left_active_listing = true` が立つ
+   （実行中ジョブでも）。このフラグを false に戻す経路は存在しなかった。
+2. その後の `refresh_with_sacct()` で sacct は走行中ジョブに
+   `RUNNING|None|0:0` の行を返す。no-row sentinel（`Unknown && exit_code
+   is None`）はすり抜け、`FinishedInfo { final_state: Running, exit_code:
+   Some(0) }` が刻印され、idempotency short-circuit により自己修復不能。
+   `SbatchManager::run()` 経由では「JobFailed { state: RUNNING }」になる。
+
+## 2. 修正
+
+- `refresh_with_sacct` に terminal ガードを追加: 既知の非 terminal 状態
+  （RUNNING/PENDING 等）の行は刻印せず、`left_active_listing` を巻き戻して
+  観測値 (`last_observed_state`) を記録し、通常ポーリングに復帰させる。
+- forward-compat 維持: 未知トークン（`Unknown`）+ exit code ありは従来
+  どおり刻印する（将来 SLURM が terminal 状態を増やしても解決できる）。
+- regression テスト: `refresh_with_sacct_rolls_back_false_vanish_on_live_sacct_row`
+  / 同 array 変種 / `refresh_with_sacct_stamps_unknown_token_with_exit_code`。
+
+## 3. 教訓
+
+- 「リストに居ない」は「終わった」を意味しない。終端の確定は terminal
+  状態の観測のみを根拠にすること（vanish は再試行のトリガーにすぎない）。
+- 根本原因は query ヘルパーが exit code / stderr を捨てて「一時失敗」と
+  「消失」を融合していること。`capture` の戻りを
+  `{ exit_code, stdout, stderr }` に構造化する改善が残タスク
+  （[stderr] マーカー結合の廃止とセット）。

@@ -478,6 +478,24 @@ impl SbatchJobHandle {
             return Ok(snap);
         }
 
+        // A *known non-terminal* row (RUNNING/PENDING/…) means the job is
+        // provably still alive — the earlier vanish observation was a
+        // false positive (e.g. a transient `squeue` failure under
+        // controller overload yields empty stdout, indistinguishable from
+        // a purge). Never stamp FinishedInfo from it: roll back the
+        // vanish flag and record the live observation so `is_running()` /
+        // `wait_terminal` resume normal polling. `Unknown` is exempt so
+        // an unrecognized future terminal token with a real exit code
+        // (forward-compat) still resolves.
+        if outcome.status.state != JobState::Unknown && !outcome.status.state.is_terminal() {
+            snap.lifecycle.left_active_listing = false;
+            snap.lifecycle.last_observed_state = Some(outcome.status);
+            snap.lifecycle.last_observed_at = Some(chrono::Utc::now());
+            inner.store.save(&snap).await?;
+            inner.snapshot_tx.send_replace(snap.clone());
+            return Ok(snap);
+        }
+
         snap.lifecycle.finished = Some(FinishedInfo {
             final_state: outcome.status.state,
             final_reason: outcome.status.reason,
@@ -1068,6 +1086,119 @@ mod tests {
         let second = h.refresh_with_sacct().await.unwrap();
         let finished = second.lifecycle.finished.expect("resolved after lag");
         assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    /// Regression (non-terminal sacct row freeze): a transient squeue
+    /// failure (controller overload prints `Socket timed out` on stderr,
+    /// exits 1, stdout empty) is indistinguishable from a vanish, so
+    /// `left_active_listing` flips to `true` while the job is still
+    /// running. A subsequent `refresh_with_sacct` then gets a live
+    /// `RUNNING|…|0:0` row — which slips past the no-row sentinel
+    /// (`Unknown && exit_code.is_none()`) and froze
+    /// `FinishedInfo { final_state: Running, exit_code: Some(0) }`
+    /// behind the idempotency short-circuit. The fix: only a terminal
+    /// state may be stamped; a live row instead rolls back the vanish
+    /// flag so normal polling resumes.
+    #[tokio::test]
+    async fn refresh_with_sacct_rolls_back_false_vanish_on_live_sacct_row() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // qgroup & squeue empty (transient miss) but sacct proves the job
+        // is alive.
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "",
+            "12345|RUNNING|None|0:0\n12345.batch|RUNNING|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(
+            first.lifecycle.finished.is_none(),
+            "a non-terminal sacct row must never be stamped as FinishedInfo, got {:?}",
+            first.lifecycle.finished
+        );
+        assert!(
+            !first.lifecycle.left_active_listing,
+            "a live sacct row must roll back the false vanish flag"
+        );
+        assert_eq!(
+            first.lifecycle.last_observed_state.as_ref().unwrap().state,
+            crate::JobState::Running,
+            "the live observation must be recorded"
+        );
+        assert!(h.is_running(), "handle must report running again");
+
+        // The job later finishes for real: squeue stays empty, sacct now
+        // reports the terminal row — the normal resolve path must work.
+        *canned.sacct.lock().unwrap() = "12345|COMPLETED|None|0:0\n".to_string();
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second
+            .lifecycle
+            .finished
+            .expect("terminal sacct row must resolve normally");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    /// Array-task variant of the non-terminal-row rollback.
+    #[tokio::test]
+    async fn refresh_with_sacct_array_task_rolls_back_false_vanish_on_live_row() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "",
+            "12345_3|RUNNING|None|0:0\n12345_3.batch|RUNNING|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(first.lifecycle.finished.is_none());
+        assert!(!first.lifecycle.left_active_listing);
+
+        *canned.sacct.lock().unwrap() = "12345_3|FAILED|NonZeroExitCode|3:0\n".to_string();
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second.lifecycle.finished.expect("terminal row resolves");
+        assert_eq!(finished.final_state, crate::JobState::Failed);
+        assert_eq!(finished.exit_code, Some(3));
+    }
+
+    /// Forward-compat lock-in: an *unrecognized* state token with a real
+    /// exit code (a future SLURM terminal state we don't know yet) must
+    /// still be stamped — the terminal guard only blocks *known*
+    /// non-terminal states. The no-row case stays covered by the
+    /// `Unknown && exit_code.is_none()` sentinel.
+    #[tokio::test]
+    async fn refresh_with_sacct_stamps_unknown_token_with_exit_code() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "",
+            "12345|SOME_FUTURE_STATE|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let after = h.refresh_with_sacct().await.unwrap();
+        let finished = after
+            .lifecycle
+            .finished
+            .expect("unknown token + exit code must still resolve (forward-compat)");
+        assert_eq!(finished.final_state, crate::JobState::Unknown);
         assert_eq!(finished.exit_code, Some(0));
     }
 

@@ -2,10 +2,31 @@ from typing import Protocol, runtime_checkable
 
 from slurm_async_runner import _slurm_async_runner_core as _core
 
+# Re-export the extension submodules so every name advertised in
+# `__all__` is actually importable from the package top level
+# (`from slurm_async_runner import sbatch`). Keep this list in sync
+# with `_core.__all__` — test_packaging.py fails on drift.
+from slurm_async_runner._slurm_async_runner_core import (
+    entities,
+    manager,
+    runner,
+    sbatch,
+    sum_as_string,
+    tssrun,
+)
+
 if hasattr(_core, "__doc__"):
     __doc__ = _core.__doc__
 
-__all__ = [*getattr(_core, "__all__", []), "JobHandleCommon"]
+__all__ = [
+    "JobHandleCommon",
+    "entities",
+    "manager",
+    "runner",
+    "sbatch",
+    "sum_as_string",
+    "tssrun",
+]
 
 
 # ────────────────────────────────────────────────────────────────────
