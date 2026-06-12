@@ -189,7 +189,10 @@ impl<S: QueryShape> JobDispatcher for QueryCachingDispatcher<S> {
         slot.recent.retain(|_, at| at.elapsed() < window);
         let mut batch: Vec<S::Key> = slot.recent.keys().cloned().collect();
         // With ttl == ZERO the retain above empties the registry, so the
-        // requested keys must be re-added unconditionally.
+        // requested keys must be re-added unconditionally. This is also
+        // what keeps `build()` from ever seeing an empty batch for keyed
+        // shapes: `requested` is only empty for the zero-key qgroup
+        // shape, whose `build()` ignores its argument.
         batch.extend(requested.iter().cloned());
         batch.sort_unstable();
         batch.dedup();
@@ -205,5 +208,161 @@ impl<S: QueryShape> JobDispatcher for QueryCachingDispatcher<S> {
             },
         });
         fetched
+    }
+}
+
+/// Generic-layer tests against a purpose-built shape, pinning the core
+/// mechanics independently of the three production shapes (whose test
+/// modules cover their argv specifics and end-to-end semantics). A
+/// fourth shape gets this regression net for free.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatcher::into_dyn;
+    use std::sync::Mutex;
+
+    /// Minimal keyed shape: `test -k <u64[,u64…]>`.
+    #[derive(Default)]
+    struct TestShape;
+    impl QueryShape for TestShape {
+        type Key = u64;
+        fn parse(&self, argv: &[String]) -> Option<Vec<u64>> {
+            if argv.len() != 3 || argv[0] != "test" || argv[1] != "-k" {
+                return None;
+            }
+            argv[2].split(',').map(|t| t.parse::<u64>().ok()).collect()
+        }
+        fn build(&self, batch: &[u64]) -> Vec<String> {
+            let csv = batch
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            vec!["test".into(), "-k".into(), csv]
+        }
+        fn replay_marker(&self) -> &'static str {
+            "(replayed from test cache)"
+        }
+    }
+
+    struct RecordingInner {
+        argvs: Arc<Mutex<Vec<Vec<String>>>>,
+        fail: bool,
+    }
+    impl JobDispatcher for RecordingInner {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
+            self.argvs.lock().unwrap().push(argv.to_vec());
+            if self.fail {
+                anyhow::bail!("inner boom")
+            }
+            Ok(CaptureOutput {
+                exit_code: 0,
+                stdout: argv.join(" "),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn cached(
+        argvs: Arc<Mutex<Vec<Vec<String>>>>,
+        fail: bool,
+        ttl: Duration,
+    ) -> QueryCachingDispatcher<TestShape> {
+        QueryCachingDispatcher::new(
+            into_dyn(RecordingInner { argvs, fail }),
+            Arc::new(QueryCacheState::new(ttl)),
+        )
+    }
+
+    fn argv(csv: &str) -> Vec<String> {
+        vec!["test".into(), "-k".into(), csv.into()]
+    }
+
+    fn calls(argvs: &Arc<Mutex<Vec<Vec<String>>>>) -> usize {
+        argvs.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn subset_replays_and_superset_goes_live_rebatched() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = cached(argvs.clone(), false, Duration::from_secs(60));
+
+        d.capture(&argv("1,2")).await.unwrap();
+        d.capture(&argv("2")).await.unwrap();
+        assert_eq!(calls(&argvs), 1, "subset must replay the cached entry");
+
+        d.capture(&argv("3")).await.unwrap();
+        assert_eq!(calls(&argvs), 2, "an unseen key must go live");
+        assert_eq!(
+            argvs.lock().unwrap()[1][2],
+            "1,2,3",
+            "the live re-batch must union the registry with the request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_entry_misses_and_registry_ages_out_after_two_ttls() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let ttl = Duration::from_secs(60);
+        let d = cached(argvs.clone(), false, ttl);
+
+        d.capture(&argv("1")).await.unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        d.capture(&argv("2")).await.unwrap();
+        assert_eq!(
+            argvs.lock().unwrap()[1][2],
+            "1,2",
+            "a key inside the 2 x ttl window must stay in the batch"
+        );
+
+        tokio::time::advance(Duration::from_secs(121)).await;
+        d.capture(&argv("2")).await.unwrap();
+        assert_eq!(
+            argvs.lock().unwrap()[2][2],
+            "2",
+            "a key idle beyond 2 x ttl must leave the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_zero_disables_caching_and_batching() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = cached(argvs.clone(), false, Duration::ZERO);
+
+        d.capture(&argv("1")).await.unwrap();
+        d.capture(&argv("1")).await.unwrap();
+        d.capture(&argv("2")).await.unwrap();
+
+        assert_eq!(calls(&argvs), 3);
+        assert_eq!(argvs.lock().unwrap()[2][2], "2");
+    }
+
+    #[tokio::test]
+    async fn replayed_error_carries_the_shape_marker() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = cached(argvs.clone(), true, Duration::from_secs(60));
+
+        let first = d.capture(&argv("1")).await.unwrap_err();
+        let second = d.capture(&argv("1")).await.unwrap_err();
+
+        assert_eq!(calls(&argvs), 1, "a cached failure must not respawn");
+        assert!(!first.to_string().contains("replayed from test cache"));
+        assert!(second.to_string().contains("(replayed from test cache)"));
+    }
+
+    #[tokio::test]
+    async fn non_matching_argv_passes_through_uncached() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = cached(argvs.clone(), false, Duration::from_secs(60));
+        let other: Vec<String> = vec!["other".into(), "-k".into(), "1".into()];
+
+        d.capture(&other).await.unwrap();
+        d.capture(&other).await.unwrap();
+
+        assert_eq!(calls(&argvs), 2, "foreign argv must never be cached");
+        assert_eq!(argvs.lock().unwrap()[0], other, "argv must pass verbatim");
     }
 }
