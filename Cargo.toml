@@ -1,6 +1,6 @@
 [package]
 name = "slurm_async_runner"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -85,7 +85,9 @@ pyo3-log = { version = "0.13", optional = true }
 pythonize = { version = "0.28", optional = true }
 
 # STUB_GEN
-pyo3-stub-gen = { git = "https://github.com/Jij-Inc/pyo3-stub-gen", branch = "main", default-features = false, features = [
+# crates.io release (was a `branch = "main"` git pin while pyo3 0.28 support
+# was unreleased; 0.22.3 ships it, and a version pin keeps builds reproducible).
+pyo3-stub-gen = { version = "0.22.3", default-features = false, features = [
   "infer_signature"
 ], optional = true }
 

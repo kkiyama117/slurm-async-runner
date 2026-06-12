@@ -93,3 +93,34 @@ jobs:
 
       - name: ruff format --check
         run: uv run ruff format --check python/
+
+      - name: Stub drift check (regenerate .pyi and diff)
+        # The committed auto-generated stubs must match the current Rust
+        # source. stub_gen emits unformatted output, so normalize with ruff
+        # format (same sequence as the documented regeneration command)
+        # before diffing. The preceding `ruff format --check` already proved
+        # the tree was formatted, so any diff here is stub drift, not
+        # formatting noise.
+        run: |
+          cargo run --bin stub_gen
+          uv run ruff format python/
+          git diff --exit-code python/
+
+  audit:
+    name: Security advisories (cargo audit)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        # Reads Cargo.lock only — no compilation, so no Rust toolchain step.
+        # `cargo-audit audit` (direct binary) skips the `cargo audit` rustup
+        # shim, which would otherwise install the nightly toolchain pinned by
+        # rust-toolchain.toml just to dispatch the subcommand.
+        # Ignored advisories are listed in .cargo/audit.toml with justification.
+        run: cargo-audit audit

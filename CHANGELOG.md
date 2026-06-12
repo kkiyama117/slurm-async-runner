@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v3.0.0] - 2026-06-12
+
+Major release: the tssrun backend's Rust API now returns typed errors
+(breaking for Rust callers; Python behavior is unchanged), the
+cross-backend `JobManager` trait lands, and `refresh_with_sacct()` is
+multiplexed across handles via a generic single-flight TTL batch cache
+(one slurmdbd query per `poll_interval` instead of one per handle).
+
+### Added
+
+- **Structured errors for the tssrun backend** (issue #16 item 1).
+  New `tssrun::error` module with `TssrunSpawnError`, `TssrunAttachError`,
+  `TssrunWaitError`, `TssrunRefreshError` (all `#[non_exhaustive]`,
+  re-exported from the crate root), mirroring the sbatch error family so
+  Rust callers can match on failure modes.
+- **`JobManager` trait** (issue #16 item 2) — manager-side companion to
+  `JobHandleCommon`: `spawn` / `attach_uuid` / `attach_jobid` with
+  associated `Handle`, `SpawnError`, `AttachError` types, implemented by
+  both `TssrunManager` and `SbatchManager` (backend-specific entry points
+  such as `spawn_array`, `run`, `cancel`, `attach(AttachKey::Pid|File)`
+  stay inherent). Cross-backend contract test in
+  `tests/job_manager_common.rs`.
+- **Shared batched `sacct` exit-code cache (refresh multiplexing,
+  part 3).** Handles of the same `SbatchManager` whose jobs finish in a
+  burst now share one batched
+  `sacct -P -n -j id1,id2,… -o JobID,State,Reason,ExitCode` query per
+  `poll_interval` (single-flight TTL cache), instead of one sacct —
+  i.e. one slurmdbd hit — per handle per `refresh_with_sacct()` call.
+  Accounting-lag retries within the TTL replay the cached listing
+  instead of re-querying slurmdbd. The same subset-replay rule as the
+  squeue cache applies, so "no row for my id" can never be fabricated.
+  Array-task finalizers (`-j <master>_<idx>`) and the legacy 3-column
+  listing are never batched or cached. Motivated by the KUDPC manual's
+  request not to repeat status commands mechanically; sacct is the
+  heaviest such command (accounting DB query).
+- **Generic `query_cache` primitive** (issue #16 item 3, internal).
+  The single-flight TTL batch cache behind the `qgroup -l`, squeue and
+  sacct multiplexing is now one generic implementation
+  (`sbatch::query_cache`, parameterized by a `QueryShape`); the three
+  shapes share the TTL slot, single-flight locking, subset-replay rule
+  and 2 × `poll_interval` key-registry aging. No behavior change for
+  the existing qgroup/squeue caches. The array-task sacct parser now
+  requires an exact JobID-column match for the queried
+  `<master>_<idx>` key (defense in depth; prerequisite for ever
+  batching array-task queries).
+
+### Changed
+
+- **Rust API (breaking): tssrun signatures return typed errors.**
+  `TssrunManager::spawn`/`spawn_with` → `Result<_, TssrunSpawnError>`,
+  `TssrunManager::attach` → `Result<_, TssrunAttachError>`,
+  `TssrunJobHandle::wait` → `Result<_, TssrunWaitError>`,
+  `TssrunJobHandle::refresh`/`wait_terminal` → `Result<_, TssrunRefreshError>`.
+  The `JobHandleCommon` trait impl still exposes `anyhow::Result`, and
+  error message strings are unchanged, so Python behavior (exception
+  types and messages) is identical.
+
+### CI
+
+- `cargo audit` job (advisory ignores documented in `.cargo/audit.toml`);
+  `pyo3-stub-gen` now pinned to the crates.io 0.22.3 release instead of a
+  moving `branch = "main"` git pin (issue #16 item 6).
+- Stub-drift check: CI regenerates the `.pyi` stubs and fails if the
+  committed ones are stale (issue #16 item 7).
+
 ## [v2.0.0] - 2026-06-12
 
 Major release: monitoring-correctness fixes change observable behavior
@@ -568,7 +633,8 @@ queries). See **Changed** for the breaking items.
   substitutes the coreutils `true` / `false` / `echo` binaries through
   `SlurmCmd::new(...)`, plus a `MockDispatcher` for argv-plumbing assertions.
 
-[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v3.0.0...HEAD
+[v3.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v2.0.0...v3.0.0
 [v2.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.1.0...v2.0.0
 [v1.1.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/kkiyama117/slurm-async-runner/releases/tag/v1.0.0

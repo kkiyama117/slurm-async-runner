@@ -11,6 +11,7 @@ pub use py_export::stub_info;
 
 pub mod dispatcher;
 pub mod handle;
+pub mod job_manager;
 pub mod manager;
 pub mod runner;
 pub mod sbatch;
@@ -42,6 +43,7 @@ pub use dispatcher::{BackgroundDispatcher, SpawnedChild, TokioBackgroundDispatch
 
 // Re-export tssrun public API.
 pub use tssrun::cmd::TssrunCmd;
+pub use tssrun::error::{TssrunAttachError, TssrunRefreshError, TssrunSpawnError, TssrunWaitError};
 // Re-export the SLURM resource/partition/time-limit vocabulary from the crate-local entities module.
 pub use crate::entities::slurm::{
     JobPartition, JobTimeLimit, Memory, MemoryUnit, ResourceSpec, ResourceSpecCPU, ResourceSpecGPU,
@@ -74,6 +76,7 @@ pub use store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateS
 // callers should write `slurm_async_runner::handle::into_dyn(h)` or
 // `use slurm_async_runner::handle::into_dyn as into_dyn_handle;`.
 pub use handle::{DynHandleAdapter, DynJobHandleCommon, JobHandleCommon};
+pub use job_manager::JobManager;
 
 #[cfg(test)]
 mod tests {

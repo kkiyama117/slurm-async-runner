@@ -4,6 +4,9 @@
 //! `"salloc: Granted job allocation N"` and
 //! `"salloc: Nodes <node> are ready for job"`. Site-specific banner
 //! changes break these parsers on purpose so the failure is visible.
+//!
+//! The full index of SLURM output formats understood by this crate lives
+//! in [`crate::sbatch::parse`] (issue #16 item 5).
 
 /// Returns `Some(jobid)` when `line` is exactly the SLURM
 /// "Granted job allocation N" message.

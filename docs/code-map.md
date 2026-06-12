@@ -12,6 +12,8 @@ slurm-async-runner2/
 ├── Cargo.lock
 ├── pyproject.toml         # maturin / ruff / uv 設定
 ├── rust-toolchain.toml    # nightly 固定 (pyo3 nightly feature 用)
+├── .cargo/audit.toml      # cargo audit の advisory ignore (理由コメント付き、
+│                          # issue #16 item 6。解消条件は issue #18)
 ├── README.md              # 公開 API のクイックリファレンス
 ├── CHANGELOG.md           # Keep a Changelog 形式
 │
@@ -20,6 +22,9 @@ slurm-async-runner2/
 │   ├── manager.rs         # SlurmCmd / SlurmManager (Spec 層)
 │   ├── dispatcher.rs      # JobDispatcher / Background系 (Runtime 層)
 │   ├── runner.rs          # squeue/sacct/qgroup パース + バッチ問合せ (Query 層)
+│   │                      # (テストは runner/tests.rs に分離、issue #16 item 4)
+│   ├── job_manager.rs     # (issue #16 item 2) JobManager trait —
+│   │                      # spawn / attach_uuid / attach_jobid の跨 backend 契約
 │   ├── store.rs           # 汎用 JobStateStore<S> trait + InMemoryStateStore<S> /
 │   │                      # FileSystemStateStore<S> (kind discriminator で
 │   │                      # tssrun/sbatch を同居)
@@ -41,20 +46,28 @@ slurm-async-runner2/
 │   │   │                  # (PR #7 で JobHandle/JobHandleSnapshot から rename。
 │   │   │                  #  #[deprecated] alias は PR #11 で削除済み)
 │   │   ├── store.rs       # tssrun 固有の薄いラッパ (汎用 store は src/store.rs)
+│   │   ├── error.rs       # (issue #16 item 1) TssrunSpawnError / TssrunAttachError /
+│   │   │                  # TssrunWaitError / TssrunRefreshError
 │   │   └── manager.rs     # TssrunManager: spawn / attach / query_state
 │   ├── sbatch/            # sbatch サブシステム (PR #6)
 │   │   ├── mod.rs         # 公開 re-export と概要
 │   │   ├── cmd.rs         # SbatchCmd (typed --flag フィールド + build_argv)
-│   │   ├── parse.rs       # qgroup -l / sacct / submitted-jobid パーサ
+│   │   ├── parse.rs       # qgroup -l / sacct / submitted-jobid パーサ。module doc に
+│   │   │                  # SLURM 出力形式の正本索引表 (issue #16 item 5)
 │   │   ├── handle.rs      # SbatchJobHandle / SbatchJobSnapshot / FinishedInfo /
 │   │   │                  # SbatchLifecycle / log_lines / refresh_with_sacct /
-│   │   │                  # wait_terminal
+│   │   │                  # wait_terminal (テストは handle/tests.rs に分離)
 │   │   ├── store.rs       # sbatch 固有 store ラッパ
 │   │   ├── manager.rs     # SbatchManager: spawn / spawn_array / run / cancel /
 │   │   │                  # attach_uuid / attach_jobid / attach_array_jobid /
-│   │   │                  # attach_file
-│   │   └── error.rs       # SbatchSpawnError / SbatchRunError / SbatchCancelError /
-│   │                      # SbatchAttachError (#[non_exhaustive] typed enum)
+│   │   │                  # attach_file (テストは manager/tests.rs に分離)
+│   │   ├── error.rs       # SbatchSpawnError / SbatchRunError / SbatchCancelError /
+│   │   │                  # SbatchAttachError (#[non_exhaustive] typed enum)
+│   │   ├── query_cache.rs # (issue #16 item 3, PR #19) generic single-flight TTL
+│   │   │                  # バッチキャッシュ — QueryShape trait + subset-replay ルール
+│   │   ├── qgroup_cache.rs # qgroup -l shape (キーなし縮退形、v2.0.0)
+│   │   ├── squeue_cache.rs # squeue summary shape (-j バッチ、v2.0.0)
+│   │   └── sacct_cache.rs  # sacct exit-code shape (-j バッチ、PR #19)
 │   ├── py_export/         # pyo3 公開層
 │   │   ├── mod.rs         # _slurm_async_runner_core モジュール定義
 │   │   ├── manager.rs     # PySlurmCmd / PySlurmManager
@@ -73,9 +86,11 @@ slurm-async-runner2/
 │
 ├── tests/                 # Rust 統合テスト (cargo test 経由)
 │   ├── tssrun_integration.rs    # tssrun spawn/wait/attach 一連
-│   └── job_handle_common.rs     # (PR #7) SbatchJobHandle / TssrunJobHandle
-│                                # 両方が JobHandleCommon の同一 contract を満たす
-│                                # ことを generic test fn で検証
+│   ├── job_handle_common.rs     # (PR #7) SbatchJobHandle / TssrunJobHandle
+│   │                            # 両方が JobHandleCommon の同一 contract を満たす
+│   │                            # ことを generic test fn で検証
+│   └── job_manager_common.rs    # (issue #16 item 2) JobManager trait の
+│                                # 跨 backend contract (attach_uuid / attach_jobid)
 │
 ├── python/                # Python 側パッケージ
 │   ├── slurm_async_runner/
@@ -137,12 +152,13 @@ slurm-async-runner2/
 
 | ファイル | 公開している主な型/関数 |
 |---|---|
-| `lib.rs` | `pub use` の集中管理。`JobReason` / `JobState` / `JobStatus`（in-tree 移管後）/ `SlurmCmd` / `SlurmManager` / `JobDispatcher` / `TokioDispatcher` / `DryRunDispatcher` / `BackgroundDispatcher` / `SpawnedChild` / `TokioBackgroundDispatcher` / tssrun モジュールの主要型 (`TssrunJobHandle` / `TssrunJobSnapshot`。旧 `JobHandle` / `JobHandleSnapshot` alias は PR #11 で削除) / sbatch モジュールの主要型 (`SbatchCmd` / `SbatchManager` / `SbatchJobHandle` / `SbatchJobSnapshot` / `FinishedInfo` / `SbatchSpawnError` ほか) / `JobStateStore` / `InMemoryStateStore` / `FileSystemStateStore` / **跨 backend handle 抽象 (PR #7)**: `handle::{JobHandleCommon, DynJobHandleCommon, DynHandleAdapter}` / SLURM 語彙再エクスポート（`JobPartition` / `JobTimeLimit` / `Memory` / `MemoryUnit` / `ResourceSpec` / `ResourceSpecCPU` / `ResourceSpecGPU` / `SlurmArraySpec` / `SlurmDependency` / `MailTypeInput` / `SlurmSignalSpec`） |
+| `lib.rs` | `pub use` の集中管理。`JobReason` / `JobState` / `JobStatus`（in-tree 移管後）/ `SlurmCmd` / `SlurmManager` / `JobDispatcher` / `TokioDispatcher` / `DryRunDispatcher` / `BackgroundDispatcher` / `SpawnedChild` / `TokioBackgroundDispatcher` / tssrun モジュールの主要型 (`TssrunJobHandle` / `TssrunJobSnapshot`。旧 `JobHandle` / `JobHandleSnapshot` alias は PR #11 で削除) / sbatch モジュールの主要型 (`SbatchCmd` / `SbatchManager` / `SbatchJobHandle` / `SbatchJobSnapshot` / `FinishedInfo` / `SbatchSpawnError` ほか) / `JobStateStore` / `InMemoryStateStore` / `FileSystemStateStore` / **跨 backend handle 抽象 (PR #7)**: `handle::{JobHandleCommon, DynJobHandleCommon, DynHandleAdapter}` / **跨 backend manager 抽象 (issue #16 item 2)**: `JobManager` / tssrun typed errors (issue #16 item 1): `TssrunSpawnError` / `TssrunAttachError` / `TssrunWaitError` / `TssrunRefreshError` / SLURM 語彙再エクスポート（`JobPartition` / `JobTimeLimit` / `Memory` / `MemoryUnit` / `ResourceSpec` / `ResourceSpecCPU` / `ResourceSpecGPU` / `SlurmArraySpec` / `SlurmDependency` / `MailTypeInput` / `SlurmSignalSpec`） |
 | `manager.rs` | `SlurmCmd::new / build_argv`, `SlurmManager::{run_job, run_job_with, query_job_state, query_job_states_batch}` |
 | `dispatcher.rs` | `JobDispatcher`, `TokioDispatcher`, `DryRunDispatcher`, `BackgroundDispatcher`, `SpawnedChild`, `TokioBackgroundDispatcher`, `DynJobDispatcher` (dyn-safe facade) + `DynDispatcherAdapter` + `into_dyn(d)` |
 | `runner.rs` | `query_job_states_batch`, `query_job_states_batch_with`, `query_job_states_with_exit_code_with` (PR #6), `query_array_task_state_with` / `query_array_task_outcome_with` (PR #12: `<master>_<idx>` 形式で squeue/sacct を直接叩く per-task クエリ), 内部 `parse_squeue` / `parse_sacct` / `parse_qgroup_l` / `merge_results` / `parse_squeue_array_task` / `parse_sacct_array_task_with_exit_code` |
 | `store.rs` | 汎用 `JobSnapshot` trait (`kind() -> &'static str` 付き) + `JobStateStore<S>` trait + `InMemoryStateStore<S>` + `FileSystemStateStore<S>` (atomic-rename + kind discriminator による silent-skip) |
 | `handle.rs` (PR #7) | `JobHandleCommon` trait (associated `Snapshot: JobSnapshot` 型) + `DynJobHandleCommon` trait (`serde_json::Value` で flatten) + `DynHandleAdapter<H>` + `into_dyn<H>(h) -> Arc<dyn DynJobHandleCommon>` |
+| `job_manager.rs` (issue #16 item 2) | `JobManager` trait — `spawn` / `attach_uuid` / `attach_jobid` を associated `Handle: JobHandleCommon` / `SpawnError` / `AttachError` 型で表現。`TssrunManager` / `SbatchManager` が impl。dyn-safe ではない（contract は `tests/job_manager_common.rs`） |
 | `util/path.rs` | `absolutize(path)` の DRY 化 (旧 `sbatch::cmd` / `tssrun::cmd` / `manager` の重複を統合) |
 
 ### 2.3 tssrun サブシステム (`src/tssrun/`)
@@ -155,6 +171,7 @@ slurm-async-runner2/
 | `log.rs` | `LogStream`, `JobLogSink` trait, `NullLogSink`, `StdLogSink`, `InMemoryLogSink`, `FileLogSink::create` |
 | `handle.rs` | `LogLocations`, `FinishedInfo`, `TssrunJobSnapshot { uuid, pid, argv, sent_env, cwd, started_at_unix, log_locations, jobid, node, finished }` (PR #7 で `JobHandleSnapshot` から rename。旧 alias は PR #11 で削除)、`TssrunJobHandle::{from_spawn, attach_snapshot, watch, snapshot, uuid, pid, jobid, node, sent_env, is_running, is_finished, exit_code, wait, refresh, wait_terminal, live_env}` (PR #7 で `refresh` の戻り値が `Result<TssrunJobSnapshot>` に変更、`wait_terminal` 追加、`is_finished` 追加)、free fn `read_live_env_for_pid` |
 | `store.rs` | tssrun 固有の薄いラッパ。汎用 store trait は `crate::store` 側で集約 |
+| `error.rs` (issue #16 item 1) | `TssrunSpawnError`, `TssrunAttachError`, `TssrunWaitError`, `TssrunRefreshError` (`#[non_exhaustive]` typed enum 群。Display 文字列は旧 anyhow! メッセージと同一 = Python 例外不変) |
 | `manager.rs` | `AttachKey { Uuid, Pid, JobId, File }`, `TssrunManager::{new, with_state_dir, with_state_store, with_log_sink, store, spawn, spawn_with, attach, query_state}` |
 
 ### 2.3.5 sbatch サブシステム (`src/sbatch/`、PR #6)
@@ -168,6 +185,8 @@ slurm-async-runner2/
 | `store.rs` | sbatch 固有 store ラッパ |
 | `manager.rs` | `SbatchAttachKey`, `SbatchManager::{new, with_dispatcher, with_state_dir, with_poll_interval, spawn, spawn_array, run, cancel, attach_uuid, attach_jobid, attach_array_jobid, attach_file, find_all_by_jobid}` |
 | `error.rs` | `SbatchSpawnError`, `SbatchRunError`, `SbatchCancelError`, `SbatchAttachError` (`#[non_exhaustive]` typed enum 群) |
+| `query_cache.rs` (issue #16 item 3, PR #19) | generic single-flight TTL バッチキャッシュ: `QueryShape` trait + `QueryCacheState<S>` + `QueryCachingDispatcher<S>`。subset-replay ルールと 2×TTL キーレジストリの正本 |
+| `qgroup_cache.rs` / `squeue_cache.rs` / `sacct_cache.rs` | `QueryShape` の 3 実装 + type alias。qgroup はキーなし縮退形 (v2.0.0)、squeue summary / sacct exit-code は `-j id1,id2,…` バッチ (squeue は v2.0.0、sacct は PR #19)。array-task キーと legacy 3 列 sacct はパススルー |
 
 ### 2.4 pyo3 公開層 (`src/py_export/`)
 

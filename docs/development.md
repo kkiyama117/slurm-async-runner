@@ -360,7 +360,8 @@ tssrun (which is setuid).
 - [ ] `cargo fmt --check` を通す
 - [ ] `cargo clippy --all-targets -- -D warnings` を通す
 - [ ] `cargo test --lib` を通す
-- [ ] `cargo test --test job_handle_common` を通す（PR #7 で導入した跨 backend contract）
+- [ ] `cargo test --test job_handle_common --test job_manager_common` を通す
+      （跨 backend contract: handle は PR #7、manager は issue #16 item 2）
 - [ ] `uv run maturin develop && uv run pytest python/tests -v` を通す
 - [ ] `uv run ruff check python/` と `ruff format --check python/` を通す
 - [ ] 公開 API を変えたら `README.md` と `CHANGELOG.md` を更新
@@ -379,6 +380,12 @@ tssrun (which is setuid).
         を使う。`let _ = snapshot_tx.send(...)` は receiver 0 で値が更新
         されず、Python 側の `is_finished()` / `exit_code()` が spawn 時
         default に凍結する (PR #14、§5.9)
+  - [ ] `qgroup -l` / squeue summary / sacct exit-code クエリの argv 形状を
+        変えたら、対応する `sbatch::query_cache` の shape
+        (`qgroup_cache` / `squeue_cache` / `sacct_cache`) も同期させる。
+        ズレるとキャッシュが素通しになり refresh 多重化がサイレントに
+        無効化される (issue #16 item 3、`docs/architecture.md` §3.5
+        設計判断 #7 と §6)
 
 ## 8. リリース
 

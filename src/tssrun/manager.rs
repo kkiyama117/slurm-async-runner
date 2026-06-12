@@ -48,7 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::JobStatus;
@@ -56,6 +56,7 @@ use crate::dispatcher::{BackgroundDispatcher, TokioBackgroundDispatcher};
 use crate::runner;
 use crate::store::JobStateStore;
 use crate::tssrun::cmd::TssrunCmd;
+use crate::tssrun::error::{TssrunAttachError, TssrunSpawnError};
 use crate::tssrun::handle::{LogLocations, TssrunJobHandle, TssrunJobSnapshot};
 use crate::tssrun::log::{JobLogSink, StdLogSink};
 use crate::tssrun::store::{self, FileSystemStateStore, InMemoryStateStore};
@@ -135,7 +136,7 @@ impl TssrunManager {
     }
 
     /// Spawn the configured command via [`TokioBackgroundDispatcher`].
-    pub async fn spawn(&self) -> Result<TssrunJobHandle> {
+    pub async fn spawn(&self) -> Result<TssrunJobHandle, TssrunSpawnError> {
         self.spawn_with(&TokioBackgroundDispatcher).await
     }
 
@@ -143,10 +144,13 @@ impl TssrunManager {
     pub async fn spawn_with<D: BackgroundDispatcher>(
         &self,
         dispatcher: &D,
-    ) -> Result<TssrunJobHandle> {
-        let argv = self.cmd.build_argv()?;
+    ) -> Result<TssrunJobHandle, TssrunSpawnError> {
+        let argv = self.cmd.build_argv().map_err(TssrunSpawnError::ArgvBuild)?;
         let cwd = self.cmd.cwd.as_deref();
-        let spawned = dispatcher.spawn(&argv, &self.cmd.env, cwd).await?;
+        let spawned = dispatcher
+            .spawn(&argv, &self.cmd.env, cwd)
+            .await
+            .map_err(|source| TssrunSpawnError::SpawnFailed { source })?;
 
         // UUID v7 — time-ordered, per-spawn primary key. The store keys
         // every snapshot by `init.uuid`, so generating it once here keeps
@@ -165,17 +169,17 @@ impl TssrunManager {
             node: None,
             finished: None,
         };
-        TssrunJobHandle::from_spawn(
+        Ok(TssrunJobHandle::from_spawn(
             spawned,
             init,
             self.log_sink.clone(),
             Some(self.store.clone()),
         )
-        .await
+        .await?)
     }
 
     /// Re-attach to a previously persisted handle.
-    pub async fn attach(&self, key: AttachKey) -> Result<TssrunJobHandle> {
+    pub async fn attach(&self, key: AttachKey) -> Result<TssrunJobHandle, TssrunAttachError> {
         match key {
             AttachKey::File(p) => {
                 let bytes = tokio::fs::read(&p)
@@ -189,11 +193,13 @@ impl TssrunManager {
                 ))
             }
             AttachKey::Uuid(uuid) => {
-                let snap = self
-                    .store
-                    .load(uuid)
-                    .await?
-                    .ok_or_else(|| anyhow!("no persisted handle matched uuid {uuid}"))?;
+                let snap =
+                    self.store
+                        .load(uuid)
+                        .await?
+                        .ok_or_else(|| TssrunAttachError::NotFound {
+                            key: format!("uuid {uuid}"),
+                        })?;
                 Ok(TssrunJobHandle::attach_snapshot(
                     snap,
                     Some(self.store.clone()),
@@ -202,18 +208,20 @@ impl TssrunManager {
             AttachKey::Pid(pid) => {
                 let snap = store::find_by_pid(self.store.as_ref(), pid)
                     .await?
-                    .ok_or_else(|| anyhow!("no persisted handle matched pid {pid}"))?;
+                    .ok_or_else(|| TssrunAttachError::NotFound {
+                        key: format!("pid {pid}"),
+                    })?;
                 Ok(TssrunJobHandle::attach_snapshot(
                     snap,
                     Some(self.store.clone()),
                 ))
             }
             AttachKey::JobId(jobid) => {
-                let snap = self
-                    .store
-                    .find_by_jobid(jobid)
-                    .await?
-                    .ok_or_else(|| anyhow!("no persisted handle matched jobid {jobid}"))?;
+                let snap = self.store.find_by_jobid(jobid).await?.ok_or_else(|| {
+                    TssrunAttachError::NotFound {
+                        key: format!("jobid {jobid}"),
+                    }
+                })?;
                 Ok(TssrunJobHandle::attach_snapshot(
                     snap,
                     Some(self.store.clone()),
@@ -234,6 +242,28 @@ impl TssrunManager {
                 Ok(states.get(&jid).cloned().unwrap_or_default())
             }
         }
+    }
+}
+
+/// [`crate::job_manager::JobManager`] impl — delegates to the inherent
+/// methods; `Pid` / `File` attach stay tssrun-specific (inherent
+/// [`TssrunManager::attach`] with the full [`AttachKey`]).
+#[async_trait::async_trait]
+impl crate::job_manager::JobManager for TssrunManager {
+    type Handle = TssrunJobHandle;
+    type SpawnError = TssrunSpawnError;
+    type AttachError = TssrunAttachError;
+
+    async fn spawn(&self) -> Result<TssrunJobHandle, TssrunSpawnError> {
+        TssrunManager::spawn(self).await
+    }
+
+    async fn attach_uuid(&self, uuid: Uuid) -> Result<TssrunJobHandle, TssrunAttachError> {
+        self.attach(AttachKey::Uuid(uuid)).await
+    }
+
+    async fn attach_jobid(&self, jobid: u64) -> Result<TssrunJobHandle, TssrunAttachError> {
+        self.attach(AttachKey::JobId(jobid)).await
     }
 }
 
@@ -473,6 +503,10 @@ echo "salloc: Nodes node-mem are ready for job"
         match manager.attach(AttachKey::JobId(999)).await {
             Ok(_) => panic!("attach should have failed for missing dir"),
             Err(e) => {
+                assert!(
+                    matches!(e, TssrunAttachError::NotFound { .. }),
+                    "expected typed NotFound variant, got: {e:?}"
+                );
                 let msg = e.to_string();
                 assert!(
                     msg.contains("no persisted handle matched jobid"),

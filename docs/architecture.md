@@ -262,6 +262,7 @@ ECCS の `tssrun`（= `salloc` + `srun` 対話バッチフロントエンド）�
 | `TssrunJobSnapshot` (handle.rs) | Serde 対応の状態。**primary key は `uuid: Uuid`（v7、時刻順）**。`pid` / `argv` / `sent_env` / `jobid` / `node` / `finished` などを含み、watch チャンネルで配信されストアに永続化される。PR #7 で `JobHandleSnapshot` から rename (旧 alias は PR #11 で削除) |
 | `JobStateStore<S>` trait (`crate::store`) | スナップショット永続化の抽象（汎用化されており tssrun / sbatch 両方が利用）。組み込み実装は `InMemoryStateStore<S>`（`HashMap<Uuid, _>`、デフォルト）と `FileSystemStateStore<S>`（`{dir}/{uuid}.json`、atomic-rename、ディレクトリ遅延作成、`kind` discriminator により他 backend snapshot は silent-skip）。Redis / SQLite 等は外部 crate で `#[async_trait]` 実装するだけで差し込める |
 | `TssrunManager` (manager.rs) | `TssrunCmd` + `Arc<dyn JobStateStore<TssrunJobSnapshot>>` + `Arc<dyn JobLogSink>` を保持。`spawn` / `attach` / `query_state` を提供 |
+| `TssrunSpawnError` / `TssrunAttachError` / `TssrunWaitError` / `TssrunRefreshError` (error.rs) | `#[non_exhaustive]` typed enum（issue #16 item 1）。sbatch の error 群と同じパターンで、`spawn` / `attach` / `wait` / `refresh` の失敗モードを Rust 側で match 可能にする。Display 文字列は旧 `anyhow!` メッセージと同一に保たれており、Python 例外（型・メッセージ）は不変。`JobHandleCommon` trait impl は従来どおり `anyhow::Result` を返す |
 
 サブシステム独自の設計判断:
 
@@ -308,6 +309,7 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
 | `SbatchJobHandle` (`src/sbatch/handle.rs`) | 子プロセスを持たない handle。`refresh()` で `qgroup -l → squeue` チェーン、`refresh_with_sacct()` で sacct を呼んで `exit_code` を確定、`wait_terminal()` で polling、`log_lines` / `read_log_to_end` で stdout/stderr のテール読み。`SbatchJobHandleInner` には PR #9 (#8 A7) で `Drop` 実装が追加され、終端到達前に最後の clone が drop された場合は `tracing::warn!` を発火する |
 | `SbatchManager` (`src/sbatch/manager.rs`) | `Arc<dyn DynJobDispatcher>` + `JobStateStore<SbatchJobSnapshot>` を保持。`spawn` / `spawn_array` / `run` / `cancel` / `attach_uuid` / `attach_jobid` / `attach_array_jobid` / `attach_file` を提供 |
 | `SbatchSpawnError` / `SbatchRunError` / `SbatchCancelError` / `SbatchAttachError` (`src/sbatch/error.rs`) | `#[non_exhaustive]` typed enum。`anyhow::Error` への型崩しを避ける（PR #6 final review HIGH issue から） |
+| `query_cache` + `qgroup_cache` / `squeue_cache` / `sacct_cache` (`src/sbatch/*.rs`) | **refresh 多重化**のための generic single-flight TTL バッチキャッシュ（issue #16 item 3、PR #19）。`QueryShape` trait が「バッチ可能な argv 形状」を表し、3 つの shape（`qgroup -l` / squeue summary / sacct exit-code クエリ）が TTL スロット・single-flight ロック・subset-replay ルール・2×TTL キーレジストリを共有する。manager が handle に渡す dispatcher に積層され、N handle の並行ポーリングを poll_interval あたり各コマンド 1 spawn に集約する |
 
 サブシステム独自の設計判断:
 
@@ -373,6 +375,25 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    / `refresh_with_sacct` 内部の 6 つの送信点はすべてこちらを使う。
    Python 側のラッパは `handle.is_finished()` 等を `snapshot_tx.borrow()`
    経由で読むため、この置換なしには Rust 側の更新が一切伝わらない。
+7. **refresh の多重化（v2.0.0 + PR #19）**。KUDPC マニュアルは
+   「ステータスコマンドを機械的に繰り返さないこと」を求めており、
+   N handle の並行ポーリングが N 個の同一サブプロセスを spawn する
+   素朴な実装は許容できない。そこで manager が handle に渡す dispatcher
+   に **generic single-flight TTL バッチキャッシュ**（`sbatch::query_cache`、
+   issue #16 item 3）を 3 層積み、`qgroup -l`（全体 listing、キーなし）・
+   squeue summary（`-j id1,id2,…` バッチ）・sacct exit-code クエリ
+   （同じくバッチ — ジョブは一斉に終了するため `refresh_with_sacct()`
+   がバーストし、slurmdbd への負荷が最も重い）をそれぞれ
+   poll_interval あたり 1 spawn に集約する。正しさの核は
+   **subset-replay ルール**: キャッシュ済み listing は「その listing が
+   実際に問い合わせたキーの部分集合」に対してのみ replay できる。
+   問い合わせていないキーに replay すると「行が無い = vanish /
+   accounting 行なし」シグナルを捏造するため、未知キーの初回は必ず
+   レジストリ全体と合流した live 再バッチになる。array-task クエリ
+   （`<master>_<idx>`）は KUDPC でのバッチ `-j` セマンティクス未検証の
+   ためキャッシュ対象外（squeue バッチ化を実機検証してから実装したのと
+   同じ基準）。TTL = poll_interval、`Duration::ZERO` でキャッシュ・
+   バッチ化とも無効（テスト時の素通し）。
 
 ### 3.6 跨 backend handle 抽象（`src/handle.rs`、PR #7）
 
@@ -406,6 +427,19 @@ PR #6 で sbatch / tssrun の handle が「コア 5 sync getter (`uuid` /
    **sync `@property` / 普通の sync method に直し**、`SbatchJobHandle` と
    call shape を揃えた。旧 await-style の `*_async` エスケープハッチは
    PR #6 review fix で削除済み (sync 版で十分なため drop)。
+
+#### 3.6.1 `JobManager` trait（`src/job_manager.rs`、issue #16 item 2）
+
+`JobHandleCommon` の manager 側対応物。`spawn()` / `attach_uuid(Uuid)` /
+`attach_jobid(u64)` を associated `type Handle: JobHandleCommon` /
+`SpawnError` / `AttachError`（いずれも `std::error::Error + Send + Sync +
+'static`）経由で表現し、`TssrunManager` / `SbatchManager` の両方が impl
+する。backend 固有のエントリポイント（`spawn_array` / `run` / `cancel` /
+`attach(AttachKey::Pid|File)` など）は inherent メソッドのまま。
+associated 型を持つため handle 本体 trait と同様 **dyn-safe ではない**
+（`DynJobManager` は必要になるまで作らない = YAGNI）。跨 backend
+contract は `tests/job_manager_common.rs` の generic test fn で固定
+されている。
 
 ### 3.7 ログシンク（`src/tssrun/log.rs`）
 
@@ -501,6 +535,15 @@ PR #5 までは `gaussian_job_shared._core.entities.slurm.status` から
   associated `Snapshot` 型がある時点で dyn-safe ではない。
   `Arc<dyn DynJobHandleCommon>` が必要なときは `crate::handle::into_dyn`
   を経由すること（blanket impl は意図的に提供していない、§3.6 参照）。
+- **status クエリの argv 形状とキャッシュ shape を同期させる**。
+  `sbatch::query_cache` の 3 shape（qgroup / squeue / sacct）は
+  `runner.rs` が組み立てる argv と**厳密一致**で照合している。
+  `-o` フォーマットやオプション並びを変えるとキャッシュが素通しになり
+  多重化がサイレントに無効化される（逆に、shape を広げるときは
+  subset-replay ルールを破らないこと — キャッシュ済み listing を
+  問い合わせていないキーへ replay すると vanish シグナルを捏造する）。
+  新しいバッチ可能クエリを足すときは `QueryShape` 実装を 1 つ書いて
+  manager の dispatcher スタックに積む（§3.5 設計判断 #7）。
 - **watch 更新は `send_replace` 一択**。`SbatchJobHandle` /
   `TssrunJobHandle` の `snapshot_tx` は初期 receiver が drop されるため、
   `send` は receiver 0 のとき値を更新せず Err を返す。新規 refresh

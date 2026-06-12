@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
@@ -48,6 +48,7 @@ use uuid::Uuid;
 
 use crate::dispatcher::SpawnedChild;
 use crate::store::JobStateStore;
+use crate::tssrun::error::{TssrunRefreshError, TssrunWaitError};
 use crate::tssrun::log::{JobLogSink, LogStream};
 use crate::tssrun::parse::{parse_salloc_jobid, parse_salloc_node};
 
@@ -270,13 +271,11 @@ impl TssrunJobHandle {
     /// - `Ok(None)` — the child was terminated by a signal (e.g. SIGTERM
     ///   from SLURM time-limit kill, SIGKILL from OOM). Inspect
     ///   `snapshot().finished` for the recorded `exit_code: None`.
-    /// - `Err(_)` — `wait()` itself failed, or the handle was attached /
-    ///   already consumed.
-    pub async fn wait(&mut self) -> Result<Option<i32>> {
-        let h = self
-            .wait_handle
-            .take()
-            .ok_or_else(|| anyhow!("not owner of the child / already waited"))?;
+    /// - `Err(TssrunWaitError::NotOwner)` — the handle was attached or
+    ///   `wait()` was already consumed.
+    /// - `Err(TssrunWaitError::Other)` — `wait()` itself failed.
+    pub async fn wait(&mut self) -> Result<Option<i32>, TssrunWaitError> {
+        let h = self.wait_handle.take().ok_or(TssrunWaitError::NotOwner)?;
         // Drain stdout/stderr completely before returning, so any salloc:
         // lines emitted before the child exited are guaranteed to be
         // parsed into the snapshot.
@@ -286,7 +285,10 @@ impl TssrunJobHandle {
         if let Some(t) = self.tee_stderr_handle.take() {
             let _ = t.await;
         }
-        h.await?
+        let inner = h
+            .await
+            .map_err(|e| TssrunWaitError::Other(anyhow::Error::from(e)))?;
+        inner.map_err(TssrunWaitError::Other)
     }
 
     /// Re-read the persisted snapshot from the store, broadcast it to all
@@ -298,16 +300,13 @@ impl TssrunJobHandle {
     /// `JobHandleCommon` trait. Existing callers that wrote
     /// `let _ = handle.refresh().await?;` continue to compile because Rust
     /// does not warn on a discarded `Ok(T)`.
-    pub async fn refresh(&self) -> Result<TssrunJobSnapshot> {
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| anyhow!("no store on this handle"))?;
+    pub async fn refresh(&self) -> Result<TssrunJobSnapshot, TssrunRefreshError> {
+        let store = self.store.as_ref().ok_or(TssrunRefreshError::NoStore)?;
         let uuid = self.snapshot_rx.borrow().uuid;
         let snap = store
             .load(uuid)
             .await?
-            .ok_or_else(|| anyhow!("uuid {uuid} not found in store"))?;
+            .ok_or(TssrunRefreshError::NotFound { uuid })?;
         self.snapshot_tx.send_replace(snap.clone());
         Ok(snap)
     }
@@ -325,7 +324,7 @@ impl TssrunJobHandle {
     pub async fn wait_terminal(
         &self,
         poll_interval: std::time::Duration,
-    ) -> Result<TssrunJobSnapshot> {
+    ) -> Result<TssrunJobSnapshot, TssrunRefreshError> {
         loop {
             let snap = self.refresh().await?;
             if snap.is_finished() {
@@ -526,11 +525,11 @@ impl crate::handle::JobHandleCommon for TssrunJobHandle {
     }
 
     async fn refresh(&self) -> Result<TssrunJobSnapshot> {
-        Self::refresh(self).await
+        Ok(Self::refresh(self).await?)
     }
 
     async fn wait_terminal(&self, poll_interval: std::time::Duration) -> Result<TssrunJobSnapshot> {
-        Self::wait_terminal(self, poll_interval).await
+        Ok(Self::wait_terminal(self, poll_interval).await?)
     }
 }
 
@@ -636,8 +635,22 @@ echo done"#
     async fn attached_handle_wait_errors_with_not_owner() {
         let snap = snap_running();
         let mut h = TssrunJobHandle::attach_snapshot(snap, None);
-        let err = h.wait().await.unwrap_err().to_string();
-        assert!(err.contains("not owner"), "unexpected: {err}");
+        let err = h.wait().await.unwrap_err();
+        assert!(
+            matches!(err, TssrunWaitError::NotOwner),
+            "expected typed NotOwner variant, got: {err:?}"
+        );
+        assert!(err.to_string().contains("not owner"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn refresh_without_store_errors_with_no_store_variant() {
+        let h = TssrunJobHandle::attach_snapshot(snap_running(), None);
+        let err = h.refresh().await.unwrap_err();
+        assert!(
+            matches!(err, TssrunRefreshError::NoStore),
+            "expected typed NoStore variant, got: {err:?}"
+        );
     }
 
     #[tokio::test]
