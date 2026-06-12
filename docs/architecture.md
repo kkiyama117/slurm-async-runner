@@ -321,8 +321,13 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    PR #12 (#8 A5) で array-task の per-task `refresh` を追加: `array_task_id.is_some()`
    の handle は `qgroup -l`（master 集計しか返さない）を skip して
    `squeue -h -r -j <master>_<idx> -o "%i %T %r"` (`query_array_task_state_with`)
-   を使う。`refresh_with_sacct()` の array-task branch も同様で
-   `sacct -j <master>_<idx>` (`query_array_task_outcome_with`) を使う。
+   を使う。`refresh_with_sacct()` の array-task branch は
+   `sacct -j <master>` (`query_array_task_outcome_with`) — **master キー**
+   で問い合わせ、sacct が展開する per-task 行から自タスクの
+   `<master>_<idx>` 親行を抽出する（2026-06-12 KUDPC 実機検証 jobid
+   7815414: master キーだけで全タスク行が返る）。これにより同一 array の
+   全タスク finalizer が同一 argv = 同一キャッシュキーを共有し、タスクが
+   別々の poll cycle で終了しても TTL 窓あたり sacct 1 spawn で済む。
    どちらも plain ジョブと同一のバッチ可能 argv 形状なので、
    設計判断 7 の squeue / sacct キャッシュに plain handle と一緒に合流する。
    **KUDPC `qgroup -l` 互換 (PR #14)**: 詳細行は `QUEUE USER JOBID | STAT
@@ -391,10 +396,13 @@ KUDPC の `sbatch`（=キュー投入型バッチ）に対応するサブシス�
    実際に問い合わせたキーの部分集合」に対してのみ replay できる。
    問い合わせていないキーに replay すると「行が無い = vanish /
    accounting 行なし」シグナルを捏造するため、未知キーの初回は必ず
-   レジストリ全体と合流した live 再バッチになる。array-task クエリ
-   （`<master>_<idx>`）も同じバッチに合流する（2026-06-12 KUDPC 実機検証:
-   squeue / sacct とも plain と array キーの混在 `-j` リストを受理し、
-   キー照合可能な per-task 行を返す）。前提は squeue argv の **`-r`**:
+   レジストリ全体と合流した live 再バッチになる。array-task クエリも
+   同じバッチに合流する（2026-06-12 KUDPC 実機検証: squeue / sacct とも
+   plain と array キーの混在 `-j` リストを受理し、キー照合可能な
+   per-task 行を返す）。キーの形は 2 コマンドで異なる: squeue probe は
+   per-task キー（`<master>_<idx>`）、sacct finalizer は **master キー**
+   （sacct が全タスク行に展開するため、array 全体で 1 キャッシュキー =
+   TTL 窓あたり 1 spawn — 設計判断 1 参照）。squeue 側の前提は argv の **`-r`**:
    これが無いと PENDING タスクが `<master>_[0,2]` 集約行に畳まれて
    キー照合が壊れる（plain ジョブには no-op）。キーの正本は
    `query_cache::JobKey`（`Plain(u64)` / `ArrayTask`）で、step suffix や

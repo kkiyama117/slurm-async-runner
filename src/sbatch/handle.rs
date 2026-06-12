@@ -418,9 +418,13 @@ impl SbatchJobHandle {
     /// done and sacct is the authoritative source for `exit_code`.
     ///
     /// For array-task handles (`array_task_id.is_some()`), the sacct
-    /// call queries `sacct -j <master>_<idx>` so the captured
-    /// `FinishedInfo` reflects the individual task — not the master
-    /// summary. Step rows (`.batch`, `.0`, …) are filtered. See spec
+    /// call queries `sacct -j <master>` (sacct expands the master key
+    /// into per-task rows) and extracts this task's `<master>_<idx>`
+    /// parent row, so the captured `FinishedInfo` reflects the
+    /// individual task — not the master summary. Step rows (`.batch`,
+    /// `.0`, …) are filtered. Keying by the master makes every task
+    /// finalizer of one array share a single sacct batch-cache entry —
+    /// see `crate::runner::query_array_task_outcome_with`. See spec
     /// §5.5 and issue #8 A5.
     ///
     /// If sacct has no usable row yet (accounting flush lag, or the job
@@ -449,8 +453,10 @@ impl SbatchJobHandle {
         let _guard = inner.refresh_lock.lock().await;
         let view = crate::dispatcher::DynView(&*inner.dispatcher);
 
-        // Array-task path: per-task sacct with `<master>_<idx>` key.
-        // Single-job path: existing batched query keyed by master jobid.
+        // Both paths key sacct by the (master) jobid. The array path
+        // extracts its own `<master>_<idx>` parent row from the
+        // master-expanded listing; the single-job path reads its row
+        // from the batched map.
         let outcome = if let Some(idx) = snap.array_task_id {
             crate::runner::query_array_task_outcome_with(&view, snap.jobid, idx)
                 .await?

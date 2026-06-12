@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Array-task sacct finalizers are keyed by the master jobid.**
+  `refresh_with_sacct()` on an array-task handle now issues
+  `sacct -j <master>` (instead of `-j <master>_<idx>`) and extracts the
+  task's own `<master>_<idx>` parent row from the expanded listing —
+  KUDPC live verification (2026-06-12, jobid 7815414) confirmed sacct
+  expands a master-keyed query into per-task rows. All task finalizers
+  of one array therefore share a single batch-cache key: one slurmdbd
+  query per cache TTL window serves the whole array even when tasks
+  finish in different poll cycles, where per-task keys each paid a
+  fresh sacct spawn. sacct is the heaviest status command (slurmdbd
+  query); this further reduces its invocation count on top of the
+  v3.0.0 batch cache. Absent-row semantics are unchanged: a task whose
+  row has not reached accounting yet still resolves to "no usable row"
+  and is retried later, never another task's outcome.
+
 ### Added
 
 - **Array-task squeue/sacct queries join the shared batch caches.**

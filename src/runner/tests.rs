@@ -788,15 +788,23 @@ async fn query_array_task_outcome_propagates_sacct_failure() {
     );
 }
 
+/// The sacct finalizer argv must carry the **master** jobid, not the
+/// `<master>_<idx>` task key: sacct expands a master-keyed query into
+/// per-task parent rows (KUDPC live-verified 2026-06-12, jobid 7815414),
+/// so every task finalizer of one array shares a single batch-cache key
+/// and one sacct spawn per TTL window serves the whole array. Any drift
+/// back to per-task keys silently multiplies slurmdbd load (sacct is the
+/// heaviest status command — see src/sbatch/sacct_cache.rs).
+/// MockCapture asserts the argv byte-for-byte.
 #[tokio::test]
-async fn query_array_task_outcome_uses_master_underscore_idx_sacct_key() {
+async fn query_array_task_outcome_builds_master_keyed_sacct_argv() {
     let mock = MockCapture::ok(
         vec![
             "sacct".into(),
             "-P".into(),
             "-n".into(),
             "-j".into(),
-            "12345_3".into(),
+            "12345".into(),
             "-o".into(),
             "JobID,State,Reason,ExitCode".into(),
         ],
@@ -808,4 +816,44 @@ async fn query_array_task_outcome_uses_master_underscore_idx_sacct_key() {
         .expect("Some");
     assert_eq!(oc.status.state, JobState::Completed);
     assert_eq!(oc.exit_code, Some(0));
+}
+
+/// The master-keyed query answers with rows for *every* task of the
+/// array (plus step rows); the finalizer must extract exactly its own
+/// task's parent row and report `None` for a task whose row has not
+/// reached accounting yet (per-task flush lag).
+#[tokio::test]
+async fn query_array_task_outcome_extracts_own_row_from_master_expansion() {
+    let listing = "12345_0|COMPLETED|None|0:0\n\
+                   12345_0.batch|COMPLETED||0:0\n\
+                   12345_3|FAILED|NonZeroExitCode|7:0\n\
+                   12345_3.batch|FAILED||7:0\n\
+                   12345_3.extern|COMPLETED||0:0\n";
+    let master_argv = || -> Vec<String> {
+        vec![
+            "sacct".into(),
+            "-P".into(),
+            "-n".into(),
+            "-j".into(),
+            "12345".into(),
+            "-o".into(),
+            "JobID,State,Reason,ExitCode".into(),
+        ]
+    };
+
+    let oc =
+        super::query_array_task_outcome_with(&MockCapture::ok(master_argv(), listing), 12345, 3)
+            .await
+            .unwrap()
+            .expect("Some");
+    assert_eq!(oc.status.state, JobState::Failed);
+    assert_eq!(oc.exit_code, Some(7));
+
+    // Task 7's row has not been flushed to accounting yet — the shared
+    // listing must yield None (lag retry), never another task's outcome.
+    let absent =
+        super::query_array_task_outcome_with(&MockCapture::ok(master_argv(), listing), 12345, 7)
+            .await
+            .unwrap();
+    assert_eq!(absent, None);
 }
