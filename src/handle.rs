@@ -143,7 +143,12 @@ pub trait DynJobHandleCommon: Send + Sync + 'static {
     /// Current snapshot, flattened to JSON. The structure matches
     /// `serde_json::to_value(handle.snapshot())` of the concrete
     /// `JobHandleCommon` impl.
-    fn snapshot_json(&self) -> serde_json::Value;
+    ///
+    /// Returns `Err` if the snapshot fails to serialize — possible for
+    /// third-party `JobHandleCommon` impls whose snapshot type has a
+    /// fallible `Serialize` (the two in-tree snapshot types always
+    /// serialize cleanly).
+    fn snapshot_json(&self) -> Result<serde_json::Value>;
 
     /// JSON-flattened equivalent of [`JobHandleCommon::refresh`]. Same
     /// invariants apply (MUST NOT call `sacct`).
@@ -184,9 +189,8 @@ impl<H: JobHandleCommon> DynJobHandleCommon for DynHandleAdapter<H> {
     fn kind(&self) -> &'static str {
         <H::Snapshot as JobSnapshot>::kind()
     }
-    fn snapshot_json(&self) -> serde_json::Value {
-        serde_json::to_value(self.inner.snapshot())
-            .expect("JobSnapshot must always serialize to JSON")
+    fn snapshot_json(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self.inner.snapshot())?)
     }
     async fn refresh_json(&self) -> Result<serde_json::Value> {
         let snap = self.inner.refresh().await?;

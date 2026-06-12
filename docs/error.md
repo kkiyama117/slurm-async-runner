@@ -265,3 +265,91 @@ fn new(
 - `slurm_async_runner/src/py_export/mod.rs`: shared2 由来の pyclass を再 export しない
 - `gaussian-job-shared2/src/entities/.../resource_spec.rs`: `pub fn ResourceSpec::from_parts(...)` を追加
 2026-05-10: Phase C smoke passed (commit a44abe2e863f1f68611ef72797f58151edb5f4ce)
+
+---
+
+# sbatch 監視 regression 3 件: stderr 誤読 / sacct ラグ凍結 / qgroup 不在
+
+> **Status:** 解決済み (2026-06-12)
+> **発見日:** 2026-06-12（「array job の監視が終わらない」という報告のコードレビューで特定）
+
+## 1. 何が起きたか
+
+1. **array task の `wait_terminal` が永久ループ**。array master が squeue から
+   完全に消えると `squeue -j <master>_<idx>` は stderr に
+   `slurm_load_jobs error: Invalid job id specified` を出して exit 1 する。
+   `TokioDispatcher::capture` は stderr を `"[stderr]\n…"` として stdout に
+   マージするため、`parse_squeue_array_task`（jobid 列を持たない `%T %r`
+   パーサ）がマーカー行 `[stderr]` を state トークンとして読み、
+   `JobState::Unknown` の「観測」を返し続けた。`left_active_listing` が
+   立たず、`wait_terminal` は終了せず、`refresh_with_sacct` も early-return
+   して sacct を呼ばなかった。単一ジョブ用 `parse_squeue` は jobid の u64
+   パースで stderr 行を弾くため無事 — array 経路だけの非対称バグ。
+2. **sacct ラグで `FinishedInfo` が `Unknown` のまま凍結**。job が listing
+   から消えた直後に sacct がまだ行を返さないと、`refresh_with_sacct` が
+   `unwrap_or(default)` で `FinishedInfo { final_state: Unknown, exit_code:
+   None }` を確定スタンプし、idempotency short-circuit で以後再解決不能。
+3. **`qgroup` バイナリ不在で `refresh()` 全体が Err**。spawn 失敗が `?` で
+   伝播し、squeue フォールバックに到達しなかった。
+
+## 2. 修正
+
+- `runner::stdout_section`（`[stderr]` マーカー行以降を切り落とす）を追加し、
+  全 `query_*` ヘルパーでパース前に適用。submit 系の診断経路（stderr 全文が
+  必要）は対象外。
+- `refresh_with_sacct` は sacct が使える行を返さない限り `finished` を
+  立てない（次回呼び出しで再試行）。
+- `refresh()` は qgroup の Err を `tracing::warn!` して miss 扱いにし
+  squeue へフォールバック。
+
+## 3. 教訓
+
+- `capture` の stderr マージ契約を前提にできるのは「jobid 等のキー検証を
+  持つパーサ」だけ。キー列を省いたパーサ（`%T %r`）を足すときは
+  `stdout_section` を必ず通すこと。
+- 「観測できなかった」と「Unknown を観測した」を混同しない。捏造した
+  Unknown を永続化すると idempotency ガードと組み合わさって自己修復不能に
+  なる。
+
+---
+
+# sbatch 監視 regression 4 件目: 偽 vanish 後の非 terminal FinishedInfo 凍結 (2026-06-12)
+
+上記 3 件の修正後のフルリポジトリレビューで発見。同族の 4 件目。
+
+## 1. 何が起きたか
+
+1. controller 過負荷時の `squeue` は「stderr に `Socket timed out`、exit 1、
+   **stdout 空**」を返す。query ヘルパーは exit code を捨てるため、これは
+   正常な「ジョブ消失」と区別できず `left_active_listing = true` が立つ
+   （実行中ジョブでも）。このフラグを false に戻す経路は存在しなかった。
+2. その後の `refresh_with_sacct()` で sacct は走行中ジョブに
+   `RUNNING|None|0:0` の行を返す。no-row sentinel（`Unknown && exit_code
+   is None`）はすり抜け、`FinishedInfo { final_state: Running, exit_code:
+   Some(0) }` が刻印され、idempotency short-circuit により自己修復不能。
+   `SbatchManager::run()` 経由では「JobFailed { state: RUNNING }」になる。
+
+## 2. 修正
+
+- `refresh_with_sacct` に terminal ガードを追加: 既知の非 terminal 状態
+  （RUNNING/PENDING 等）の行は刻印せず、`left_active_listing` を巻き戻して
+  観測値 (`last_observed_state`) を記録し、通常ポーリングに復帰させる。
+- forward-compat 維持: 未知トークン（`Unknown`）+ exit code ありは従来
+  どおり刻印する（将来 SLURM が terminal 状態を増やしても解決できる）。
+- regression テスト: `refresh_with_sacct_rolls_back_false_vanish_on_live_sacct_row`
+  / 同 array 変種 / `refresh_with_sacct_stamps_unknown_token_with_exit_code`。
+
+## 3. 教訓
+
+- 「リストに居ない」は「終わった」を意味しない。終端の確定は terminal
+  状態の観測のみを根拠にすること（vanish は再試行のトリガーにすぎない）。
+- 根本原因は query ヘルパーが exit code / stderr を捨てて「一時失敗」と
+  「消失」を融合していること。同日中に `capture` の戻りを
+  `CaptureOutput { exit_code, stdout, stderr }` に構造化して解決した:
+  `[stderr]` マーカー結合と `stdout_section` は廃止（パーサは `.stdout`
+  のみを読むため誤読が構造的に不可能に）、squeue の
+  `Invalid job id specified` (= vanish) とそれ以外の非ゼロ exit
+  (= transient エラー、`refresh()` が Err を伝播) を判別、
+  `wait_terminal` は連続 5 回まで refresh 失敗を warn して耐える。
+  診断用の merged 形式は `CaptureOutput::diagnostic()` としてエラー
+  構築箇所のみで生成する。

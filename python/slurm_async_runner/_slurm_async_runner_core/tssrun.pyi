@@ -81,6 +81,10 @@ def file_system_state_store(
 @final
 class TssrunJobHandle:
     """In-process or attached handle to a ``tssrun`` child."""
+    # ``pid`` / ``node`` / ``sent_env`` are pyo3 *getters that return an
+    # awaitable*: attribute access itself is sync, but the value must be
+    # awaited (``await h.pid``). ``Awaitable[...]`` under ``@property`` is
+    # the accurate stub for that shape, not a mistake.
     @property
     def pid(self) -> Awaitable[builtins.int]: ...
     # ``jobid`` / ``uuid`` / ``is_running`` / ``is_finished`` / ``exit_code``

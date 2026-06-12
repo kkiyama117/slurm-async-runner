@@ -303,9 +303,10 @@ surfaced していました）。
 PR #14 までの `TokioDispatcher::capture` は stdout だけを返し stderr を
 捨てていた。sbatch / scancel が失敗すると `sbatch: error: ...` は stderr
 に出るので、`SbatchSpawnError::SubmitFailed::output` が空になって診断
-不能になっていた。現在は stdout 末尾に `[stderr]` マーカー区切りで stderr
-を結合する（`src/dispatcher.rs::TokioDispatcher::capture`）。line-based
-パーサ群は `[stderr]` マーカーを skip するので非破壊。
+不能になっていた。現在は `capture` が `CaptureOutput { exit_code,
+stdout, stderr }` を構造化して返し、エラー側は `CaptureOutput::
+diagnostic()`（`"{stdout}\n[stderr]\n{stderr}"` 結合形）を `output` に
+格納する。パーサ群は `.stdout` のみを読むので stderr 混入の心配はない。
 
 ## 6. CI と同じ条件をローカルで回す
 

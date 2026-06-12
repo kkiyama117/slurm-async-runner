@@ -10,11 +10,14 @@
 //!
 //! - [`TokioDispatcher`] — production. Uses `tokio::process::Command`,
 //!   pipes both stdout and stderr, and (for `run`) echoes them after
-//!   the child exits. For `capture`, stderr is appended after stdout
-//!   with a `\n[stderr]\n` marker so failure diagnostics (`sbatch: error:
-//!   …`) reach the caller's error message. Line-based parsers
-//!   (`parse_submitted_jobid`, squeue / sacct / qgroup parsers) are
-//!   unaffected because they ignore lines that don't match their prefix.
+//!   the child exits. For `capture`, the child's exit code, stdout, and
+//!   stderr are returned **separately** as a [`CaptureOutput`]: parsers
+//!   (the `query_*` helpers in [`crate::runner`]) consume `.stdout`
+//!   only, while failure diagnostics (`sbatch: error: …`) are rendered
+//!   on demand via [`CaptureOutput::diagnostic`]. There is no in-band
+//!   `[stderr]` marker anymore — stderr text can never be misread as
+//!   data rows, and `exit_code` + `stderr` let callers classify
+//!   failures (e.g. "job vanished" vs. "transient SLURM failure").
 //! - [`DryRunDispatcher`] — testing / dry-run. Prints the argv that
 //!   *would* have been spawned and returns success without touching
 //!   the OS.
@@ -32,7 +35,36 @@ use tokio::process::Command;
 type DynRunFut<'a> = Pin<Box<dyn Future<Output = Result<i32>> + Send + 'a>>;
 
 /// Boxed future returned by [`DynJobDispatcher::capture`].
-type DynCaptureFut<'a> = Pin<Box<dyn Future<Output = Result<(i32, String)>> + Send + 'a>>;
+type DynCaptureFut<'a> = Pin<Box<dyn Future<Output = Result<CaptureOutput>> + Send + 'a>>;
+
+/// Structured result of a [`JobDispatcher::capture`] call. stdout and
+/// stderr are kept separate so parsers consume `stdout` only and
+/// callers can classify failures from `exit_code` + `stderr`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl CaptureOutput {
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+
+    /// Human-readable merged form for error diagnostics — the legacy
+    /// `"{stdout}\n[stderr]\n{stderr}"` shape that submit/cancel error
+    /// messages have always carried.
+    pub fn diagnostic(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            self.stdout.clone()
+        } else if self.stdout.is_empty() {
+            format!("[stderr]\n{}", self.stderr)
+        } else {
+            format!("{}\n[stderr]\n{}", self.stdout, self.stderr)
+        }
+    }
+}
 
 /// Abstract subprocess launcher used by the SLURM glue.
 ///
@@ -51,20 +83,22 @@ pub trait JobDispatcher: Send + Sync {
     /// child was signal-killed).
     fn run(&self, argv: &[String]) -> impl Future<Output = Result<i32>> + Send;
 
-    /// Spawn `argv` and capture its output. Returns `(exit_code, output)`.
+    /// Spawn `argv` and capture its output as a structured
+    /// [`CaptureOutput`] (exit code, stdout, stderr — kept separate).
     ///
-    /// Production implementations (e.g. [`TokioDispatcher`]) merge stderr
-    /// into the returned `output`: if stderr is non-empty, the second
-    /// tuple element is `"{stdout}\n[stderr]\n{stderr}"`; otherwise it is
-    /// just `stdout`. This contract exists so that command failures
-    /// (e.g. `sbatch: error: invalid partition`) surface in
-    /// [`crate::sbatch::error::SbatchSpawnError::SubmitFailed::output`]
-    /// rather than being silently dropped.
+    /// Parsers must read [`CaptureOutput::stdout`] only; stderr never
+    /// contaminates the data stream (the old contract merged stderr into
+    /// a single string behind a `[stderr]` marker line, which a parser
+    /// once misread as a state token). Error paths that need a
+    /// human-readable blob (e.g.
+    /// [`crate::sbatch::error::SbatchSpawnError::SubmitFailed`]) render
+    /// it via [`CaptureOutput::diagnostic`]. `exit_code` + `stderr`
+    /// additionally let callers classify failures — see the
+    /// vanish-vs-transient logic in [`crate::runner`].
     ///
     /// Used for `sbatch`, `scancel`, `squeue`, `sacct`, and `qgroup` style
-    /// queries. Their line-based parsers ignore the `[stderr]` marker line
-    /// and any subsequent stderr lines that don't match the expected prefix.
-    fn capture(&self, argv: &[String]) -> impl Future<Output = Result<(i32, String)>> + Send;
+    /// queries.
+    fn capture(&self, argv: &[String]) -> impl Future<Output = Result<CaptureOutput>> + Send;
 }
 
 /// Dyn-compatible facade over [`JobDispatcher`] so callers can hold
@@ -126,7 +160,7 @@ impl<'a> JobDispatcher for DynView<'a> {
     }
 
     #[allow(clippy::manual_async_fn)]
-    fn capture(&self, argv: &[String]) -> impl Future<Output = Result<(i32, String)>> + Send {
+    fn capture(&self, argv: &[String]) -> impl Future<Output = Result<CaptureOutput>> + Send {
         async move { self.0.capture(argv).await }
     }
 }
@@ -160,7 +194,7 @@ impl JobDispatcher for TokioDispatcher {
         Ok(code)
     }
 
-    async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+    async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
         let (program, args) = argv
             .split_first()
             .context("TokioDispatcher::capture called with empty argv")?;
@@ -171,17 +205,11 @@ impl JobDispatcher for TokioDispatcher {
             .output()
             .await
             .with_context(|| format!("failed to spawn `{program}`"))?;
-        let code = output.status.code().unwrap_or(0);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = if stderr.trim().is_empty() {
-            stdout.into_owned()
-        } else if stdout.is_empty() {
-            format!("[stderr]\n{stderr}")
-        } else {
-            format!("{stdout}\n[stderr]\n{stderr}")
-        };
-        Ok((code, combined))
+        Ok(CaptureOutput {
+            exit_code: output.status.code().unwrap_or(0),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 }
 
@@ -198,9 +226,9 @@ impl JobDispatcher for DryRunDispatcher {
         Ok(0)
     }
 
-    async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+    async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
         println!("{}", argv.join(" "));
-        Ok((0, String::new()))
+        Ok(CaptureOutput::default())
     }
 }
 
@@ -240,7 +268,7 @@ impl JobDispatcher for TokioBackgroundDispatcher {
     async fn run(&self, argv: &[String]) -> anyhow::Result<i32> {
         TokioDispatcher.run(argv).await
     }
-    async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+    async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
         TokioDispatcher.capture(argv).await
     }
 }
@@ -287,11 +315,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_capture_returns_empty_stdout() {
+    async fn dry_run_capture_returns_empty_default_output() {
         let d = DryRunDispatcher;
-        let (code, out) = d.capture(&["does-not-exist".into()]).await.unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(out, "");
+        let out = d.capture(&["does-not-exist".into()]).await.unwrap();
+        assert_eq!(out, CaptureOutput::default());
+        assert!(out.success());
     }
 
     #[tokio::test]
@@ -316,23 +344,26 @@ mod tests {
     #[tokio::test]
     async fn tokio_capture_echo_returns_stdout() {
         let d = TokioDispatcher;
-        let (code, out) = d
+        let out = d
             .capture(&["echo".into(), "hello world".into()])
             .await
             .unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(out.trim(), "hello world");
+        assert_eq!(out.exit_code, 0);
+        assert!(out.success());
+        assert_eq!(out.stdout.trim(), "hello world");
+        assert_eq!(out.stderr, "");
     }
 
-    /// Failure-mode diagnostic contract: when a child writes to stderr
-    /// (e.g. `sbatch: error: invalid partition`), `capture` must surface
-    /// it via the returned `output` string. Regression guard for the bug
-    /// where `RuntimeError: sbatch invocation failed (exit=1):` reached
-    /// Python with an empty message.
+    /// Structured-capture contract: stdout and stderr land in separate
+    /// fields (parsers read `.stdout` only) while `.diagnostic()` keeps
+    /// the legacy merged shape — both streams plus the `[stderr]` marker
+    /// — so error messages (`SubmitFailed::output` etc.) stay readable.
+    /// Regression guard for the bug where `RuntimeError: sbatch
+    /// invocation failed (exit=1):` reached Python with an empty message.
     #[tokio::test]
-    async fn tokio_capture_merges_stderr_after_stdout() {
+    async fn tokio_capture_separates_stdout_and_stderr_fields() {
         let d = TokioDispatcher;
-        let (code, out) = d
+        let out = d
             .capture(&[
                 "sh".into(),
                 "-c".into(),
@@ -340,37 +371,69 @@ mod tests {
             ])
             .await
             .unwrap();
-        assert_eq!(code, 1);
+        assert_eq!(out.exit_code, 1);
+        assert!(!out.success());
+        assert_eq!(out.stdout.trim(), "on-stdout");
+        assert_eq!(out.stderr.trim(), "on-stderr");
         assert!(
-            out.contains("on-stdout"),
-            "stdout content must be preserved, got: {out:?}"
+            !out.stdout.contains("on-stderr"),
+            "stderr must never leak into the stdout field, got: {:?}",
+            out.stdout
+        );
+        let diag = out.diagnostic();
+        assert!(
+            diag.contains("on-stdout") && diag.contains("on-stderr"),
+            "diagnostic must carry both streams, got: {diag:?}"
         );
         assert!(
-            out.contains("on-stderr"),
-            "stderr content must be appended for diagnostics, got: {out:?}"
-        );
-        assert!(
-            out.contains("[stderr]"),
-            "stderr section must be marked, got: {out:?}"
+            diag.contains("[stderr]"),
+            "diagnostic must mark the stderr section, got: {diag:?}"
         );
     }
 
-    /// stdout-only commands must not gain a spurious `[stderr]` marker.
-    /// Pins the success path so existing line-based parsers
-    /// (`parse_submitted_jobid` etc.) stay unaffected.
+    /// stdout-only commands: `.stdout` is the data, and `.diagnostic()`
+    /// degenerates to exactly the stdout text (no spurious `[stderr]`
+    /// marker).
     #[tokio::test]
     async fn tokio_capture_stderr_empty_leaves_stdout_unchanged() {
         let d = TokioDispatcher;
-        let (code, out) = d
+        let out = d
             .capture(&["sh".into(), "-c".into(), "echo only-stdout".into()])
             .await
             .unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(out.trim(), "only-stdout");
-        assert!(
-            !out.contains("[stderr]"),
-            "no stderr marker when stderr empty, got: {out:?}"
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout.trim(), "only-stdout");
+        assert_eq!(out.stderr, "");
+        assert_eq!(
+            out.diagnostic(),
+            out.stdout,
+            "diagnostic must equal stdout when stderr is empty"
         );
+    }
+
+    /// `diagnostic()` merging rules pinned without spawning a process.
+    #[test]
+    fn diagnostic_merging_rules() {
+        let both = CaptureOutput {
+            exit_code: 1,
+            stdout: "out".into(),
+            stderr: "err\n".into(),
+        };
+        assert_eq!(both.diagnostic(), "out\n[stderr]\nerr\n");
+
+        let stderr_only = CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "err\n".into(),
+        };
+        assert_eq!(stderr_only.diagnostic(), "[stderr]\nerr\n");
+
+        let whitespace_stderr = CaptureOutput {
+            exit_code: 0,
+            stdout: "out\n".into(),
+            stderr: "  \n".into(),
+        };
+        assert_eq!(whitespace_stderr.diagnostic(), "out\n");
     }
 
     #[tokio::test]

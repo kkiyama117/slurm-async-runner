@@ -6,7 +6,7 @@
 
 import builtins
 import os
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, final
 
 if TYPE_CHECKING:
@@ -51,6 +51,9 @@ class SbatchCmd:
         signal: "SlurmSignalSpec | None" = None,
         array_spec: "SlurmArraySpec | None" = None,
     ) -> None: ...
+    def build_argv(self) -> builtins.list[builtins.str]:
+        """Render the full ``sbatch`` argv (pure, no I/O)."""
+        ...
 
 @final
 class SbatchJobHandle:
@@ -130,6 +133,7 @@ class FinishedInfo:
     def exit_code(self) -> builtins.int | None: ...
     @property
     def finished_at(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
 
 @final
 class SbatchManager:
@@ -171,7 +175,7 @@ class SbatchManager:
 
     def run_with_jobid_callback(
         self,
-        on_spawn: "builtins.object",
+        on_spawn: Callable[[builtins.int], object],
     ) -> Awaitable[FinishedInfo]:
         """Same as ``run()`` but invokes ``on_spawn(jobid)`` synchronously
         the moment sbatch returns a parseable jobid.

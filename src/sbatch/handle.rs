@@ -149,6 +149,19 @@ pub enum SbatchAttachKey {
     File(PathBuf),
 }
 
+/// How many *consecutive* `refresh()` failures `wait_terminal` tolerates
+/// before propagating the error.
+///
+/// Rationale: with failure classification in place (see
+/// `crate::runner::ensure_query_success`), a transient `Socket timed
+/// out` under SLURM controller overload now surfaces as a refresh `Err`
+/// — and a single hiccup must not kill a multi-hour wait. Conversely,
+/// 5 × `poll_interval` (5 minutes at the default 60 s cadence) of
+/// uninterrupted failure indicates a real outage that the caller should
+/// see. The counter resets on every successful refresh, so only an
+/// unbroken failure streak trips the cap.
+const MAX_CONSECUTIVE_REFRESH_FAILURES: u32 = 5;
+
 /// Cheap-to-clone handle to an in-flight or attached sbatch job. All
 /// snapshot reads are lock-free; `refresh` / `refresh_with_sacct` /
 /// `wait_terminal` serialize through `refresh_lock`.
@@ -274,9 +287,10 @@ impl SbatchJobHandle {
     /// if the snapshot does not carry the corresponding log template.
     /// Other I/O errors are propagated as `LogReadError::Io`.
     ///
-    /// Phase 2 P1 implements this with a full read of the file followed
-    /// by line splitting; for very large logs (> ~10MB) consider Phase 3
-    /// optimization with reverse seek.
+    /// Reads the file *backwards* in fixed-size chunks and stops as soon
+    /// as `n` lines are covered, so memory stays bounded by
+    /// `O(n × line length)` even for multi-GB HPC job logs (the previous
+    /// implementation loaded the whole file).
     pub async fn log_lines(
         &self,
         stream: LogStream,
@@ -288,12 +302,8 @@ impl SbatchJobHandle {
             LogStream::Stderr => snap.error_path(),
         };
         let path = path.ok_or(LogReadError::PathNotResolved)?;
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
-                let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-                let start = lines.len().saturating_sub(n);
-                Ok(lines[start..].to_vec())
-            }
+        match read_last_lines(&path, n).await {
+            Ok(lines) => Ok(lines),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(LogReadError::Io(e)),
         }
@@ -303,6 +313,8 @@ impl SbatchJobHandle {
     ///
     /// Returns an empty string if the log file does not yet exist.
     /// Same error semantics as [`SbatchJobHandle::log_lines`] otherwise.
+    /// Unlike `log_lines` this intentionally loads the whole file —
+    /// that is its contract; use `log_lines` for tail reads.
     pub async fn read_log_to_end(&self, stream: LogStream) -> Result<String, LogReadError> {
         let snap = self.0.snapshot_tx.borrow().clone();
         let path = match stream {
@@ -319,6 +331,8 @@ impl SbatchJobHandle {
 
     /// Lightweight polling: `qgroup -l` → `squeue` fallback. **Never** calls
     /// sacct. If both lookups miss, sets `lifecycle.left_active_listing = true`.
+    /// A failing `qgroup` invocation (e.g. the binary does not exist on
+    /// non-KUDPC clusters) is logged and treated as a miss, not an error.
     ///
     /// For handles produced by `spawn_array` / `attach_array_jobid`
     /// (i.e. `array_task_id.is_some()`), this branches into a per-task
@@ -351,7 +365,22 @@ impl SbatchJobHandle {
             return Ok(snap);
         }
 
-        let qgroup = crate::runner::query_job_states_via_qgroup_with(&view, &[snap.jobid]).await?;
+        // `qgroup` is KUDPC-specific: on clusters without the binary the
+        // spawn itself fails. Treat any qgroup error as a miss (with a
+        // warning so genuine qgroup breakage on KUDPC stays visible) and
+        // fall through to the squeue probe instead of failing the refresh.
+        let qgroup =
+            match crate::runner::query_job_states_via_qgroup_with(&view, &[snap.jobid]).await {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!(
+                        jobid = snap.jobid,
+                        error = %e,
+                        "qgroup -l query failed; treating as a miss and falling back to squeue"
+                    );
+                    HashMap::new()
+                }
+            };
         if let Some(status) = qgroup.get(&snap.jobid) {
             snap.lifecycle.last_observed_state = Some(status.clone());
             snap.lifecycle.last_observed_at = Some(now);
@@ -393,6 +422,11 @@ impl SbatchJobHandle {
     /// `FinishedInfo` reflects the individual task — not the master
     /// summary. Step rows (`.batch`, `.0`, …) are filtered. See spec
     /// §5.5 and issue #8 A5.
+    ///
+    /// If sacct has no usable row yet (accounting flush lag, or the job
+    /// was purged from history), `lifecycle.finished` is left unset so a
+    /// later call can retry — a fabricated `Unknown` outcome is never
+    /// recorded.
     pub async fn refresh_with_sacct(&self) -> anyhow::Result<SbatchJobSnapshot> {
         let mut snap = self.refresh().await?;
         if snap.lifecycle.finished.is_some() {
@@ -437,6 +471,43 @@ impl SbatchJobHandle {
                 })
         };
 
+        // sacct may lag behind qgroup/squeue (accounting flush delay) or
+        // may have purged the job from history entirely. Both cases yield
+        // no usable row — the queries above synthesize a default outcome
+        // (state Unknown, no exit code). Leave `finished` unset so a later
+        // call can retry once accounting catches up, instead of freezing
+        // the fabricated Unknown outcome behind the idempotency
+        // short-circuit at the top of this method. Callers can detect the
+        // vanished-but-unresolved situation via
+        // `left_active_listing == true && finished.is_none()`.
+        //
+        // This sentinel relies on every sacct query above selecting the
+        // `ExitCode` column: a row that actually exists always yields
+        // `exit_code: Some(_)` (sacct prints `<exit>:<signal>` for every
+        // parent row), so `Unknown + None` can only mean "no usable row".
+        // Keep that column in the argv if the queries are ever reworked.
+        if outcome.status.state == JobState::Unknown && outcome.exit_code.is_none() {
+            return Ok(snap);
+        }
+
+        // A *known non-terminal* row (RUNNING/PENDING/…) means the job is
+        // provably still alive — the earlier vanish observation was a
+        // false positive (e.g. a transient `squeue` failure under
+        // controller overload yields empty stdout, indistinguishable from
+        // a purge). Never stamp FinishedInfo from it: roll back the
+        // vanish flag and record the live observation so `is_running()` /
+        // `wait_terminal` resume normal polling. `Unknown` is exempt so
+        // an unrecognized future terminal token with a real exit code
+        // (forward-compat) still resolves.
+        if outcome.status.state != JobState::Unknown && !outcome.status.state.is_terminal() {
+            snap.lifecycle.left_active_listing = false;
+            snap.lifecycle.last_observed_state = Some(outcome.status);
+            snap.lifecycle.last_observed_at = Some(chrono::Utc::now());
+            inner.store.save(&snap).await?;
+            inner.snapshot_tx.send_replace(snap.clone());
+            return Ok(snap);
+        }
+
         snap.lifecycle.finished = Some(FinishedInfo {
             final_state: outcome.status.state,
             final_reason: outcome.status.reason,
@@ -452,19 +523,42 @@ impl SbatchJobHandle {
     /// supplied interval until either (a) the observed state is terminal,
     /// or (b) the job leaves both active listings. Caller may follow up
     /// with one `refresh_with_sacct()` if exit_code resolution is needed.
+    ///
+    /// Up to [`MAX_CONSECUTIVE_REFRESH_FAILURES`] consecutive `refresh()`
+    /// errors are tolerated (each is logged via `tracing::warn!` and the
+    /// loop keeps polling); the counter resets on any success, and the
+    /// error propagates once the cap is hit.
     pub async fn wait_terminal(
         &self,
         poll_interval: std::time::Duration,
     ) -> anyhow::Result<SbatchJobSnapshot> {
+        let mut consecutive_failures: u32 = 0;
         loop {
-            let snap = self.refresh().await?;
-            if let Some(state) = &snap.lifecycle.last_observed_state
-                && state.state.is_terminal()
-            {
-                return Ok(snap);
-            }
-            if snap.lifecycle.left_active_listing {
-                return Ok(snap);
+            match self.refresh().await {
+                Ok(snap) => {
+                    consecutive_failures = 0;
+                    if let Some(state) = &snap.lifecycle.last_observed_state
+                        && state.state.is_terminal()
+                    {
+                        return Ok(snap);
+                    }
+                    if snap.lifecycle.left_active_listing {
+                        return Ok(snap);
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_REFRESH_FAILURES {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        jobid = self.0.snapshot_tx.borrow().jobid,
+                        consecutive_failures,
+                        max = MAX_CONSECUTIVE_REFRESH_FAILURES,
+                        error = %e,
+                        "wait_terminal: refresh failed transiently; continuing to poll"
+                    );
+                }
             }
             tokio::time::sleep(poll_interval).await;
         }
@@ -512,6 +606,61 @@ impl crate::handle::JobHandleCommon for SbatchJobHandle {
     ) -> anyhow::Result<SbatchJobSnapshot> {
         Self::wait_terminal(self, poll_interval).await
     }
+}
+
+/// Chunk size for the backwards tail read in [`read_last_lines`]. 8 KiB
+/// covers `n × typical-line-length` for the common `log_lines(_, 100)`
+/// case in one or two reads while keeping worst-case memory at
+/// `O(n × line length)`, not `O(file size)`.
+const TAIL_READ_CHUNK: u64 = 8192;
+
+/// Return the last `n` lines of `path` without reading the whole file.
+///
+/// Reads backwards in [`TAIL_READ_CHUNK`]-sized chunks and stops once the
+/// accumulated buffer contains more than `n` newlines (i.e. at least `n`
+/// complete lines after the potentially partial first one). Line
+/// semantics match [`str::lines`] — a final line without a trailing
+/// newline counts as a line — so small files behave identically to the
+/// previous whole-file implementation.
+///
+/// UTF-8 safety: the buffer is only decoded (lossily) after assembly.
+/// The buffer can start mid-multibyte-character only when the loop broke
+/// early on the newline budget; in that case the buffer holds more than
+/// `n` newlines, so `lines.len() > n` is guaranteed and the damaged
+/// fragment occupies the leading line that `drain` removes. A buffer
+/// that reaches back to the start of the file is never damaged.
+pub(crate) async fn read_last_lines(
+    path: &std::path::Path,
+    n: usize,
+) -> std::io::Result<Vec<String>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut pos = file.metadata().await?.len();
+    let mut buf: Vec<u8> = Vec::new();
+
+    while pos > 0 {
+        let read_len = TAIL_READ_CHUNK.min(pos);
+        pos -= read_len;
+        file.seek(std::io::SeekFrom::Start(pos)).await?;
+        let mut chunk = vec![0u8; read_len as usize];
+        file.read_exact(&mut chunk).await?;
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        if buf.iter().filter(|&&b| b == b'\n').count() > n {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    if lines.len() > n {
+        lines.drain(..lines.len() - n);
+    }
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -616,21 +765,35 @@ mod tests {
 
     // ---- CannedDispatcher mock for refresh tests ----
 
+    use crate::dispatcher::CaptureOutput;
+
+    /// stdout-only success [`CaptureOutput`] — the common canned shape.
+    fn cap_ok(stdout: &str) -> CaptureOutput {
+        CaptureOutput {
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
     /// Mock dispatcher: returns canned outputs keyed by argv[0].
     /// argv[0] = "qgroup" → first canned, "squeue" → second, "sacct" → third.
+    /// The constructor takes stdout-only `&str` values for ergonomics;
+    /// tests that need a nonzero exit / stderr replace the whole
+    /// `CaptureOutput` through the field's `Mutex`.
     struct CannedDispatcher {
-        qgroup: std::sync::Mutex<String>,
-        squeue: std::sync::Mutex<String>,
-        sacct: std::sync::Mutex<String>,
+        qgroup: std::sync::Mutex<CaptureOutput>,
+        squeue: std::sync::Mutex<CaptureOutput>,
+        sacct: std::sync::Mutex<CaptureOutput>,
         sacct_call_count: std::sync::Mutex<u32>,
     }
 
     impl CannedDispatcher {
         fn new(qgroup: &str, squeue: &str, sacct: &str) -> Self {
             Self {
-                qgroup: std::sync::Mutex::new(qgroup.to_string()),
-                squeue: std::sync::Mutex::new(squeue.to_string()),
-                sacct: std::sync::Mutex::new(sacct.to_string()),
+                qgroup: std::sync::Mutex::new(cap_ok(qgroup)),
+                squeue: std::sync::Mutex::new(cap_ok(squeue)),
+                sacct: std::sync::Mutex::new(cap_ok(sacct)),
                 sacct_call_count: std::sync::Mutex::new(0),
             }
         }
@@ -645,7 +808,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
             let bin = argv[0].as_str();
             let out = match bin {
                 "qgroup" => self.qgroup.lock().unwrap().clone(),
@@ -654,9 +817,9 @@ mod tests {
                     *self.sacct_call_count.lock().unwrap() += 1;
                     self.sacct.lock().unwrap().clone()
                 }
-                _ => String::new(),
+                _ => CaptureOutput::default(),
             };
-            Ok((0, out))
+            Ok(out)
         }
     }
 
@@ -935,6 +1098,400 @@ mod tests {
         assert_eq!(canned.sacct_calls(), 1);
     }
 
+    /// Regression (vanished-jobid classification): once the array master
+    /// has left squeue entirely, `squeue -j <master>_<idx>` prints
+    /// `slurm_load_jobs error: Invalid job id specified` on stderr and
+    /// exits 1 (KUDPC purges terminated jobs from the queue immediately).
+    /// That combination is the *vanish* signal — the refresh must set
+    /// `left_active_listing = true`, never record a bogus observation,
+    /// and never treat it as a query failure.
+    #[tokio::test]
+    async fn refresh_array_task_treats_stderr_only_squeue_as_vanished() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        *canned.squeue.lock().unwrap() = CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "slurm_load_jobs error: Invalid job id specified\n".into(),
+        };
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h.refresh().await.unwrap();
+        assert!(
+            after.lifecycle.left_active_listing,
+            "vanished-jobid squeue failure must mark the task as vanished, got {:?}",
+            after.lifecycle
+        );
+        assert_eq!(canned.sacct_calls(), 0, "refresh must NOT call sacct");
+    }
+
+    fn transient_squeue_failure() -> CaptureOutput {
+        CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "slurm_load_jobs error: Socket timed out on send/recv operation\n".into(),
+        }
+    }
+
+    /// A transient squeue failure (controller overload prints `Socket
+    /// timed out` on stderr, exits 1) must NOT be misread as a vanish:
+    /// `refresh()` propagates the error and the persisted snapshot keeps
+    /// `left_active_listing == false`. This was the root cause of the
+    /// false-vanish regressions — previously the failure looked like an
+    /// empty listing.
+    #[tokio::test]
+    async fn refresh_propagates_transient_squeue_failure() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // qgroup: empty success (a miss) → falls through to squeue, which
+        // fails transiently.
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        *canned.squeue.lock().unwrap() = transient_squeue_failure();
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let err = h.refresh().await.expect_err("transient failure must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("squeue"), "tool name expected, got: {msg}");
+        assert!(
+            !h.snapshot().lifecycle.left_active_listing,
+            "transient failure must not persist a fake vanish"
+        );
+    }
+
+    /// Array-task variant of the transient-failure propagation.
+    #[tokio::test]
+    async fn refresh_array_task_propagates_transient_squeue_failure() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        *canned.squeue.lock().unwrap() = transient_squeue_failure();
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let err = h.refresh().await.expect_err("transient failure must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("squeue"), "tool name expected, got: {msg}");
+        assert!(
+            !h.snapshot().lifecycle.left_active_listing,
+            "transient failure must not persist a fake vanish"
+        );
+        assert_eq!(canned.sacct_calls(), 0, "refresh must NOT call sacct");
+    }
+
+    /// Regression (sacct-lag freeze): when the job has vanished from the
+    /// active listings but sacct has no row *yet* (accounting flush lag),
+    /// `refresh_with_sacct` must leave `finished` unset so a later call
+    /// can retry — previously it stamped
+    /// `FinishedInfo { final_state: Unknown, exit_code: None }` and the
+    /// idempotency short-circuit froze that fabricated outcome forever.
+    #[tokio::test]
+    async fn refresh_with_sacct_leaves_finished_unset_until_sacct_reports() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // qgroup & squeue both miss (vanish) AND sacct is still empty.
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(first.lifecycle.left_active_listing);
+        assert!(
+            first.lifecycle.finished.is_none(),
+            "sacct miss must not freeze a fabricated Unknown outcome"
+        );
+
+        // Accounting catches up — the next call must resolve for real.
+        *canned.sacct.lock().unwrap() = cap_ok("12345|COMPLETED|None|0:0\n");
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second
+            .lifecycle
+            .finished
+            .expect("finished must resolve once sacct reports the row");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+        assert_eq!(
+            canned.sacct_calls(),
+            2,
+            "each unresolved call retries sacct"
+        );
+    }
+
+    /// Array-task variant of the sacct-lag retry: empty sacct leaves
+    /// `finished` unset; a later call resolves from the per-task row.
+    #[tokio::test]
+    async fn refresh_with_sacct_array_task_retries_after_sacct_lag() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new("", "", ""));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(first.lifecycle.finished.is_none());
+
+        *canned.sacct.lock().unwrap() = cap_ok("12345_3|COMPLETED|None|0:0\n");
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second.lifecycle.finished.expect("resolved after lag");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    // -------- read_last_lines (tail read) --------
+
+    /// Equivalence with the naive whole-file implementation for files
+    /// smaller than one chunk.
+    #[tokio::test]
+    async fn read_last_lines_small_file_matches_naive_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.out");
+        tokio::fs::write(&path, "a\nb\nc\nd\n").await.unwrap();
+        assert_eq!(read_last_lines(&path, 2).await.unwrap(), vec!["c", "d"]);
+        assert_eq!(
+            read_last_lines(&path, 10).await.unwrap(),
+            vec!["a", "b", "c", "d"],
+            "n larger than the file returns every line"
+        );
+        assert_eq!(
+            read_last_lines(&path, 0).await.unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A file spanning many read chunks must yield exactly the last `n`
+    /// lines without loading the whole file (correctness side; the memory
+    /// bound is structural — the loop stops once `n` newlines are seen).
+    #[tokio::test]
+    async fn read_last_lines_large_file_returns_exact_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.out");
+        // ~100 bytes × 2000 lines ≈ 200 KiB — dozens of 8 KiB chunks.
+        let mut content = String::new();
+        for i in 0..2000 {
+            content.push_str(&format!("line-{i:05} {}\n", "x".repeat(90)));
+        }
+        tokio::fs::write(&path, &content).await.unwrap();
+        let tail = read_last_lines(&path, 3).await.unwrap();
+        assert_eq!(tail.len(), 3);
+        assert!(tail[0].starts_with("line-01997"));
+        assert!(tail[2].starts_with("line-01999"));
+    }
+
+    /// `lines()` semantics: a final line without a trailing newline still
+    /// counts as a line (matches the previous whole-file implementation).
+    #[tokio::test]
+    async fn read_last_lines_includes_unterminated_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.out");
+        tokio::fs::write(&path, "first\nsecond\nno-newline-tail")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_last_lines(&path, 2).await.unwrap(),
+            vec!["second", "no-newline-tail"]
+        );
+    }
+
+    /// Multibyte (UTF-8) content must survive chunk-boundary splits —
+    /// the buffer is only decoded after assembly and the potentially
+    /// broken leading line is always outside the returned tail.
+    #[tokio::test]
+    async fn read_last_lines_multibyte_content_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jp.out");
+        let mut content = String::new();
+        for i in 0..2000 {
+            content.push_str(&format!("行{i:05}-日本語テキスト{}\n", "あ".repeat(30)));
+        }
+        tokio::fs::write(&path, &content).await.unwrap();
+        let tail = read_last_lines(&path, 2).await.unwrap();
+        assert_eq!(tail.len(), 2);
+        assert!(tail[0].starts_with("行01998"));
+        assert!(tail[1].starts_with("行01999"));
+        assert!(
+            !tail[0].contains('\u{FFFD}'),
+            "no replacement chars: {tail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_last_lines_empty_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.out");
+        tokio::fs::write(&path, "").await.unwrap();
+        assert_eq!(
+            read_last_lines(&path, 5).await.unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Regression (non-terminal sacct row freeze): a transient squeue
+    /// failure (controller overload prints `Socket timed out` on stderr,
+    /// exits 1, stdout empty) is indistinguishable from a vanish, so
+    /// `left_active_listing` flips to `true` while the job is still
+    /// running. A subsequent `refresh_with_sacct` then gets a live
+    /// `RUNNING|…|0:0` row — which slips past the no-row sentinel
+    /// (`Unknown && exit_code.is_none()`) and froze
+    /// `FinishedInfo { final_state: Running, exit_code: Some(0) }`
+    /// behind the idempotency short-circuit. The fix: only a terminal
+    /// state may be stamped; a live row instead rolls back the vanish
+    /// flag so normal polling resumes.
+    #[tokio::test]
+    async fn refresh_with_sacct_rolls_back_false_vanish_on_live_sacct_row() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        // qgroup & squeue empty (transient miss) but sacct proves the job
+        // is alive.
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "",
+            "12345|RUNNING|None|0:0\n12345.batch|RUNNING|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(
+            first.lifecycle.finished.is_none(),
+            "a non-terminal sacct row must never be stamped as FinishedInfo, got {:?}",
+            first.lifecycle.finished
+        );
+        assert!(
+            !first.lifecycle.left_active_listing,
+            "a live sacct row must roll back the false vanish flag"
+        );
+        assert_eq!(
+            first.lifecycle.last_observed_state.as_ref().unwrap().state,
+            crate::JobState::Running,
+            "the live observation must be recorded"
+        );
+        assert!(h.is_running(), "handle must report running again");
+
+        // The job later finishes for real: squeue stays empty, sacct now
+        // reports the terminal row — the normal resolve path must work.
+        *canned.sacct.lock().unwrap() = cap_ok("12345|COMPLETED|None|0:0\n");
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second
+            .lifecycle
+            .finished
+            .expect("terminal sacct row must resolve normally");
+        assert_eq!(finished.final_state, crate::JobState::Completed);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    /// Array-task variant of the non-terminal-row rollback.
+    #[tokio::test]
+    async fn refresh_with_sacct_array_task_rolls_back_false_vanish_on_live_row() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "",
+            "12345_3|RUNNING|None|0:0\n12345_3.batch|RUNNING|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let first = h.refresh_with_sacct().await.unwrap();
+        assert!(first.lifecycle.finished.is_none());
+        assert!(!first.lifecycle.left_active_listing);
+
+        *canned.sacct.lock().unwrap() = cap_ok("12345_3|FAILED|NonZeroExitCode|3:0\n");
+        let second = h.refresh_with_sacct().await.unwrap();
+        let finished = second.lifecycle.finished.expect("terminal row resolves");
+        assert_eq!(finished.final_state, crate::JobState::Failed);
+        assert_eq!(finished.exit_code, Some(3));
+    }
+
+    /// Forward-compat lock-in: an *unrecognized* state token with a real
+    /// exit code (a future SLURM terminal state we don't know yet) must
+    /// still be stamped — the terminal guard only blocks *known*
+    /// non-terminal states. The no-row case stays covered by the
+    /// `Unknown && exit_code.is_none()` sentinel.
+    #[tokio::test]
+    async fn refresh_with_sacct_stamps_unknown_token_with_exit_code() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let canned = std::sync::Arc::new(CannedDispatcher::new(
+            "",
+            "",
+            "12345|SOME_FUTURE_STATE|None|0:0\n",
+        ));
+        let dispatcher = into_dyn(MoveDispatcher(canned.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let after = h.refresh_with_sacct().await.unwrap();
+        let finished = after
+            .lifecycle
+            .finished
+            .expect("unknown token + exit code must still resolve (forward-compat)");
+        assert_eq!(finished.final_state, crate::JobState::Unknown);
+        assert_eq!(finished.exit_code, Some(0));
+    }
+
+    /// `qgroup` is a KUDPC-ism: on clusters where the binary does not
+    /// exist, spawning it fails with an `Err` (not a nonzero exit).
+    /// `refresh()` must treat that as a qgroup miss and fall back to
+    /// squeue instead of propagating the error to the caller.
+    #[tokio::test]
+    async fn refresh_falls_back_to_squeue_when_qgroup_spawn_fails() {
+        use crate::dispatcher::{JobDispatcher, into_dyn};
+        use crate::store::InMemoryStateStore;
+
+        struct QgroupErrDispatcher;
+        impl JobDispatcher for QgroupErrDispatcher {
+            async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+                unimplemented!()
+            }
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
+                match argv[0].as_str() {
+                    "qgroup" => Err(anyhow::anyhow!("failed to spawn `qgroup`")),
+                    "squeue" => Ok(cap_ok("12345 RUNNING None\n")),
+                    _ => Ok(CaptureOutput::default()),
+                }
+            }
+        }
+
+        let s = snap(12345);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let dispatcher = into_dyn(QgroupErrDispatcher);
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+        let after = h
+            .refresh()
+            .await
+            .expect("qgroup spawn failure must not propagate");
+        assert_eq!(
+            after.lifecycle.last_observed_state.unwrap().state,
+            crate::JobState::Running
+        );
+        assert!(!after.lifecycle.left_active_listing);
+    }
+
     /// Per-task tasks of one master submission must observe distinct
     /// states even when the master would only have a single qgroup
     /// summary row. This is the regression test for issue #8 A5: before
@@ -953,19 +1510,16 @@ mod tests {
             async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
                 unimplemented!()
             }
-            async fn capture(&self, argv: &[String]) -> anyhow::Result<(i32, String)> {
+            async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
                 if argv[0] == "squeue" {
                     let key = argv[3].as_str();
-                    return Ok((
-                        0,
-                        match key {
-                            "12345_0" => "RUNNING None\n".into(),
-                            "12345_1" => "PENDING Priority\n".into(),
-                            _ => String::new(),
-                        },
-                    ));
+                    return Ok(cap_ok(match key {
+                        "12345_0" => "RUNNING None\n",
+                        "12345_1" => "PENDING Priority\n",
+                        _ => "",
+                    }));
                 }
-                Ok((0, String::new()))
+                Ok(CaptureOutput::default())
             }
         }
 
@@ -1032,6 +1586,107 @@ mod tests {
             canned.sacct_calls(),
             0,
             "wait_terminal must NEVER call sacct"
+        );
+    }
+
+    /// Dispatcher whose squeue responses follow a script: pops the next
+    /// canned [`CaptureOutput`] per squeue call (the last entry repeats
+    /// once the script is exhausted). Counts squeue calls so tests can
+    /// assert exactly how many refresh attempts happened.
+    struct ScriptedSqueue {
+        script: std::sync::Mutex<std::collections::VecDeque<CaptureOutput>>,
+        last: CaptureOutput,
+        squeue_calls: std::sync::Mutex<u32>,
+    }
+
+    impl ScriptedSqueue {
+        fn new(script: Vec<CaptureOutput>) -> Self {
+            let last = script.last().cloned().unwrap_or_default();
+            Self {
+                script: std::sync::Mutex::new(script.into_iter().collect()),
+                last,
+                squeue_calls: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn squeue_calls(&self) -> u32 {
+            *self.squeue_calls.lock().unwrap()
+        }
+    }
+
+    impl crate::dispatcher::JobDispatcher for ScriptedSqueue {
+        async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
+            if argv[0] == "squeue" {
+                *self.squeue_calls.lock().unwrap() += 1;
+                let next = self.script.lock().unwrap().pop_front();
+                return Ok(next.unwrap_or_else(|| self.last.clone()));
+            }
+            Ok(CaptureOutput::default())
+        }
+    }
+
+    fn vanished_squeue_failure() -> CaptureOutput {
+        CaptureOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "slurm_load_jobs error: Invalid job id specified\n".into(),
+        }
+    }
+
+    /// Phase C: a couple of transient `Socket timed out` hiccups during a
+    /// long `wait_terminal` poll must not abort the wait — the loop keeps
+    /// polling and succeeds once squeue reports the terminal vanish.
+    #[tokio::test]
+    async fn wait_terminal_tolerates_transient_refresh_failures() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let scripted = std::sync::Arc::new(ScriptedSqueue::new(vec![
+            transient_squeue_failure(),
+            transient_squeue_failure(),
+            vanished_squeue_failure(),
+        ]));
+        let dispatcher = into_dyn(MoveDispatcher(scripted.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let after = h
+            .wait_terminal(std::time::Duration::from_millis(1))
+            .await
+            .expect("two transient failures then a vanish must succeed");
+        assert!(after.lifecycle.left_active_listing);
+        assert_eq!(scripted.squeue_calls(), 3);
+    }
+
+    /// Phase C: persistent refresh failure must still propagate — after
+    /// exactly `MAX_CONSECUTIVE_REFRESH_FAILURES` (5) consecutive failed
+    /// refresh attempts, `wait_terminal` returns the error instead of
+    /// polling forever against a dead controller.
+    #[tokio::test]
+    async fn wait_terminal_propagates_persistent_refresh_failure() {
+        use crate::dispatcher::into_dyn;
+        use crate::store::InMemoryStateStore;
+
+        let s = snap_array_task(12345, 3);
+        let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
+        let scripted = std::sync::Arc::new(ScriptedSqueue::new(vec![transient_squeue_failure()]));
+        let dispatcher = into_dyn(MoveDispatcher(scripted.clone()));
+        let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
+
+        let err = h
+            .wait_terminal(std::time::Duration::from_millis(1))
+            .await
+            .expect_err("persistent failure must propagate");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("squeue"), "tool name expected, got: {msg}");
+        assert_eq!(
+            scripted.squeue_calls(),
+            5,
+            "exactly MAX_CONSECUTIVE_REFRESH_FAILURES attempts before giving up"
         );
     }
 

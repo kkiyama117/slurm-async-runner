@@ -7,6 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-06-12
+
+Major release: monitoring-correctness fixes change observable behavior
+(`refresh()` / `refresh_with_sacct()` can now raise on transient SLURM
+failures instead of recording a false vanish), and the refresh path is
+multiplexed across handles (shared `qgroup -l` cache + batched squeue
+queries). See **Changed** for the breaking items.
+
+### Added
+
+- **Shared `qgroup -l` listing cache (refresh multiplexing).** Handles
+  created by the same `SbatchManager` now share a single-flight TTL
+  cache (TTL = `poll_interval`) for the `qgroup -l` listing, so N
+  concurrently-polling handles spawn one qgroup subprocess per poll
+  cycle instead of N (100 handles @ 5 s: 72 000 → 720 spawns/hour).
+  Spawn failures (missing qgroup binary on non-KUDPC clusters) are
+  cached too, so the squeue fallback no longer re-spawns a failing
+  binary per handle per poll. `squeue`/`sacct`/`sbatch`/`scancel` are
+  never cached; a manual `refresh()` can observe a listing at most one
+  poll cycle old (qgroup data is itself sampled ~30 s at the source).
+- **Shared batched `squeue` listing (refresh multiplexing, part 2).**
+  Handles of the same `SbatchManager` that fall through to the squeue
+  probe now share one batched `squeue -j id1,id2,… -o "%i %T %r"`
+  query per poll cycle (single-flight TTL cache, TTL =
+  `poll_interval`), instead of one single-id squeue subprocess per
+  handle. Built after live verification on KUDPC (2026-06-12) that a
+  multi-id `-j` list always exits 0 and returns rows for still-listed
+  ids only — even when some or all queried ids are already purged — so
+  the existing "absent row = left the queue" semantics carry over
+  unchanged. A cached listing is only replayed to requests whose ids
+  the batch actually queried (anything else would fabricate a vanish
+  signal); a new handle's first poll therefore costs one live re-batch
+  and joins the shared listing from the next cycle. Ids idle for
+  2 × `poll_interval` age out of the batch. Array-task probes
+  (`squeue -j <master>_<idx>`) and `sacct` are never batched or
+  cached.
+
+### Changed
+
+- **Structured subprocess capture (`CaptureOutput`).** The internal
+  `JobDispatcher::capture` API now returns
+  `CaptureOutput { exit_code, stdout, stderr }` instead of merging
+  stderr into stdout behind a `[stderr]` marker line. Query parsers read
+  `.stdout` only — the marker-misread bug class is structurally
+  impossible now — and error diagnostics use
+  `CaptureOutput::diagnostic()` (same merged text as before, so
+  user-facing error messages are unchanged). `runner::stdout_section`
+  is gone.
+- **`refresh()` now distinguishes transient SLURM failures from
+  vanished jobs.** A `squeue`/`sacct` non-zero exit with a stderr other
+  than `Invalid job id specified` (e.g. `Socket timed out` under
+  controller overload) propagates as an error instead of being recorded
+  as a false "left the queue" observation. `Invalid job id specified`
+  still counts as a vanish. **Behavior change**: Python `refresh()` /
+  `refresh_with_sacct()` can now raise `RuntimeError` on controller
+  hiccups — retry on the next poll.
+- **`wait_terminal` tolerates transient refresh failures.** Up to 5
+  consecutive refresh errors are logged (`tracing::warn!`) and polling
+  continues; the 5th consecutive failure propagates. A multi-hour wait
+  no longer dies on a single controller timeout.
+- **`log_lines` reads the file tail via backwards chunked seeks.**
+  Memory is now `O(n × line length)` instead of `O(file size)` — no
+  more whole-file loads (potential OOM) on multi-GB job logs.
+  `read_log_to_end` intentionally keeps whole-file semantics.
+- **State store hardening:** corrupted snapshot files are skipped with
+  a `tracing::warn!` instead of silently vanishing from `list()`;
+  `JobStateStore::delete(uuid)` added (idempotent) for garbage
+  collection; the on-disk envelope now carries `"schema_version": 1`
+  (files without the field load as v1; unsupported versions fail with a
+  clear message).
+
+### Fixed
+
+- **`refresh_with_sacct` no longer stamps a non-terminal `FinishedInfo`
+  after a false vanish.** A transient `squeue` failure under controller
+  overload (stderr `Socket timed out`, empty stdout) is indistinguishable
+  from a purge, so `left_active_listing` could flip to `true` while the
+  job was still running; the follow-up sacct query then returned a live
+  `RUNNING|…|0:0` row that slipped past the no-row sentinel and froze
+  `FinishedInfo { final_state: Running, exit_code: Some(0) }` behind the
+  idempotency short-circuit. Now only terminal states (or unrecognized
+  future tokens carrying an exit code) are stamped; a known non-terminal
+  row instead rolls back `left_active_listing`, records the live
+  observation, and normal polling resumes.
+- **`from slurm_async_runner import tssrun / sbatch / …` works.**
+  `__all__` advertised the extension submodules without binding them in
+  the package namespace, so every advertised name raised `ImportError`.
+  The submodules are now re-exported at the top level.
+- **PEP 561 `py.typed` marker added.** Downstream mypy/pyright previously
+  treated the whole package as untyped and ignored every `.pyi` stub.
+- **Stub fixes:** `SbatchCmd.build_argv` and `FinishedInfo.__repr__` were
+  missing from the handwritten `sbatch.pyi`; the PyPy trove classifier
+  (impossible for an abi3 CPython extension) and the hyphenated
+  `known-first-party` entry in `pyproject.toml` were corrected.
+
+- **sbatch monitoring correctness — stderr misread / sacct-lag freeze /
+  qgroup fallback.**
+  - **Array-task refresh no longer misreads merged stderr as a job
+    state.** `TokioDispatcher::capture` merges the child's stderr after a
+    `[stderr]` marker line; once an array master left squeue entirely
+    (`slurm_load_jobs error: Invalid job id specified` on stderr),
+    `parse_squeue_array_task` read the marker line itself as a state token
+    (`Unknown`), so `left_active_listing` never flipped, `wait_terminal`
+    polled forever, and `refresh_with_sacct` never resolved the exit code.
+    All `runner::query_*` helpers now strip the `[stderr]` section
+    (`runner::stdout_section`) before parsing.
+  - **`refresh_with_sacct` no longer freezes a fabricated `Unknown`
+    outcome when sacct has no row yet** (accounting flush lag, or history
+    purge). `lifecycle.finished` is left unset so a later call retries;
+    callers can detect the vanished-but-unresolved state via
+    `left_active_listing == True and not is_finished()`. **Behavior
+    change**: a single `refresh_with_sacct()` call immediately after the
+    job vanishes may now report `is_finished() == False` until SLURM
+    accounting catches up — poll again instead of assuming one call
+    finalizes (affects `scripts/test_sbatch_live.py`-style usage).
+  - **`refresh()` falls back to squeue when `qgroup` itself fails** (e.g.
+    the binary does not exist on non-KUDPC clusters). The error is logged
+    via `tracing::warn!` and treated as a qgroup miss instead of failing
+    the whole refresh.
+
+- **Code-review hardening (issue #15).**
+  - `PyTssrunJobHandle.wait_terminal` no longer holds the handle mutex
+    across the whole polling loop — the lock is taken per `refresh`
+    round-trip, so a concurrent `wait()` / `refresh()` on the same handle
+    is not serialized for the (potentially minutes-long) wait.
+  - `InMemoryStateStore` switched to an internal `std::sync::Mutex`;
+    `len()` / `is_empty()` can no longer panic under lock contention
+    (previously `try_lock().expect(...)`).
+  - `DynJobHandleCommon::snapshot_json` now returns
+    `anyhow::Result<serde_json::Value>` instead of panicking on
+    serialization failure (**breaking** for `dyn` facade callers).
+  - `resolve_log_path` gained an env-free substitution core
+    (`resolve_log_path_with`); its tests no longer mutate process env via
+    `unsafe { env::set_var }` (multi-threaded test-runner race).
+  - `TssrunManager::query_state` doc corrected: `squeue` with `sacct`
+    fallback, not sacct-only.
+  - Python: `JobHandleCommon.refresh` / `wait_terminal` annotated
+    `-> None`; `run_with_jobid_callback(on_spawn)` stub typed
+    `Callable[[int], object]`; `scripts/test_sbatch_live.py` cleans up its
+    `state_dir` on failure; the H1 snapshot-getter regression test is now
+    event-based instead of sleep-based; misc stub / test cleanups.
+
 ## [v1.1.0] - 2026-05-28
 
 ### Added
@@ -426,5 +568,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   substitutes the coreutils `true` / `false` / `echo` binaries through
   `SlurmCmd::new(...)`, plus a `MockDispatcher` for argv-plumbing assertions.
 
-[Unreleased]: https://github.com/kkiyama117/slurm-async-runner2/compare/v1.0.0...HEAD
-[v1.0.0]: https://github.com/kkiyama117/slurm-async-runner2/releases/tag/v1.0.0
+[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v2.0.0...HEAD
+[v2.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.1.0...v2.0.0
+[v1.1.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.0.0...v1.1.0
+[v1.0.0]: https://github.com/kkiyama117/slurm-async-runner/releases/tag/v1.0.0

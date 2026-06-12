@@ -8,6 +8,8 @@ pub mod error;
 pub mod handle;
 pub mod manager;
 pub mod parse;
+pub(crate) mod qgroup_cache;
+pub(crate) mod squeue_cache;
 pub mod store;
 
 #[cfg(test)]
@@ -18,7 +20,7 @@ pub(crate) mod test_util {
 
     use anyhow::Result;
 
-    use crate::dispatcher::JobDispatcher;
+    use crate::dispatcher::{CaptureOutput, JobDispatcher};
 
     /// Wraps an `Arc<D: JobDispatcher>` so the wrapper can be moved into
     /// `dispatcher::into_dyn` while the caller keeps the original `Arc`
@@ -34,7 +36,7 @@ pub(crate) mod test_util {
         async fn run(&self, argv: &[String]) -> Result<i32> {
             self.0.run(argv).await
         }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
             self.0.capture(argv).await
         }
     }

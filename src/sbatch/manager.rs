@@ -14,7 +14,14 @@ use crate::sbatch::handle::{
     LogPathSpec, SbatchAttachKey, SbatchJobHandle, SbatchJobSnapshot, SbatchLifecycle,
 };
 use crate::sbatch::parse::parse_submitted_jobid;
+use crate::sbatch::qgroup_cache::{QgroupCacheState, QgroupCachingDispatcher};
+use crate::sbatch::squeue_cache::{SqueueBatchingDispatcher, SqueueCacheState};
 use crate::store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
+
+/// Default polling cadence — also the TTL of the shared `qgroup -l`
+/// listing cache. See [`SbatchManager::with_poll_interval`] for the
+/// rationale behind 60 s.
+const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct SbatchManager {
@@ -23,6 +30,16 @@ pub struct SbatchManager {
     dispatcher: Arc<dyn DynJobDispatcher>,
     poll_interval: std::time::Duration,
     scancel_bin: String,
+    /// Shared `qgroup -l` listing cache (TTL = `poll_interval`), layered
+    /// into the dispatcher handed to every handle this manager creates so
+    /// N concurrently-polling handles spawn one qgroup subprocess per
+    /// poll cycle instead of N.
+    qgroup_cache: Arc<QgroupCacheState>,
+    /// Shared squeue summary-query batch cache (TTL = `poll_interval`),
+    /// the squeue-side counterpart of `qgroup_cache`: handles that fall
+    /// through to the squeue probe share one batched `-j id1,id2,…`
+    /// listing per poll cycle. See [`crate::sbatch::squeue_cache`].
+    squeue_cache: Arc<SqueueCacheState>,
 }
 
 impl SbatchManager {
@@ -31,9 +48,29 @@ impl SbatchManager {
             cmd,
             store: Arc::new(InMemoryStateStore::<SbatchJobSnapshot>::new()),
             dispatcher: into_dyn(TokioDispatcher),
-            poll_interval: std::time::Duration::from_secs(60),
+            poll_interval: DEFAULT_POLL_INTERVAL,
             scancel_bin: "scancel".to_string(),
+            qgroup_cache: Arc::new(QgroupCacheState::new(DEFAULT_POLL_INTERVAL)),
+            squeue_cache: Arc::new(SqueueCacheState::new(DEFAULT_POLL_INTERVAL)),
         }
+    }
+
+    /// Dispatcher handed to handles: `self.dispatcher` with the shared
+    /// `qgroup -l` TTL cache and the squeue batch cache layered in.
+    /// The two wrappers intercept disjoint argv shapes, so their order
+    /// is immaterial. Submission-side calls (`sbatch` in `spawn`,
+    /// `scancel` in `cancel`) keep using `self.dispatcher` directly —
+    /// they never issue either query, and the wrappers pass every other
+    /// argv through untouched anyway.
+    fn handle_dispatcher(&self) -> Arc<dyn DynJobDispatcher> {
+        let squeue_batched = into_dyn(SqueueBatchingDispatcher::new(
+            self.dispatcher.clone(),
+            self.squeue_cache.clone(),
+        ));
+        into_dyn(QgroupCachingDispatcher::new(
+            squeue_batched,
+            self.qgroup_cache.clone(),
+        ))
     }
 
     #[must_use = "with_state_dir returns a new SbatchManager; the receiver is unchanged"]
@@ -48,6 +85,11 @@ impl SbatchManager {
         self
     }
 
+    /// Deliberately leaves `qgroup_cache` / `squeue_cache` untouched: the
+    /// cache wrappers are (re)assembled around the *current* dispatcher at
+    /// each handle creation (`handle_dispatcher`), so calling this before
+    /// or after `with_poll_interval` works equally — the TTLs always come
+    /// from `with_poll_interval`, the inner dispatcher always from here.
     #[must_use = "with_dispatcher returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn DynJobDispatcher>) -> Self {
         self.dispatcher = dispatcher;
@@ -59,9 +101,17 @@ impl SbatchManager {
     /// SLURM's default 30 s task sampling interval (so two consecutive polls
     /// cannot land inside a single sampling window) and to keep KUDPC
     /// squeue load low. Tests typically use 1–10 ms.
+    ///
+    /// Also sets the TTL of the shared `qgroup -l` listing cache and of
+    /// the squeue batch cache to the same duration, so a manual
+    /// `refresh()` is never staler than one poll cycle. Call this
+    /// *before* `spawn`/`attach` — handles created earlier keep the
+    /// caches built from the previous interval.
     #[must_use = "with_poll_interval returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
+        self.qgroup_cache = Arc::new(QgroupCacheState::new(dur));
+        self.squeue_cache = Arc::new(SqueueCacheState::new(dur));
         self
     }
 
@@ -77,21 +127,22 @@ impl SbatchManager {
 
     pub async fn spawn(&self) -> Result<SbatchJobHandle, SbatchSpawnError> {
         let argv = self.cmd.build_argv()?;
-        let (exit_code, stdout) = self
+        let out = self
             .dispatcher
             .capture(&argv)
             .await
             .map_err(SbatchSpawnError::Other)?;
-        if exit_code != 0 {
+        if !out.success() {
             return Err(SbatchSpawnError::SubmitFailed {
-                exit_code,
-                output: stdout,
+                exit_code: out.exit_code,
+                output: out.diagnostic(),
             });
         }
-        let jobid =
-            parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
-                stdout: stdout.clone(),
-            })?;
+        let jobid = parse_submitted_jobid(&out.stdout).ok_or_else(|| {
+            SbatchSpawnError::JobidParseError {
+                stdout: out.stdout.clone(),
+            }
+        })?;
 
         let uuid = Uuid::now_v7();
         let script_path = std::path::absolute(&self.cmd.script)
@@ -121,7 +172,7 @@ impl SbatchManager {
         Ok(SbatchJobHandle::new(
             snapshot,
             self.store.clone(),
-            self.dispatcher.clone(),
+            self.handle_dispatcher(),
         ))
     }
 
@@ -155,21 +206,22 @@ impl SbatchManager {
         cmd.array_spec = Some(array_spec);
         let argv = cmd.build_argv()?;
 
-        let (exit_code, stdout) = self
+        let out = self
             .dispatcher
             .capture(&argv)
             .await
             .map_err(SbatchSpawnError::Other)?;
-        if exit_code != 0 {
+        if !out.success() {
             return Err(SbatchSpawnError::SubmitFailed {
-                exit_code,
-                output: stdout,
+                exit_code: out.exit_code,
+                output: out.diagnostic(),
             });
         }
-        let master_jobid =
-            parse_submitted_jobid(&stdout).ok_or_else(|| SbatchSpawnError::JobidParseError {
-                stdout: stdout.clone(),
-            })?;
+        let master_jobid = parse_submitted_jobid(&out.stdout).ok_or_else(|| {
+            SbatchSpawnError::JobidParseError {
+                stdout: out.stdout.clone(),
+            }
+        })?;
 
         let script_path = std::path::absolute(&cmd.script)
             .with_context(|| format!("absolutize {}", cmd.script.display()))
@@ -203,7 +255,7 @@ impl SbatchManager {
             handles.push(SbatchJobHandle::new(
                 snapshot,
                 self.store.clone(),
-                self.dispatcher.clone(),
+                self.handle_dispatcher(),
             ));
         }
         Ok(handles)
@@ -251,7 +303,7 @@ impl SbatchManager {
         Ok(SbatchJobHandle::new(
             snapshot,
             self.store.clone(),
-            self.dispatcher.clone(),
+            self.handle_dispatcher(),
         ))
     }
 
@@ -290,7 +342,7 @@ impl SbatchManager {
         filtered.sort_by_key(|s| s.array_task_id);
         Ok(filtered
             .into_iter()
-            .map(|snap| SbatchJobHandle::new(snap, self.store.clone(), self.dispatcher.clone()))
+            .map(|snap| SbatchJobHandle::new(snap, self.store.clone(), self.handle_dispatcher()))
             .collect())
     }
 
@@ -387,15 +439,15 @@ impl SbatchManager {
     /// fake-scancel script.
     pub async fn cancel(&self, jobid: u64) -> Result<(), SbatchCancelError> {
         let argv = vec![self.scancel_bin.clone(), jobid.to_string()];
-        let (exit_code, stdout) = self
+        let out = self
             .dispatcher
             .capture(&argv)
             .await
             .map_err(SbatchCancelError::Other)?;
-        if exit_code != 0 {
+        if !out.success() {
             return Err(SbatchCancelError::Scancel {
-                exit_code,
-                output: stdout,
+                exit_code: out.exit_code,
+                output: out.diagnostic(),
             });
         }
         Ok(())
@@ -405,8 +457,18 @@ impl SbatchManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatcher::{JobDispatcher, into_dyn};
+    use crate::dispatcher::{CaptureOutput, JobDispatcher, into_dyn};
     use std::sync::Mutex;
+
+    /// stdout-only [`CaptureOutput`] with the given exit code — the
+    /// common shape for canned test responses.
+    fn cap(exit_code: i32, stdout: &str) -> CaptureOutput {
+        CaptureOutput {
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
 
     struct CannedSbatch {
         stdout: Mutex<String>,
@@ -436,10 +498,10 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             unimplemented!()
         }
-        async fn capture(&self, _argv: &[String]) -> Result<(i32, String)> {
-            Ok((
+        async fn capture(&self, _argv: &[String]) -> Result<CaptureOutput> {
+            Ok(cap(
                 *self.exit.lock().unwrap(),
-                self.stdout.lock().unwrap().clone(),
+                &self.stdout.lock().unwrap(),
             ))
         }
     }
@@ -705,15 +767,15 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             unimplemented!()
         }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
             self.seen.lock().unwrap().push(argv.to_vec());
-            let resp = self
+            let (exit_code, stdout) = self
                 .responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or((0, String::new()));
-            Ok(resp)
+            Ok(cap(exit_code, &stdout))
         }
     }
 
@@ -817,18 +879,18 @@ mod tests {
         async fn run(&self, _argv: &[String]) -> Result<i32> {
             unimplemented!()
         }
-        async fn capture(&self, argv: &[String]) -> Result<(i32, String)> {
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
             let out = match argv[0].as_str() {
                 "sbatch" => {
                     let (e, s) = self.sbatch.lock().unwrap().clone();
-                    return Ok((e, s));
+                    return Ok(cap(e, &s));
                 }
                 "qgroup" => self.qgroup.lock().unwrap().clone(),
                 "squeue" => self.squeue.lock().unwrap().clone(),
                 "sacct" => self.sacct.lock().unwrap().clone(),
                 _ => String::new(),
             };
-            Ok((0, out))
+            Ok(cap(0, &out))
         }
     }
 
@@ -928,6 +990,182 @@ mod tests {
             !*fired.lock().unwrap(),
             "callback must NOT fire when array rejection short-circuits before spawn"
         );
+    }
+
+    /// Routes by argv[0]: `sbatch` hands out incrementing jobids,
+    /// `qgroup` returns a listing with every issued jobid as RUN and
+    /// counts its invocations. Everything else returns empty success.
+    struct SharedPollDispatcher {
+        next_jobid: std::sync::atomic::AtomicU64,
+        issued: Mutex<Vec<u64>>,
+        qgroup_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SharedPollDispatcher {
+        fn new(first_jobid: u64) -> Self {
+            Self {
+                next_jobid: std::sync::atomic::AtomicU64::new(first_jobid),
+                issued: Mutex::new(Vec::new()),
+                qgroup_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl JobDispatcher for SharedPollDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
+            use std::sync::atomic::Ordering;
+            match argv[0].as_str() {
+                "sbatch" => {
+                    let jobid = self.next_jobid.fetch_add(1, Ordering::SeqCst);
+                    self.issued.lock().unwrap().push(jobid);
+                    Ok(cap(0, &format!("Submitted batch job {jobid}\n")))
+                }
+                "qgroup" => {
+                    self.qgroup_calls.fetch_add(1, Ordering::SeqCst);
+                    let rows: String = self
+                        .issued
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|j| format!("queue user {j} RUN 1 1 1M 00:00:01\n"))
+                        .collect();
+                    Ok(cap(0, &rows))
+                }
+                _ => Ok(cap(0, "")),
+            }
+        }
+    }
+
+    /// The qgroup -l listing is global, so handles spawned by the same
+    /// manager must share one subprocess per poll cycle instead of each
+    /// spawning their own (the refresh-multiplexing review item).
+    #[tokio::test]
+    async fn handles_from_same_manager_share_one_qgroup_listing_within_ttl() {
+        let recorder = std::sync::Arc::new(SharedPollDispatcher::new(101));
+        let mgr = SbatchManager::new(SbatchCmd::new("/w/job.sh"))
+            .with_dispatcher(into_dyn(ArcDispatcher(recorder.clone())));
+        // Default poll_interval (60 s) == cache TTL — both refreshes land
+        // well inside it.
+        let h1 = mgr.spawn().await.unwrap();
+        let h2 = mgr.spawn().await.unwrap();
+
+        let s1 = h1.refresh().await.unwrap();
+        let s2 = h2.refresh().await.unwrap();
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            recorder.qgroup_calls.load(Ordering::SeqCst),
+            1,
+            "two handles refreshing within poll_interval must share one qgroup -l spawn"
+        );
+        assert_eq!(
+            s1.lifecycle.last_observed_state.as_ref().map(|s| s.state),
+            Some(crate::JobState::Running),
+        );
+        assert_eq!(
+            s2.lifecycle.last_observed_state.as_ref().map(|s| s.state),
+            Some(crate::JobState::Running),
+            "the cached listing must still resolve the second handle's own jobid"
+        );
+    }
+
+    /// TTL is wired to `with_poll_interval`: a zero interval means every
+    /// refresh does a live qgroup query (cache effectively off).
+    #[tokio::test]
+    async fn poll_interval_zero_makes_every_refresh_query_qgroup_live() {
+        let recorder = std::sync::Arc::new(SharedPollDispatcher::new(201));
+        let mgr = SbatchManager::new(SbatchCmd::new("/w/job.sh"))
+            .with_dispatcher(into_dyn(ArcDispatcher(recorder.clone())))
+            .with_poll_interval(std::time::Duration::ZERO);
+        let h = mgr.spawn().await.unwrap();
+
+        h.refresh().await.unwrap();
+        h.refresh().await.unwrap();
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            recorder.qgroup_calls.load(Ordering::SeqCst),
+            2,
+            "TTL must follow poll_interval; zero interval disables caching"
+        );
+    }
+
+    /// Routes by argv[0]: `sbatch` hands out incrementing jobids,
+    /// `qgroup` returns an empty listing (forcing every handle onto the
+    /// squeue fallback), `squeue` echoes a RUNNING row per requested
+    /// `-j` id and counts its invocations.
+    struct SqueueFallbackDispatcher {
+        next_jobid: std::sync::atomic::AtomicU64,
+        squeue_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SqueueFallbackDispatcher {
+        fn new(first_jobid: u64) -> Self {
+            Self {
+                next_jobid: std::sync::atomic::AtomicU64::new(first_jobid),
+                squeue_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl JobDispatcher for SqueueFallbackDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
+            use std::sync::atomic::Ordering;
+            match argv[0].as_str() {
+                "sbatch" => {
+                    let jobid = self.next_jobid.fetch_add(1, Ordering::SeqCst);
+                    Ok(cap(0, &format!("Submitted batch job {jobid}\n")))
+                }
+                "squeue" => {
+                    self.squeue_calls.fetch_add(1, Ordering::SeqCst);
+                    let rows: String = argv[3]
+                        .split(',')
+                        .map(|id| format!("{id} RUNNING None\n"))
+                        .collect();
+                    Ok(cap(0, &rows))
+                }
+                _ => Ok(cap(0, "")),
+            }
+        }
+    }
+
+    /// Squeue-side refresh multiplexing: handles that fall through to
+    /// the squeue probe must converge onto one shared batched `-j`
+    /// query per poll cycle. The second handle's first poll forces one
+    /// live re-batch (its id was not in the first listing — replaying
+    /// it would fabricate a vanish), after which both replay.
+    #[tokio::test]
+    async fn handles_falling_back_to_squeue_share_one_batched_query_within_ttl() {
+        let recorder = std::sync::Arc::new(SqueueFallbackDispatcher::new(301));
+        let mgr = SbatchManager::new(SbatchCmd::new("/w/job.sh"))
+            .with_dispatcher(into_dyn(ArcDispatcher(recorder.clone())));
+        let h1 = mgr.spawn().await.unwrap();
+        let h2 = mgr.spawn().await.unwrap();
+
+        h1.refresh().await.unwrap();
+        h2.refresh().await.unwrap();
+        let s1 = h1.refresh().await.unwrap();
+        let s2 = h2.refresh().await.unwrap();
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            recorder.squeue_calls.load(Ordering::SeqCst),
+            2,
+            "4 refreshes across 2 handles must cost 1 warm-up query + 1 re-batch, then replay"
+        );
+        for (snap, jobid) in [(&s1, 301), (&s2, 302)] {
+            assert_eq!(
+                snap.lifecycle.last_observed_state.as_ref().map(|s| s.state),
+                Some(crate::JobState::Running),
+                "jobid {jobid} must resolve from the shared listing"
+            );
+            assert!(
+                !snap.lifecycle.left_active_listing,
+                "jobid {jobid} must not be misread as vanished from the batched listing"
+            );
+        }
     }
 
     #[tokio::test]

@@ -3,9 +3,10 @@
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum SbatchSpawnError {
-    /// `output` is the captured combined stdout/stderr from the
-    /// `sbatch` invocation. The dispatcher `capture` API merges both
-    /// streams, so this field can contain stderr lines as well.
+    /// `output` carries `CaptureOutput::diagnostic()` text from the
+    /// `sbatch` invocation — the human-readable merged form
+    /// (`"{stdout}\n[stderr]\n{stderr}"`), so this field can contain
+    /// stderr lines as well.
     #[error("sbatch invocation failed (exit={exit_code}): {output}")]
     SubmitFailed { exit_code: i32, output: String },
 
@@ -82,9 +83,10 @@ pub enum SbatchRunError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum SbatchCancelError {
-    /// `output` is the captured combined stdout/stderr from the
-    /// `scancel` invocation. The dispatcher `capture` API merges both
-    /// streams, so this field can contain stderr lines as well.
+    /// `output` carries `CaptureOutput::diagnostic()` text from the
+    /// `scancel` invocation — the human-readable merged form
+    /// (`"{stdout}\n[stderr]\n{stderr}"`), so this field can contain
+    /// stderr lines as well.
     #[error("scancel failed (exit={exit_code}): {output}")]
     Scancel { exit_code: i32, output: String },
 
