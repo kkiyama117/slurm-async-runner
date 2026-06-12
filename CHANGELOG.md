@@ -19,8 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary per handle per poll. `squeue`/`sacct`/`sbatch`/`scancel` are
   never cached; a manual `refresh()` can observe a listing at most one
   poll cycle old (qgroup data is itself sampled ~30 s at the source).
-  Batched `squeue -j id1,id2,…` coalescing remains deferred until the
-  mixed live/purged jobid behaviour is verified on KUDPC.
+- **Shared batched `squeue` listing (refresh multiplexing, part 2).**
+  Handles of the same `SbatchManager` that fall through to the squeue
+  probe now share one batched `squeue -j id1,id2,… -o "%i %T %r"`
+  query per poll cycle (single-flight TTL cache, TTL =
+  `poll_interval`), instead of one single-id squeue subprocess per
+  handle. Built after live verification on KUDPC (2026-06-12) that a
+  multi-id `-j` list always exits 0 and returns rows for still-listed
+  ids only — even when some or all queried ids are already purged — so
+  the existing "absent row = left the queue" semantics carry over
+  unchanged. A cached listing is only replayed to requests whose ids
+  the batch actually queried (anything else would fabricate a vanish
+  signal); a new handle's first poll therefore costs one live re-batch
+  and joins the shared listing from the next cycle. Ids idle for
+  2 × `poll_interval` age out of the batch. Array-task probes
+  (`squeue -j <master>_<idx>`) and `sacct` are never batched or
+  cached.
 
 ### Changed
 

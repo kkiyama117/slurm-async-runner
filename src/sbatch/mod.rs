@@ -9,6 +9,7 @@ pub mod handle;
 pub mod manager;
 pub mod parse;
 pub(crate) mod qgroup_cache;
+pub(crate) mod squeue_cache;
 pub mod store;
 
 #[cfg(test)]

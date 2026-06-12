@@ -92,6 +92,11 @@ pyo3-stub-gen = { git = "https://github.com/Jij-Inc/pyo3-stub-gen", branch = "ma
 [dev-dependencies]
 # TOML round-trip used by `entities::slurm::status` and `array_spec` test modules.
 toml = "1.1.2"
+# Paused-clock tests (`#[tokio::test(start_paused = true)]` +
+# `tokio::time::advance`) in `sbatch::squeue_cache`. Cargo feature-unifies
+# this with the main [dependencies] tokio entry for test builds only —
+# release/wheel builds never link `test-util`.
+tokio = { version = "1.0", features = ["test-util"] }
 
 [features]
 default = ["pyo3", "stub_gen"]

@@ -9,10 +9,9 @@
 //! without touching the refresh logic itself.
 //!
 //! Scope is deliberately limited to the exact `qgroup -l` argv:
-//! - `squeue` stays uncached because batching/coalescing `-j` queries
-//!   changes vanish-detection semantics (`Invalid job id specified` fires
-//!   only when *every* queried id is gone) and KUDPC's behaviour for
-//!   mixed live/purged id lists is unverified on the real cluster.
+//! - `squeue` summary queries are handled by their own batching cache
+//!   one layer below (see [`crate::sbatch::squeue_cache`], added after
+//!   the mixed live/purged `-j` list behaviour was verified on KUDPC).
 //! - `sbatch` / `scancel` / `sacct` are mutating or heavyweight opt-in
 //!   calls where replaying a stale result would be wrong.
 //!

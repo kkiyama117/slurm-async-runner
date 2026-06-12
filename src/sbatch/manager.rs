@@ -15,6 +15,7 @@ use crate::sbatch::handle::{
 };
 use crate::sbatch::parse::parse_submitted_jobid;
 use crate::sbatch::qgroup_cache::{QgroupCacheState, QgroupCachingDispatcher};
+use crate::sbatch::squeue_cache::{SqueueBatchingDispatcher, SqueueCacheState};
 use crate::store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
 
 /// Default polling cadence — also the TTL of the shared `qgroup -l`
@@ -34,6 +35,11 @@ pub struct SbatchManager {
     /// N concurrently-polling handles spawn one qgroup subprocess per
     /// poll cycle instead of N.
     qgroup_cache: Arc<QgroupCacheState>,
+    /// Shared squeue summary-query batch cache (TTL = `poll_interval`),
+    /// the squeue-side counterpart of `qgroup_cache`: handles that fall
+    /// through to the squeue probe share one batched `-j id1,id2,…`
+    /// listing per poll cycle. See [`crate::sbatch::squeue_cache`].
+    squeue_cache: Arc<SqueueCacheState>,
 }
 
 impl SbatchManager {
@@ -45,17 +51,24 @@ impl SbatchManager {
             poll_interval: DEFAULT_POLL_INTERVAL,
             scancel_bin: "scancel".to_string(),
             qgroup_cache: Arc::new(QgroupCacheState::new(DEFAULT_POLL_INTERVAL)),
+            squeue_cache: Arc::new(SqueueCacheState::new(DEFAULT_POLL_INTERVAL)),
         }
     }
 
     /// Dispatcher handed to handles: `self.dispatcher` with the shared
-    /// `qgroup -l` TTL cache layered in. Submission-side calls (`sbatch`
-    /// in `spawn`, `scancel` in `cancel`) keep using `self.dispatcher`
-    /// directly — they never issue `qgroup -l`, and the wrapper passes
-    /// every other argv through untouched anyway.
+    /// `qgroup -l` TTL cache and the squeue batch cache layered in.
+    /// The two wrappers intercept disjoint argv shapes, so their order
+    /// is immaterial. Submission-side calls (`sbatch` in `spawn`,
+    /// `scancel` in `cancel`) keep using `self.dispatcher` directly —
+    /// they never issue either query, and the wrappers pass every other
+    /// argv through untouched anyway.
     fn handle_dispatcher(&self) -> Arc<dyn DynJobDispatcher> {
-        into_dyn(QgroupCachingDispatcher::new(
+        let squeue_batched = into_dyn(SqueueBatchingDispatcher::new(
             self.dispatcher.clone(),
+            self.squeue_cache.clone(),
+        ));
+        into_dyn(QgroupCachingDispatcher::new(
+            squeue_batched,
             self.qgroup_cache.clone(),
         ))
     }
@@ -72,11 +85,11 @@ impl SbatchManager {
         self
     }
 
-    /// Deliberately leaves `qgroup_cache` untouched: the cache wrapper is
-    /// (re)assembled around the *current* dispatcher at each handle
-    /// creation (`handle_dispatcher`), so calling this before or after
-    /// `with_poll_interval` works equally — the TTL always comes from
-    /// `with_poll_interval`, the inner dispatcher always from here.
+    /// Deliberately leaves `qgroup_cache` / `squeue_cache` untouched: the
+    /// cache wrappers are (re)assembled around the *current* dispatcher at
+    /// each handle creation (`handle_dispatcher`), so calling this before
+    /// or after `with_poll_interval` works equally — the TTLs always come
+    /// from `with_poll_interval`, the inner dispatcher always from here.
     #[must_use = "with_dispatcher returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn DynJobDispatcher>) -> Self {
         self.dispatcher = dispatcher;
@@ -89,14 +102,16 @@ impl SbatchManager {
     /// cannot land inside a single sampling window) and to keep KUDPC
     /// squeue load low. Tests typically use 1–10 ms.
     ///
-    /// Also sets the TTL of the shared `qgroup -l` listing cache to the
-    /// same duration, so a manual `refresh()` is never staler than one
-    /// poll cycle. Call this *before* `spawn`/`attach` — handles created
-    /// earlier keep the cache built from the previous interval.
+    /// Also sets the TTL of the shared `qgroup -l` listing cache and of
+    /// the squeue batch cache to the same duration, so a manual
+    /// `refresh()` is never staler than one poll cycle. Call this
+    /// *before* `spawn`/`attach` — handles created earlier keep the
+    /// caches built from the previous interval.
     #[must_use = "with_poll_interval returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
         self.qgroup_cache = Arc::new(QgroupCacheState::new(dur));
+        self.squeue_cache = Arc::new(SqueueCacheState::new(dur));
         self
     }
 
@@ -1074,6 +1089,83 @@ mod tests {
             2,
             "TTL must follow poll_interval; zero interval disables caching"
         );
+    }
+
+    /// Routes by argv[0]: `sbatch` hands out incrementing jobids,
+    /// `qgroup` returns an empty listing (forcing every handle onto the
+    /// squeue fallback), `squeue` echoes a RUNNING row per requested
+    /// `-j` id and counts its invocations.
+    struct SqueueFallbackDispatcher {
+        next_jobid: std::sync::atomic::AtomicU64,
+        squeue_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SqueueFallbackDispatcher {
+        fn new(first_jobid: u64) -> Self {
+            Self {
+                next_jobid: std::sync::atomic::AtomicU64::new(first_jobid),
+                squeue_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl JobDispatcher for SqueueFallbackDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
+            use std::sync::atomic::Ordering;
+            match argv[0].as_str() {
+                "sbatch" => {
+                    let jobid = self.next_jobid.fetch_add(1, Ordering::SeqCst);
+                    Ok(cap(0, &format!("Submitted batch job {jobid}\n")))
+                }
+                "squeue" => {
+                    self.squeue_calls.fetch_add(1, Ordering::SeqCst);
+                    let rows: String = argv[3]
+                        .split(',')
+                        .map(|id| format!("{id} RUNNING None\n"))
+                        .collect();
+                    Ok(cap(0, &rows))
+                }
+                _ => Ok(cap(0, "")),
+            }
+        }
+    }
+
+    /// Squeue-side refresh multiplexing: handles that fall through to
+    /// the squeue probe must converge onto one shared batched `-j`
+    /// query per poll cycle. The second handle's first poll forces one
+    /// live re-batch (its id was not in the first listing — replaying
+    /// it would fabricate a vanish), after which both replay.
+    #[tokio::test]
+    async fn handles_falling_back_to_squeue_share_one_batched_query_within_ttl() {
+        let recorder = std::sync::Arc::new(SqueueFallbackDispatcher::new(301));
+        let mgr = SbatchManager::new(SbatchCmd::new("/w/job.sh"))
+            .with_dispatcher(into_dyn(ArcDispatcher(recorder.clone())));
+        let h1 = mgr.spawn().await.unwrap();
+        let h2 = mgr.spawn().await.unwrap();
+
+        h1.refresh().await.unwrap();
+        h2.refresh().await.unwrap();
+        let s1 = h1.refresh().await.unwrap();
+        let s2 = h2.refresh().await.unwrap();
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            recorder.squeue_calls.load(Ordering::SeqCst),
+            2,
+            "4 refreshes across 2 handles must cost 1 warm-up query + 1 re-batch, then replay"
+        );
+        for (snap, jobid) in [(&s1, 301), (&s2, 302)] {
+            assert_eq!(
+                snap.lifecycle.last_observed_state.as_ref().map(|s| s.state),
+                Some(crate::JobState::Running),
+                "jobid {jobid} must resolve from the shared listing"
+            );
+            assert!(
+                !snap.lifecycle.left_active_listing,
+                "jobid {jobid} must not be misread as vanished from the batched listing"
+            );
+        }
     }
 
     #[tokio::test]
