@@ -633,6 +633,55 @@ async fn query_array_task_state_returns_none_when_squeue_reports_no_row() {
     assert!(r.is_none());
 }
 
+// ---- summary-argv shape pinning ----
+//
+// All three bulk query functions must build the exact batchable summary
+// shape the squeue cache recognizes (`-r` included) — any drift silently
+// bypasses the cache (shape-sync invariant, docs/architecture.md §6).
+// MockCapture asserts the full argv byte-for-byte.
+
+fn pinned_summary_argv(csv: &str) -> Vec<String> {
+    vec![
+        "squeue".into(),
+        "-h".into(),
+        "-r".into(),
+        "-j".into(),
+        csv.into(),
+        "-o".into(),
+        "%i %T %r".into(),
+    ]
+}
+
+#[tokio::test]
+async fn query_job_states_batch_builds_the_batchable_summary_argv() {
+    let mock = MockCapture::ok(pinned_summary_argv("100"), "100 RUNNING None\n");
+    let map = super::query_job_states_batch_with(&mock, &[100])
+        .await
+        .unwrap();
+    assert_eq!(map.get(&100).map(|s| s.state), Some(JobState::Running));
+}
+
+#[tokio::test]
+async fn query_job_states_with_exit_code_builds_the_batchable_summary_argv() {
+    let mock = MockCapture::ok(pinned_summary_argv("100"), "100 RUNNING None\n");
+    let map = super::query_job_states_with_exit_code_with(&mock, &[100])
+        .await
+        .unwrap();
+    assert_eq!(
+        map.get(&100).map(|o| o.status.state),
+        Some(JobState::Running)
+    );
+}
+
+#[tokio::test]
+async fn query_job_states_squeue_only_builds_the_batchable_summary_argv() {
+    let mock = MockCapture::ok(pinned_summary_argv("100"), "100 RUNNING None\n");
+    let map = super::query_job_states_squeue_only_with(&mock, &[100])
+        .await
+        .unwrap();
+    assert_eq!(map.get(&100).map(|s| s.state), Some(JobState::Running));
+}
+
 // ---- failure classification (vanish vs. transient) ----
 
 /// Mock that always returns the same canned [`CaptureOutput`]

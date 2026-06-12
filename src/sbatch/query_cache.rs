@@ -85,12 +85,14 @@ impl JobKey {
 
     /// Join a batch back into the comma-separated `-j` value.
     pub(crate) fn build_csv(batch: &[JobKey]) -> String {
+        use std::fmt::Write as _;
         let mut out = String::with_capacity(batch.len() * 8);
         for (i, key) in batch.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&key.to_string());
+            // Infallible: `fmt::Write` for `String` never errors.
+            let _ = write!(out, "{key}");
         }
         out
     }

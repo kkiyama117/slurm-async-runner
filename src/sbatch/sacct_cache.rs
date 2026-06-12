@@ -240,6 +240,27 @@ mod tests {
         );
     }
 
+    /// Subset-replay, array edition: a listing that never asked about an
+    /// array key must not be replayed to it — the absent parent row would
+    /// fabricate "no usable accounting row" for that task. The unseen
+    /// array key must force a live re-batch.
+    #[tokio::test]
+    async fn cached_listing_never_replays_to_an_unqueried_array_key() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = batching(argvs.clone(), Duration::from_secs(60));
+
+        d.capture(&exit_code_argv("100")).await.unwrap();
+        let out = d.capture(&exit_code_argv("200_7")).await.unwrap();
+
+        assert_eq!(
+            calls(&argvs),
+            2,
+            "an unqueried array key must go live, never read the cached listing"
+        );
+        assert_eq!(jlist(&argvs, 1), "100,200_7");
+        assert!(out.stdout.contains("200_7|COMPLETED"));
+    }
+
     /// The legacy 3-column listing must pass through untouched — see the
     /// module doc for why it is excluded.
     #[tokio::test]
