@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v3.1.0] - 2026-06-12
+
+Minor release: array-task status queries join the shared batch caches,
+and array sacct finalizers are collapsed onto one master-keyed slurmdbd
+query per cache window — both aimed at further reducing SLURM status
+command load (sacct above all), continuing the v3.0.0 multiplexing
+work. No breaking changes.
+
 ### Changed
 
 - **Array-task sacct finalizers are keyed by the master jobid.**
@@ -665,7 +673,8 @@ queries). See **Changed** for the breaking items.
   substitutes the coreutils `true` / `false` / `echo` binaries through
   `SlurmCmd::new(...)`, plus a `MockDispatcher` for argv-plumbing assertions.
 
-[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/kkiyama117/slurm-async-runner/compare/v3.1.0...HEAD
+[v3.1.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v3.0.0...v3.1.0
 [v3.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v2.0.0...v3.0.0
 [v2.0.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.1.0...v2.0.0
 [v1.1.0]: https://github.com/kkiyama117/slurm-async-runner/compare/v1.0.0...v1.1.0
