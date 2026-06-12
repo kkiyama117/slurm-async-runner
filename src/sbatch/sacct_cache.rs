@@ -29,13 +29,16 @@
 //!
 //! Scope covers the exit-code query shape
 //! `sacct -P -n -j <key[,key…]> -o JobID,State,Reason,ExitCode` issued by
-//! `refresh_with_sacct()` — the burst source described above. Keys are
-//! plain jobids **and** array tasks (`<master>_<idx>`): KUDPC live
-//! verification (2026-06-12, jobids 7815400/7815401) confirmed sacct
-//! accepts both kinds mixed in one `-j` list and answers with per-task
-//! parent rows whose JobID column is exactly the queried key, which the
-//! keyed array-task parser (`parse_sacct_array_task_with_exit_code`)
-//! requires. Passed through untouched:
+//! `refresh_with_sacct()` — the burst source described above. Array-task
+//! finalizers arrive keyed by their **master** jobid (sacct expands a
+//! master-keyed query into per-task parent rows — KUDPC live-verified
+//! 2026-06-12, jobid 7815414), so all N tasks of one array share a single
+//! cache key: one slurmdbd query per TTL window serves the whole array,
+//! even when tasks finish in different poll cycles. The shape still
+//! accepts explicit `<master>_<idx>` keys (KUDPC-verified mixed `-j`
+//! lists, jobids 7815400/7815401) as defense in depth and for symmetry
+//! with the squeue shape, where per-task keys remain the live form.
+//! Passed through untouched:
 //! - the legacy 3-column listing (`-o JobID,State,Reason`) used by the
 //!   one-shot `query_job_states_batch` API: not a polling path, and its
 //!   output shape differs from the cached one
@@ -212,10 +215,44 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// Array-task finalizers share the batch with plain finalizers:
+    /// The load win that motivated keying array finalizers by their
+    /// master jobid: tasks of one array finishing in *different* poll
+    /// cycles still issue the identical master-keyed query, so every
+    /// finalizer after the first replays the cached listing — one sacct
+    /// spawn per TTL window for the whole array. Per-task keys would
+    /// pay a fresh live re-batch for each newly-finishing task.
+    ///
+    /// This test pins the cache-hit behaviour only; that each task then
+    /// extracts its *own* row from the shared listing is the parser's
+    /// job, pinned by `runner::tests::
+    /// query_array_task_outcome_extracts_own_row_from_master_expansion`.
+    #[tokio::test]
+    async fn staggered_array_finalizers_share_one_master_keyed_spawn() {
+        let argvs = Arc::new(Mutex::new(Vec::new()));
+        let d = batching(argvs.clone(), Duration::from_secs(60));
+
+        // Task 0 finishes first; its finalizer queries the master key.
+        d.capture(&exit_code_argv("12345")).await.unwrap();
+        // Tasks 1 and 2 finish in later poll cycles within the TTL —
+        // identical argv, so both replay the shared listing.
+        d.capture(&exit_code_argv("12345")).await.unwrap();
+        d.capture(&exit_code_argv("12345")).await.unwrap();
+
+        assert_eq!(
+            calls(&argvs),
+            1,
+            "all task finalizers of one array must share one sacct spawn"
+        );
+        assert_eq!(jlist(&argvs, 0), "12345");
+    }
+
+    /// Explicit `<master>_<idx>` keys still enter the shared batch:
     /// KUDPC-verified (2026-06-12) that sacct accepts the mixed `-j`
     /// list and answers per-task parent rows the keyed array parser can
-    /// match on.
+    /// match on. The runner's array finalizer no longer emits this form
+    /// (it keys by the master — see
+    /// `crate::runner::query_array_task_outcome_with`), but the shape
+    /// keeps accepting it as defense in depth.
     #[tokio::test]
     async fn array_task_finalizers_join_the_shared_batch() {
         let argvs = Arc::new(Mutex::new(Vec::new()));

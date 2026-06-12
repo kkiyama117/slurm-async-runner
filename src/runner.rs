@@ -498,22 +498,34 @@ pub async fn query_array_task_state_with<D: JobDispatcher>(
     Ok(parse_squeue_array_task(&out.stdout, &key))
 }
 
-/// Per-task heavyweight finalizer. Issues `sacct -P -n -j <master>_<idx>`
-/// and returns a [`JobOutcome`] (status + exit code). Caller is expected
+/// Per-task heavyweight finalizer. Issues `sacct -P -n -j <master>`
+/// (the **master** jobid, not the task key) and extracts the queried
+/// task's parent row from the expanded listing. Caller is expected
 /// to have already verified via [`query_array_task_state_with`] that
 /// the task has vanished from the active queue; this function does not
 /// short-circuit on a still-active task.
 ///
 /// Returns `None` if sacct reports no parent row for the task (purged
-/// from history, never made it past the controller, …). Step rows
-/// (`<master>_<idx>.batch`, `<master>_<idx>.0`) are filtered out — only
-/// the parent row contributes to the returned outcome.
+/// from history, accounting flush lag, never made it past the
+/// controller, …). Step rows (`<master>_<idx>.batch`,
+/// `<master>_<idx>.0`) are filtered out — only the parent row
+/// contributes to the returned outcome.
+///
+/// Keying the query by the master jobid is a deliberate load
+/// optimization: sacct expands a master-keyed query into per-task
+/// parent rows whose JobID column is exactly `<master>_<idx>` (KUDPC
+/// live-verified 2026-06-12, jobid 7815414), so every task finalizer
+/// of one array issues the *identical* argv and shares one sacct
+/// batch-cache key. One slurmdbd query per TTL window serves the whole
+/// array — even when tasks finish in different poll cycles, which
+/// per-task keys would each pay a fresh sacct spawn for. sacct is the
+/// heaviest of the status commands (see
+/// [`crate::sbatch::sacct_cache`]); keep the master key if this argv
+/// is ever reworked.
 ///
 /// The argv is the same batchable exit-code shape the plain-job
-/// finalizer uses, so array finalizers of one manager share the sacct
-/// batch cache with plain handles (KUDPC live-verified 2026-06-12 that
-/// sacct accepts mixed plain/array `-j` lists and answers per-task
-/// parent rows).
+/// finalizer uses, so array finalizers also batch with plain handles
+/// in one `-j` list.
 ///
 /// See spec §5.5 (sbatch Phase 2 design) and issue #8 A5.
 pub async fn query_array_task_outcome_with<D: JobDispatcher>(
@@ -527,7 +539,7 @@ pub async fn query_array_task_outcome_with<D: JobDispatcher>(
         "-P".to_string(),
         "-n".to_string(),
         "-j".to_string(),
-        key.clone(),
+        master_jobid.to_string(),
         "-o".to_string(),
         "JobID,State,Reason,ExitCode".to_string(),
     ];
