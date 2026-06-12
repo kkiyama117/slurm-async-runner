@@ -14,7 +14,13 @@ use crate::sbatch::handle::{
     LogPathSpec, SbatchAttachKey, SbatchJobHandle, SbatchJobSnapshot, SbatchLifecycle,
 };
 use crate::sbatch::parse::parse_submitted_jobid;
+use crate::sbatch::qgroup_cache::{QgroupCacheState, QgroupCachingDispatcher};
 use crate::store::{FileSystemStateStore, InMemoryStateStore, JobSnapshot, JobStateStore};
+
+/// Default polling cadence — also the TTL of the shared `qgroup -l`
+/// listing cache. See [`SbatchManager::with_poll_interval`] for the
+/// rationale behind 60 s.
+const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct SbatchManager {
@@ -23,6 +29,11 @@ pub struct SbatchManager {
     dispatcher: Arc<dyn DynJobDispatcher>,
     poll_interval: std::time::Duration,
     scancel_bin: String,
+    /// Shared `qgroup -l` listing cache (TTL = `poll_interval`), layered
+    /// into the dispatcher handed to every handle this manager creates so
+    /// N concurrently-polling handles spawn one qgroup subprocess per
+    /// poll cycle instead of N.
+    qgroup_cache: Arc<QgroupCacheState>,
 }
 
 impl SbatchManager {
@@ -31,9 +42,22 @@ impl SbatchManager {
             cmd,
             store: Arc::new(InMemoryStateStore::<SbatchJobSnapshot>::new()),
             dispatcher: into_dyn(TokioDispatcher),
-            poll_interval: std::time::Duration::from_secs(60),
+            poll_interval: DEFAULT_POLL_INTERVAL,
             scancel_bin: "scancel".to_string(),
+            qgroup_cache: Arc::new(QgroupCacheState::new(DEFAULT_POLL_INTERVAL)),
         }
+    }
+
+    /// Dispatcher handed to handles: `self.dispatcher` with the shared
+    /// `qgroup -l` TTL cache layered in. Submission-side calls (`sbatch`
+    /// in `spawn`, `scancel` in `cancel`) keep using `self.dispatcher`
+    /// directly — they never issue `qgroup -l`, and the wrapper passes
+    /// every other argv through untouched anyway.
+    fn handle_dispatcher(&self) -> Arc<dyn DynJobDispatcher> {
+        into_dyn(QgroupCachingDispatcher::new(
+            self.dispatcher.clone(),
+            self.qgroup_cache.clone(),
+        ))
     }
 
     #[must_use = "with_state_dir returns a new SbatchManager; the receiver is unchanged"]
@@ -48,6 +72,11 @@ impl SbatchManager {
         self
     }
 
+    /// Deliberately leaves `qgroup_cache` untouched: the cache wrapper is
+    /// (re)assembled around the *current* dispatcher at each handle
+    /// creation (`handle_dispatcher`), so calling this before or after
+    /// `with_poll_interval` works equally — the TTL always comes from
+    /// `with_poll_interval`, the inner dispatcher always from here.
     #[must_use = "with_dispatcher returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn DynJobDispatcher>) -> Self {
         self.dispatcher = dispatcher;
@@ -59,9 +88,15 @@ impl SbatchManager {
     /// SLURM's default 30 s task sampling interval (so two consecutive polls
     /// cannot land inside a single sampling window) and to keep KUDPC
     /// squeue load low. Tests typically use 1–10 ms.
+    ///
+    /// Also sets the TTL of the shared `qgroup -l` listing cache to the
+    /// same duration, so a manual `refresh()` is never staler than one
+    /// poll cycle. Call this *before* `spawn`/`attach` — handles created
+    /// earlier keep the cache built from the previous interval.
     #[must_use = "with_poll_interval returns a new SbatchManager; the receiver is unchanged"]
     pub fn with_poll_interval(mut self, dur: std::time::Duration) -> Self {
         self.poll_interval = dur;
+        self.qgroup_cache = Arc::new(QgroupCacheState::new(dur));
         self
     }
 
@@ -122,7 +157,7 @@ impl SbatchManager {
         Ok(SbatchJobHandle::new(
             snapshot,
             self.store.clone(),
-            self.dispatcher.clone(),
+            self.handle_dispatcher(),
         ))
     }
 
@@ -205,7 +240,7 @@ impl SbatchManager {
             handles.push(SbatchJobHandle::new(
                 snapshot,
                 self.store.clone(),
-                self.dispatcher.clone(),
+                self.handle_dispatcher(),
             ));
         }
         Ok(handles)
@@ -253,7 +288,7 @@ impl SbatchManager {
         Ok(SbatchJobHandle::new(
             snapshot,
             self.store.clone(),
-            self.dispatcher.clone(),
+            self.handle_dispatcher(),
         ))
     }
 
@@ -292,7 +327,7 @@ impl SbatchManager {
         filtered.sort_by_key(|s| s.array_task_id);
         Ok(filtered
             .into_iter()
-            .map(|snap| SbatchJobHandle::new(snap, self.store.clone(), self.dispatcher.clone()))
+            .map(|snap| SbatchJobHandle::new(snap, self.store.clone(), self.handle_dispatcher()))
             .collect())
     }
 
@@ -939,6 +974,105 @@ mod tests {
         assert!(
             !*fired.lock().unwrap(),
             "callback must NOT fire when array rejection short-circuits before spawn"
+        );
+    }
+
+    /// Routes by argv[0]: `sbatch` hands out incrementing jobids,
+    /// `qgroup` returns a listing with every issued jobid as RUN and
+    /// counts its invocations. Everything else returns empty success.
+    struct SharedPollDispatcher {
+        next_jobid: std::sync::atomic::AtomicU64,
+        issued: Mutex<Vec<u64>>,
+        qgroup_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SharedPollDispatcher {
+        fn new(first_jobid: u64) -> Self {
+            Self {
+                next_jobid: std::sync::atomic::AtomicU64::new(first_jobid),
+                issued: Mutex::new(Vec::new()),
+                qgroup_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl JobDispatcher for SharedPollDispatcher {
+        async fn run(&self, _argv: &[String]) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn capture(&self, argv: &[String]) -> Result<CaptureOutput> {
+            use std::sync::atomic::Ordering;
+            match argv[0].as_str() {
+                "sbatch" => {
+                    let jobid = self.next_jobid.fetch_add(1, Ordering::SeqCst);
+                    self.issued.lock().unwrap().push(jobid);
+                    Ok(cap(0, &format!("Submitted batch job {jobid}\n")))
+                }
+                "qgroup" => {
+                    self.qgroup_calls.fetch_add(1, Ordering::SeqCst);
+                    let rows: String = self
+                        .issued
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|j| format!("queue user {j} RUN 1 1 1M 00:00:01\n"))
+                        .collect();
+                    Ok(cap(0, &rows))
+                }
+                _ => Ok(cap(0, "")),
+            }
+        }
+    }
+
+    /// The qgroup -l listing is global, so handles spawned by the same
+    /// manager must share one subprocess per poll cycle instead of each
+    /// spawning their own (the refresh-multiplexing review item).
+    #[tokio::test]
+    async fn handles_from_same_manager_share_one_qgroup_listing_within_ttl() {
+        let recorder = std::sync::Arc::new(SharedPollDispatcher::new(101));
+        let mgr = SbatchManager::new(SbatchCmd::new("/w/job.sh"))
+            .with_dispatcher(into_dyn(ArcDispatcher(recorder.clone())));
+        // Default poll_interval (60 s) == cache TTL — both refreshes land
+        // well inside it.
+        let h1 = mgr.spawn().await.unwrap();
+        let h2 = mgr.spawn().await.unwrap();
+
+        let s1 = h1.refresh().await.unwrap();
+        let s2 = h2.refresh().await.unwrap();
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            recorder.qgroup_calls.load(Ordering::SeqCst),
+            1,
+            "two handles refreshing within poll_interval must share one qgroup -l spawn"
+        );
+        assert_eq!(
+            s1.lifecycle.last_observed_state.as_ref().map(|s| s.state),
+            Some(crate::JobState::Running),
+        );
+        assert_eq!(
+            s2.lifecycle.last_observed_state.as_ref().map(|s| s.state),
+            Some(crate::JobState::Running),
+            "the cached listing must still resolve the second handle's own jobid"
+        );
+    }
+
+    /// TTL is wired to `with_poll_interval`: a zero interval means every
+    /// refresh does a live qgroup query (cache effectively off).
+    #[tokio::test]
+    async fn poll_interval_zero_makes_every_refresh_query_qgroup_live() {
+        let recorder = std::sync::Arc::new(SharedPollDispatcher::new(201));
+        let mgr = SbatchManager::new(SbatchCmd::new("/w/job.sh"))
+            .with_dispatcher(into_dyn(ArcDispatcher(recorder.clone())))
+            .with_poll_interval(std::time::Duration::ZERO);
+        let h = mgr.spawn().await.unwrap();
+
+        h.refresh().await.unwrap();
+        h.refresh().await.unwrap();
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            recorder.qgroup_calls.load(Ordering::SeqCst),
+            2,
+            "TTL must follow poll_interval; zero interval disables caching"
         );
     }
 

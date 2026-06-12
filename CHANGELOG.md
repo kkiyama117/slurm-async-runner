@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Shared `qgroup -l` listing cache (refresh multiplexing).** Handles
+  created by the same `SbatchManager` now share a single-flight TTL
+  cache (TTL = `poll_interval`) for the `qgroup -l` listing, so N
+  concurrently-polling handles spawn one qgroup subprocess per poll
+  cycle instead of N (100 handles @ 5 s: 72 000 → 720 spawns/hour).
+  Spawn failures (missing qgroup binary on non-KUDPC clusters) are
+  cached too, so the squeue fallback no longer re-spawns a failing
+  binary per handle per poll. `squeue`/`sacct`/`sbatch`/`scancel` are
+  never cached; a manual `refresh()` can observe a listing at most one
+  poll cycle old (qgroup data is itself sampled ~30 s at the source).
+  Batched `squeue -j id1,id2,…` coalescing remains deferred until the
+  mixed live/purged jobid behaviour is verified on KUDPC.
+
 ### Changed
 
 - **Structured subprocess capture (`CaptureOutput`).** The internal
