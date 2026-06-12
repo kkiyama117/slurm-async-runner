@@ -370,7 +370,7 @@ async fn refresh_array_task_uses_squeue_and_skips_qgroup() {
     let store: Arc<dyn JobStateStore<SbatchJobSnapshot>> = Arc::new(InMemoryStateStore::new());
     let dispatcher = into_dyn(CannedDispatcher::new(
         "QUEUE USER JOBID STATUS PROC\ngr u 12345 RUN 1\n",
-        "RUNNING None\n",
+        "12345_3 RUNNING None\n",
         "",
     ));
     let h = SbatchJobHandle::new(s.clone(), store, dispatcher);
@@ -832,8 +832,8 @@ async fn refresh_array_tasks_observe_per_task_states() {
     use crate::store::InMemoryStateStore;
 
     // Dispatcher: route squeue calls based on the `-j <key>` argv to
-    // produce per-task responses. `argv[3]` carries the `<master>_<idx>`
-    // key (after "squeue", "-h", "-j").
+    // produce per-task responses. `argv[4]` carries the `<master>_<idx>`
+    // key (after "squeue", "-h", "-r", "-j").
     struct PerTaskSqueue;
     impl JobDispatcher for PerTaskSqueue {
         async fn run(&self, _argv: &[String]) -> anyhow::Result<i32> {
@@ -841,10 +841,10 @@ async fn refresh_array_tasks_observe_per_task_states() {
         }
         async fn capture(&self, argv: &[String]) -> anyhow::Result<CaptureOutput> {
             if argv[0] == "squeue" {
-                let key = argv[3].as_str();
+                let key = argv[4].as_str();
                 return Ok(cap_ok(match key {
-                    "12345_0" => "RUNNING None\n",
-                    "12345_1" => "PENDING Priority\n",
+                    "12345_0" => "12345_0 RUNNING None\n",
+                    "12345_1" => "12345_1 PENDING Priority\n",
                     _ => "",
                 }));
             }
